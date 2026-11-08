@@ -1,0 +1,19 @@
+# build output
+*.o
+*.elf
+*.img
+*.iso
+*.exe
+*.dll
+build/
+iso/apps/
+iso/files/
+iso/boot/kernel.elf
+iso/boot/grub/grub.cfg
+# third-party binaries dropped into user/ (fastfetch, putty, ...): not ours to redistribute
+user/*
+!user/.gitkeep
+# editor / scratch
+*.swp
+.vscode/
+__pycache__/

@@ -1,0 +1,11 @@
+<!doctype html><html><head><title>POST test</title></head><body style="font-family:sans-serif;margin:16px">
+<h2>POST test</h2>
+<form id="f" method="post" action="http://10.0.2.2:8002/form"><input name="user" value="willow tree"><input name="pw" value="a&b=c"><input type="submit" name="go" value="Send form"></form>
+<p id="fetch">fetch pending</p><p id="xhr">xhr pending</p>
+<script>
+fetch('http://10.0.2.2:8002/api', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Test': 'yes' }, body: JSON.stringify({ hello: 'world', n: 42 }) })
+  .then(r => r.json()).then(j => { document.getElementById('fetch').textContent = 'fetch POST -> ' + j.method + ' len=' + j.len + ' ctype=' + j.ctype + ' x=' + j.x + ' body=' + j.body; });
+const x = new XMLHttpRequest(); x.open('POST', 'http://10.0.2.2:8002/api'); x.setRequestHeader('Content-Type', 'application/x-www-form-urlencoded');
+x.onload = () => { const j = JSON.parse(x.responseText); document.getElementById('xhr').textContent = 'XHR POST -> status ' + x.status + ' ' + j.method + ' body=' + j.body; };
+x.send(new URLSearchParams({ a: '1', b: 'two words' }));
+</script></body></html>

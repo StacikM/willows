@@ -1,0 +1,16 @@
+<!doctype html><html><head><title>JS test</title><style>.ok{color:#080}.box{padding:8px;border:1px solid #888;margin:6px}li{margin:2px}</style></head>
+<body style="font-family:sans-serif;margin:16px"><h1 id="h">Static heading</h1><div id="out"></div>
+<button id="btn">Click me</button> <input id="inp" value="abc"><ul id="list"></ul><p id="status">script has not run</p>
+<script>
+document.getElementById('h').textContent = 'Heading changed by JS';
+const out = document.getElementById('out');
+out.innerHTML = '<p class="ok">innerHTML works: <b>bold</b> and <i>italic</i></p>';
+for (let i = 1; i <= 3; i++) { const li = document.createElement('li'); li.textContent = 'item ' + i; document.getElementById('list').appendChild(li); }
+document.querySelectorAll('li').forEach((e, i) => { e.style.color = ['red', 'green', 'blue'][i]; });
+let n = 0;
+document.getElementById('btn').addEventListener('click', () => { n++; const d = document.createElement('div'); d.className = 'box'; d.textContent = 'clicked ' + n + ' times, input=' + document.getElementById('inp').value; out.appendChild(d); });
+setTimeout(() => { const d = document.createElement('p'); d.textContent = 'timer fired after 500ms'; out.appendChild(d); }, 500);
+fetch('file:///Documents/welcome.txt').then(r => r.text()).then(t => { const p = document.createElement('p'); p.textContent = 'fetched ' + t.length + ' bytes via fetch()'; out.appendChild(p); });
+document.getElementById('status').textContent = 'readyState=' + document.readyState + ', ' + document.querySelectorAll('*').length + ' elements, UA ok=' + /Willows/.test(navigator.userAgent);
+document.addEventListener('DOMContentLoaded', () => { document.title = 'JS test - loaded'; });
+</script></body></html>

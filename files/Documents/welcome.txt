@@ -1,0 +1,4 @@
+Welcome to Willows!
+
+This file lives in the RAM filesystem (C:\welcome.txt).
+Open it from the notepad with Ctrl+O (or whatever your app uses).

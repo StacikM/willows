@@ -1,0 +1,8 @@
+<!doctype html><html><head><title>createElement test</title></head><body style="font-family:sans-serif;margin:16px"><div id="o"></div>
+<script>
+const o = document.getElementById('o'); const names = ['div', 'my-widget', 'ytd-rich-item-renderer', 'x-' + 'a'.repeat(40), 'custom-tag'];
+for (let i = 0; i < 100; i++) names.push('el-' + i);
+let bad = 0; for (const nm of names) { const e = document.createElement(nm); if (e.localName !== nm || e.tagName !== nm.toUpperCase()) bad++; e.textContent = nm.length > 30 ? 'long tag ok' : ''; o.appendChild(e); }
+const a = document.createElement('el-5'), b = document.createElement('el-6');
+o.insertAdjacentHTML('beforeend', '<p>created ' + names.length + ' elements, mismatches: ' + bad + '; el-5 vs el-6 distinct: ' + (a.localName !== b.localName) + '; unknown tag via innerHTML: ' + (() => { const t = document.createElement('div'); t.innerHTML = '<foo-bar>x</foo-bar>'; return t.firstChild.localName; })() + '</p>');
+</script></body></html>
