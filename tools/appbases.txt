@@ -19,3 +19,6 @@ wlib.dll 17
 wdyn.dll 18
 dlltest.exe 19
 jstest.exe 20
+apitest.exe 21
+apitest2.exe 22
+apitest3.exe 23

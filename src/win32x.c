@@ -161,7 +161,7 @@ static DWORD WINAPI x_WaitForMultipleObjects(DWORD n, const HANDLE *hs, BOOL all
     if(all? cnt==(int)n : ready>=0){ for(DWORD i=0;i<n;i++){ struct kobj *o=obj_get(hs[i]); if(o&&!o->manual) o->sig=0; if(!all) break; } return (DWORD)(all?0:ready); }
     if(ms!=(DWORD)-1 && (u32)(ticks-t0)>=ms) return 0x102; idle_wait(); }
 }
-static BOOL WINAPI x_DuplicateHandle(HANDLE sp, HANDLE sh, HANDLE tp, HANDLE *th, DWORD a, BOOL i, DWORD o){ (void)sp;(void)tp;(void)a;(void)i;(void)o; if(th) *th=sh; return 1; }
+static BOOL WINAPI x_DuplicateHandle(HANDLE sp, HANDLE sh, HANDLE tp, HANDLE *th, DWORD a, BOOL i, DWORD o){ (void)sp;(void)tp;(void)a;(void)i; if(pipe_is_handle(sh)){ pipe_addref(sh); if(o&1) pipe_close(sh); } if(th) *th=sh; return 1; }   /* handles are global: a duplicate is the same value (pipes count references) */
 static DWORD WINAPI x_SleepEx(DWORD ms, BOOL al){ (void)al; void (WINAPI *f)(DWORD)=K32("Sleep"); if(f) f(ms); return 0; }
 
 /* ---- memory ---- */
@@ -242,18 +242,7 @@ static i32 WINAPI x_InterlockedAnd(volatile i32 *d, i32 v){ i32 o=*d; *d=o&v; re
 static void *WINAPI x_InterlockedExchangePointer(void *volatile *d, void *v){ void *o=*d; *d=v; return o; }
 static void *WINAPI x_InterlockedCompareExchangePointer(void *volatile *d, void *x, void *c){ void *o=*d; if(o==c) *d=x; return o; }
 
-/* ---- registry: an empty hive (every key/value is "not found"; writes are accepted and dropped) ---- */
-static long WINAPI x_RegOpenKeyExA(HANDLE k, const char *s, DWORD o, DWORD a, HANDLE *r){ (void)k;(void)s;(void)o;(void)a; if(r) *r=0; return 2; }
-static long WINAPI x_RegOpenKeyExW(HANDLE k, const u16 *s, DWORD o, DWORD a, HANDLE *r){ (void)k;(void)s;(void)o;(void)a; if(r) *r=0; return 2; }
-static long WINAPI x_RegQueryValueExA(HANDLE k, const char *n, DWORD *rs, DWORD *t, u8 *d, DWORD *l){ (void)k;(void)n;(void)rs;(void)t;(void)d;(void)l; return 2; }
-static long WINAPI x_RegQueryValueExW(HANDLE k, const u16 *n, DWORD *rs, DWORD *t, u8 *d, DWORD *l){ (void)k;(void)n;(void)rs;(void)t;(void)d;(void)l; return 2; }
-static long WINAPI x_RegCloseKey(HANDLE k){ (void)k; return 0; }
-static long WINAPI x_RegCreateKeyExA(HANDLE k, const char *s, DWORD r, char *c, DWORD o, DWORD a, void *sa, HANDLE *res, DWORD *d){ (void)k;(void)s;(void)r;(void)c;(void)o;(void)a;(void)sa; if(res) *res=0x7100; if(d) *d=1; return 0; }
-static long WINAPI x_RegCreateKeyExW(HANDLE k, const u16 *s, DWORD r, u16 *c, DWORD o, DWORD a, void *sa, HANDLE *res, DWORD *d){ (void)k;(void)s;(void)r;(void)c;(void)o;(void)a;(void)sa; if(res) *res=0x7100; if(d) *d=1; return 0; }
-static long WINAPI x_RegSetValueExA(HANDLE k, const char *n, DWORD r, DWORD t, const u8 *d, DWORD l){ (void)k;(void)n;(void)r;(void)t;(void)d;(void)l; return 0; }
-static long WINAPI x_RegSetValueExW(HANDLE k, const u16 *n, DWORD r, DWORD t, const u8 *d, DWORD l){ (void)k;(void)n;(void)r;(void)t;(void)d;(void)l; return 0; }
-static long WINAPI x_RegDeleteValueA(HANDLE k, const char *n){ (void)k;(void)n; return 2; }
-
+/* (the registry now lives in registry.c) */
 /* ---- ini files: always empty, defaults returned ---- */
 static DWORD WINAPI x_GetPrivateProfileStringA(const char *s, const char *k, const char *d, char *b, DWORD n, const char *f){ (void)s;(void)k;(void)f; if(!n) return 0; const char *v=d? d : ""; DWORD l=(DWORD)strlen(v); if(l>=n) l=n-1; memcpy(b,v,l); b[l]=0; return l; }
 static u32 WINAPI x_GetPrivateProfileIntA(const char *s, const char *k, i32 d, const char *f){ (void)s;(void)k;(void)f; return (u32)d; }
@@ -365,7 +354,7 @@ static int WINAPI x_GetDateFormatW(u32 loc, DWORD fl, const struct systime *st, 
 static int WINAPI x_GetTimeFormatW(u32 loc, DWORD fl, const struct systime *st, const u16 *fmt, u16 *out, int n){ (void)loc;(void)fl;(void)fmt; struct systime t; if(st) t = *st; else x_GetLocalTime(&t); char o[16]; o[0] = (char)('0' + t.h / 10); o[1] = (char)('0' + t.h % 10); o[2] = ':'; o[3] = (char)('0' + t.mi / 10); o[4] = (char)('0' + t.mi % 10); o[5] = ':'; o[6] = (char)('0' + t.s / 10); o[7] = (char)('0' + t.s % 10); o[8] = 0; if(!n) return 9; a2w(o, out, n); return 9; }
 static long WINAPI x_CoInitialize(void *r){ (void)r; return 0; }
 static void WINAPI x_CoUninitialize(void){}
-static long WINAPI x_CoCreateInstance(void *a, void *b, DWORD c, void *d, void **e){ (void)a;(void)b;(void)c;(void)d; if(e) *e = 0; return (long)0x80004002; }
+static long WINAPI x_CoCreateInstance(void *a, void *b, DWORD c, void *d, void **e){ (void)a;(void)b;(void)c;(void)d; if(e) *e = 0; return (long)0x80040154; }                       /* REGDB_E_CLASSNOTREG */
 static BOOL WINAPI x_AllocateAndInitializeSid(void *a, u8 n, DWORD s0, DWORD s1, DWORD s2, DWORD s3, DWORD s4, DWORD s5, DWORD s6, DWORD s7, void **sid){ (void)a;(void)n;(void)s0;(void)s1;(void)s2;(void)s3;(void)s4;(void)s5;(void)s6;(void)s7; static u8 fake[16]; if(sid) *sid = fake; return 1; }
 static BOOL WINAPI x_EqualSid(void *a, void *b){ return a == b; }
 static DWORD WINAPI x_GetLengthSid(void *s){ (void)s; return 12; }
@@ -374,8 +363,6 @@ static BOOL WINAPI x_true4(void *a, DWORD b, void *c, DWORD d){ (void)a;(void)b;
 static BOOL WINAPI x_InitializeSecurityDescriptor(void *sd, DWORD rev){ (void)rev; memset(sd, 0, 40); return 1; }
 static BOOL WINAPI x_SetSecurityDescriptorDacl(void *sd, BOOL p, void *acl, BOOL d){ (void)sd;(void)p;(void)acl;(void)d; return 1; }
 static BOOL WINAPI x_SetSecurityDescriptorOwner(void *sd, void *o, BOOL d){ (void)sd;(void)o;(void)d; return 1; }
-static long WINAPI x_RegEnumKeyA(HANDLE k, DWORD i, char *n, DWORD l){ (void)k;(void)i;(void)n;(void)l; return 259; }
-static long WINAPI x_RegDeleteKeyA(HANDLE k, const char *n){ (void)k;(void)n; return 2; }
 static BOOL WINAPI x_ChooseColorA(void *c){ (void)c; return 0; }
 static BOOL WINAPI x_ChooseFontA(void *c){ (void)c; return 0; }
 static BOOL WINAPI x_GetFileNameW(void *c){ (void)c; return 0; }
@@ -384,11 +371,10 @@ static HANDLE WINAPI x_imm0(void){ return 0; }
 const struct export x_exports[] = {
   XD("secur32",GetUserNameExW), XD("secur32",LsaGetUserName), XD("advapi32",LsaGetUserName), XD("advapi32",LsaFreeMemory), XD("secur32",LsaFreeMemory), X(GetComputerNameExW), X(AreFileApisANSI), X(WillowsReadOutput), X(WillowsProcessRunning), X(Beep), X(SetHandleInformation), X(IsDBCSLeadByteEx), X(LocalFileTimeToFileTime), X(GlobalMemoryStatus), X(ReadConsoleW), X(RtlUnwind), X(RtlUnwindEx), X(RtlPcToFileHeader),
   X(GetOverlappedResult), X(CreateThread), X(GetExitCodeThread), X(TerminateThread), X(FindFirstFileW), X(FindNextFileW), X(FindFirstFileExW), X(GetDateFormatW), X(GetTimeFormatW),
-  {"kernel32","CreatePipe",x_fail0}, {"kernel32","CreateNamedPipeA",x_failh}, {"kernel32","ConnectNamedPipe",x_fail0}, {"kernel32","WaitNamedPipeA",x_fail0}, {"kernel32","CreateFileMappingA",x_failh}, {"kernel32","MapViewOfFile",x_failh},
-  {"kernel32","UnmapViewOfFile",x_fail0}, {"kernel32","GetCommState",x_fail0}, {"kernel32","SetCommState",x_fail0}, {"kernel32","SetCommBreak",x_fail0}, {"kernel32","ClearCommBreak",x_fail0}, {"kernel32","SetCommTimeouts",x_fail0},
+  {"kernel32","GetCommState",x_fail0}, {"kernel32","SetCommState",x_fail0}, {"kernel32","SetCommBreak",x_fail0}, {"kernel32","ClearCommBreak",x_fail0}, {"kernel32","SetCommTimeouts",x_fail0},
   {"ole32","CoInitialize",x_CoInitialize}, {"ole32","CoUninitialize",x_CoUninitialize}, {"ole32","CoCreateInstance",x_CoCreateInstance},
   XD("advapi32",AllocateAndInitializeSid), XD("advapi32",EqualSid), XD("advapi32",GetLengthSid), XD("advapi32",CopySid), XD("advapi32",InitializeSecurityDescriptor), XD("advapi32",SetSecurityDescriptorDacl), XD("advapi32",SetSecurityDescriptorOwner),
-  XD("advapi32",RegEnumKeyA), XD("advapi32",RegDeleteKeyA), XD("comdlg32",ChooseColorA), XD("comdlg32",ChooseFontA), {"comdlg32","GetOpenFileNameW",x_GetFileNameW}, {"comdlg32","GetSaveFileNameW",x_GetFileNameW},
+  XD("comdlg32",ChooseColorA), XD("comdlg32",ChooseFontA), {"comdlg32","GetOpenFileNameW",x_GetFileNameW}, {"comdlg32","GetSaveFileNameW",x_GetFileNameW},
   {"imm32","ImmGetContext",x_imm0}, {"imm32","ImmReleaseContext",x_imm0}, {"imm32","ImmGetCompositionStringW",x_imm0}, {"imm32","ImmSetCompositionFontA",x_imm0}, {"imm32","ImmSetCompositionWindow",x_imm0},
 
   X(GetSystemDefaultLCID), X(GetSystemDefaultLangID), X(GetUserDefaultUILanguage), X(SetThreadUILanguage), {"kernel32","GetThreadUILanguage",x_GetUserDefaultUILanguage}, X(SetThreadLocale),
@@ -421,8 +407,6 @@ const struct export x_exports[] = {
   X(GetVersionExA), X(GetVersionExW), XD("ntdll",RtlGetVersion), XD("kernel32",VerifyVersionInfoW), XD("kernel32",VerSetConditionMask),
   X(InterlockedCompareExchange64), X(InterlockedExchange64), X(InterlockedExchangeAdd64), X(InterlockedIncrement64), X(InterlockedDecrement64),
   X(InterlockedOr), X(InterlockedAnd), X(InterlockedExchangePointer), X(InterlockedCompareExchangePointer),
-  XD("advapi32",RegOpenKeyExA), XD("advapi32",RegOpenKeyExW), XD("advapi32",RegQueryValueExA), XD("advapi32",RegQueryValueExW), XD("advapi32",RegCloseKey),
-  XD("advapi32",RegCreateKeyExA), XD("advapi32",RegCreateKeyExW), XD("advapi32",RegSetValueExA), XD("advapi32",RegSetValueExW), XD("advapi32",RegDeleteValueA),
   X(GetPrivateProfileStringA), X(GetPrivateProfileIntA), X(WritePrivateProfileStringA), XD("advapi32",GetUserNameW), X(GetComputerNameW),
 };
 const unsigned x_nexports=sizeof x_exports/sizeof *x_exports;

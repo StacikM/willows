@@ -3,10 +3,12 @@
 #define K_MEM 8
 #define GO_BASE 0x9000
 #define GO_MAX 1024
-enum { GT_BRUSH = 1, GT_PEN, GT_FONT, GT_BITMAP, GT_PALETTE };
-struct gobj { u8 used, type, style, hollow; u32 color; int px, w, h, penw; u32 *pix; u8 mono; };
+enum { GT_BRUSH = 1, GT_PEN, GT_FONT, GT_BITMAP, GT_PALETTE, GT_RGN };
+/* rc: a region's bounding box (regions are rectangles here). dib/bpp/topdown/raw/rstride: a DIB section whose bits the program writes
+   directly; unless it is 32-bit top-down (then raw == pix) it is converted into pix before it is used as a blit source. */
+struct gobj { u8 used, type, style, hollow; u32 color; int px, w, h, penw; u32 *pix; u8 mono; i32 rc[4]; u8 dib, topdown; u16 bpp; u8 *raw; int rstride; };
 static struct gobj gobjs[GO_MAX];
-struct dcst { u8 init, bkmode, align, mem; u32 fg, bg; u64 font, pen, brush, bmp; i32 px, py; };
+struct dcst { u8 init, bkmode, align, mem, hasclip, rop2, stretch; u32 fg, bg; u64 font, pen, brush, bmp; i32 px, py; i32 clip[4]; };
 static struct dcst dcs[MAXW];
 static u64 stock_obj[24];
 static u64 gh(int i){ return GO_BASE + (u64)i * 4; }
@@ -62,6 +64,7 @@ static i32 WINAPI w_DeleteObject(u64 h){
   struct gobj *o = go_get(h); if(!o) return h != 0; if(h == stock_obj[0] || h == stock_obj[4]) return 1;
   for(int i = 0; i < 24; i++) if(stock_obj[i] == h) return 1;
   for(int i = 0; i < MAXW; i++) if(dcs[i].init){ if(dcs[i].font == h) dcs[i].font = 0; if(dcs[i].pen == h) dcs[i].pen = 0; if(dcs[i].brush == h) dcs[i].brush = 0; if(dcs[i].bmp == h) return 1; }
+  if(o->raw && o->raw != (u8 *)o->pix) heap_free(o->raw);
   if(o->pix) heap_free(o->pix); o->used = 0; return 1;
 }
 static u64 WINAPI w_CreateCompatibleDC(u64 dc){
@@ -105,12 +108,13 @@ static u64 WINAPI w_SelectPalette(u64 dc, u64 p, i32 bk){ (void)dc; (void)bk; re
 static u32 WINAPI w_SetPaletteEntries(u64 p, u32 a, u32 n, const void *e){ (void)p; (void)a; (void)e; return n; }
 static i32 WINAPI w_UnrealizeObject(u64 h){ (void)h; return 1; }
 static i32 WINAPI w_UpdateColors(u64 dc){ (void)dc; return 1; }
-static i32 WINAPI w_ExcludeClipRect(u64 dc, i32 a, i32 b, i32 c, i32 d){ (void)dc; (void)a; (void)b; (void)c; (void)d; return 2; }
-static i32 WINAPI w_IntersectClipRect(u64 dc, i32 a, i32 b, i32 c, i32 d){ (void)dc; (void)a; (void)b; (void)c; (void)d; return 2; }
-static i32 WINAPI w_GetDIBits(u64 dc, u64 bmp, u32 a, u32 b, void *bits, void *bi, u32 u){ (void)dc; (void)bmp; (void)a; (void)b; (void)bits; (void)bi; (void)u; return 0; }
 
 /* ---- drawing ---- */
-static void px_put(struct wnd *s, int x, int y, u32 c){ if(x >= 0 && y >= 0 && x < s->pw && y < s->ph) s->pix[(u64)y * s->stride + x] = c; }
+static const i32 *g_clip;                                                  /* the current DC's clip rectangle while a primitive draws (0 = none) */
+static void px_put(struct wnd *s, int x, int y, u32 c){ if(g_clip && (x < g_clip[0] || y < g_clip[1] || x >= g_clip[2] || y >= g_clip[3])) return; if(x >= 0 && y >= 0 && x < s->pw && y < s->ph) s->pix[(u64)y * s->stride + x] = c; }
+static void clip_on(struct dcst *d){ g_clip = d && d->hasclip ? d->clip : 0; }
+/* wm_gdi_rect (in wm.c) asks for the clip rectangle of a DC; 1 = a clip is active */
+int dc_clip(u64 dc, int *r){ struct dcst *d = dc_state(dc); if(!d || !d->hasclip) return 0; r[0] = d->clip[0]; r[1] = d->clip[1]; r[2] = d->clip[2]; r[3] = d->clip[3]; return 1; }
 static u32 pen_color(struct dcst *d, int *skip){ struct gobj *p = go_get(d->pen); if(p){ *skip = p->style == 5; return p->color; } *skip = 0; return 0; }
 static void draw_line(struct wnd *s, int x0, int y0, int x1, int y1, u32 c, int pw){
   int dx = x1 > x0 ? x1 - x0 : x0 - x1, dy = y1 > y0 ? y0 - y1 : y1 - y0; int sx = x0 < x1 ? 1 : -1, sy = y0 < y1 ? 1 : -1; int err = dx + dy;
@@ -122,10 +126,10 @@ static void draw_line(struct wnd *s, int x0, int y0, int x1, int y1, u32 c, int 
 static i32 WINAPI w_MoveToEx(u64 dc, i32 x, i32 y, i32 *old){ struct dcst *d = dc_state(dc); if(!d) return 0; if(old){ old[0] = d->px; old[1] = d->py; } d->px = x; d->py = y; return 1; }
 static i32 WINAPI w_LineTo(u64 dc, i32 x, i32 y){
   struct dcst *d = dc_state(dc); struct wnd *s = dc_target(dc); if(!d || !s) return 0; int skip; u32 c = pen_color(d, &skip); struct gobj *p = go_get(d->pen);
-  if(!skip) draw_line(s, d->px, d->py, x, y, c, p ? p->penw : 1); d->px = x; d->py = y; dirty = 1; return 1;
+  clip_on(d); if(!skip) draw_line(s, d->px, d->py, x, y, c, p ? p->penw : 1); g_clip = 0; d->px = x; d->py = y; dirty = 1; return 1;
 }
 static i32 WINAPI w_Polyline(u64 dc, const i32 *pts, i32 n){ struct dcst *d = dc_state(dc); struct wnd *s = dc_target(dc); if(!d || !s || n < 2) return 0; int skip; u32 c = pen_color(d, &skip); struct gobj *p = go_get(d->pen);
-  if(!skip) for(int i = 0; i + 1 < n; i++) draw_line(s, pts[i * 2], pts[i * 2 + 1], pts[i * 2 + 2], pts[i * 2 + 3], c, p ? p->penw : 1); dirty = 1; return 1; }
+  clip_on(d); if(!skip) for(int i = 0; i + 1 < n; i++) draw_line(s, pts[i * 2], pts[i * 2 + 1], pts[i * 2 + 2], pts[i * 2 + 3], c, p ? p->penw : 1); g_clip = 0; dirty = 1; return 1; }
 static i32 WINAPI w_Rectangle(u64 dc, i32 l, i32 t, i32 r, i32 b){
   struct dcst *d = dc_state(dc); struct wnd *s = dc_target(dc); if(!d || !s) return 0; struct gobj *br = go_get(d->brush ? d->brush : stock(0)); int skip; u32 pc = pen_color(d, &skip);
   if(br && !br->hollow) wm_gdi_rect(dc, l + (skip ? 0 : 1), t + (skip ? 0 : 1), r - l - (skip ? 0 : 2), b - t - (skip ? 0 : 2), br->color);
@@ -148,14 +152,31 @@ static i32 WINAPI w_PatBlt(u64 dc, i32 x, i32 y, i32 w, i32 h, u32 rop){
 }
 static u32 WINAPI w_GetPixel(u64 dc, i32 x, i32 y){ struct wnd *s = dc_target(dc); if(!s || x < 0 || y < 0 || x >= s->pw || y >= s->ph) return 0xFFFFFFFFu; return cref(s->pix[(u64)y * s->stride + x] & 0xFFFFFF); }
 static u32 WINAPI w_SetPixel(u64 dc, i32 x, i32 y, u32 c){ wm_gdi_pixel(dc, x, y, cref(c)); return c; }
+/* a DIB section the program filled directly (not 32-bit top-down) is converted to pix before it is read as a source */
+static void dib_sync(struct gobj *o){
+  if(!o || !o->dib || (u8 *)o->pix == o->raw || !o->raw) return;
+  for(int y = 0; y < o->h; y++){
+    const u8 *r = o->raw + (u64)(o->topdown ? y : o->h - 1 - y) * o->rstride; u32 *dst = o->pix + (u64)y * o->w;
+    for(int x = 0; x < o->w; x++){
+      u32 v;
+      if(o->bpp == 32) v = ((const u32 *)r)[x];
+      else if(o->bpp == 24) v = 0xFF000000u | ((u32)r[x * 3 + 2] << 16) | ((u32)r[x * 3 + 1] << 8) | r[x * 3];
+      else if(o->bpp == 16){ u16 p = ((const u16 *)r)[x]; v = ((u32)((p >> 10) & 31) * 255 / 31 << 16) | ((u32)((p >> 5) & 31) * 255 / 31 << 8) | ((u32)(p & 31) * 255 / 31); }
+      else if(o->bpp == 8){ u8 g = r[x]; v = ((u32)g << 16) | ((u32)g << 8) | g; }
+      else { v = (r[x >> 3] >> (7 - (x & 7))) & 1 ? 0xFFFFFF : 0; }
+      dst[x] = v;
+    }
+  }
+}
+static void dib_sync_dc(u64 dc){ struct dcst *d = dc_state(dc); if(d && d->mem){ struct gobj *o = go_get(d->bmp); if(o && o->dib) dib_sync(o); } }
 static i32 WINAPI w_BitBlt(u64 dst, i32 dx, i32 dy, i32 w, i32 h, u64 src, i32 sx, i32 sy, u32 rop){
   struct wnd *d = dc_target(dst); if(!d) return 0;
   if(rop == 0x42 || rop == 0xFF0062 || rop == 0xF00021 || rop == 0x550009) return w_PatBlt(dst, dx, dy, w, h, rop);
-  struct wnd *s = dc_target(src); if(!s) return 0;
+  struct wnd *s = dc_target(src); if(!s) return 0; dib_sync_dc(src); int cl[4]; int hc = dc_clip(dst, cl);
   for(int j = 0; j < h; j++){
-    int y = dy + j, yy = sy + j; if(y < 0 || y >= d->ph || yy < 0 || yy >= s->ph) continue;
+    int y = dy + j, yy = sy + j; if(y < 0 || y >= d->ph || yy < 0 || yy >= s->ph) continue; if(hc && (y < cl[1] || y >= cl[3])) continue;
     for(int i = 0; i < w; i++){
-      int x = dx + i, xx = sx + i; if(x < 0 || x >= d->pw || xx < 0 || xx >= s->pw) continue;
+      int x = dx + i, xx = sx + i; if(x < 0 || x >= d->pw || xx < 0 || xx >= s->pw) continue; if(hc && (x < cl[0] || x >= cl[2])) continue;
       u32 sp = s->pix[(u64)yy * s->stride + xx] & 0xFFFFFF; u32 *dp = &d->pix[(u64)y * d->stride + x];
       switch(rop){ case 0x660046: *dp ^= sp; break; case 0x8800C6: *dp &= sp; break; case 0xEE0086: *dp |= sp; break; case 0x330008: *dp = ~sp & 0xFFFFFF; break; default: *dp = sp; }
     }
@@ -163,9 +184,9 @@ static i32 WINAPI w_BitBlt(u64 dst, i32 dx, i32 dy, i32 w, i32 h, u64 src, i32 s
   dirty = 1; return 1;
 }
 static i32 WINAPI w_StretchBlt(u64 dst, i32 dx, i32 dy, i32 dw, i32 dh, u64 src, i32 sx, i32 sy, i32 sw, i32 sh, u32 rop){
-  (void)rop; struct wnd *d = dc_target(dst), *s = dc_target(src); if(!d || !s || dw <= 0 || dh <= 0 || sw <= 0 || sh <= 0) return 0;
-  for(int j = 0; j < dh; j++){ int y = dy + j; if(y < 0 || y >= d->ph) continue; int yy = sy + j * sh / dh; if(yy < 0 || yy >= s->ph) continue;
-    for(int i = 0; i < dw; i++){ int x = dx + i; if(x < 0 || x >= d->pw) continue; int xx = sx + i * sw / dw; if(xx < 0 || xx >= s->pw) continue; d->pix[(u64)y * d->stride + x] = s->pix[(u64)yy * s->stride + xx]; } }
+  (void)rop; struct wnd *d = dc_target(dst), *s = dc_target(src); if(!d || !s || dw <= 0 || dh <= 0 || sw <= 0 || sh <= 0) return 0; dib_sync_dc(src); int cl[4]; int hc = dc_clip(dst, cl);
+  for(int j = 0; j < dh; j++){ int y = dy + j; if(y < 0 || y >= d->ph) continue; if(hc && (y < cl[1] || y >= cl[3])) continue; int yy = sy + j * sh / dh; if(yy < 0 || yy >= s->ph) continue;
+    for(int i = 0; i < dw; i++){ int x = dx + i; if(x < 0 || x >= d->pw) continue; if(hc && (x < cl[0] || x >= cl[2])) continue; int xx = sx + i * sw / dw; if(xx < 0 || xx >= s->pw) continue; d->pix[(u64)y * d->stride + x] = s->pix[(u64)yy * s->stride + xx] & 0xFFFFFF; } }
   dirty = 1; return 1;
 }
 
@@ -180,12 +201,17 @@ static i32 do_text(u64 dc, int x, int y, const char *s, int n, const i32 *dxs, u
   if((al & 24) == 24) y -= ui_ascent(f); else if(al & 8) y -= lh;
   if(rc && (opts & 2)) wm_gdi_rect(dc, rc[0], rc[1], rc[2] - rc[0], rc[3] - rc[1], d->bg);
   else if(d->bkmode == 2 && !(opts & 2)) wm_gdi_rect(dc, x, y, tw, lh, d->bg);
-  if(dxs){ int cx = x; for(int i = 0; i < n; i++){ int cl = 1; while(i + cl < n && ((unsigned char)s[i + cl] & 0xC0) == 0x80) cl++; if(s[i] != ' ') ui_text_to(f, t->pix, t->stride, t->pw, t->ph, cx, y, s + i, cl, d->fg); cx += dxs[i]; i += cl - 1; } }
-  else ui_text_to(f, t->pix, t->stride, t->pw, t->ph, x, y, s, n, d->fg);
+  u32 *tp = t->pix; int tpw = t->pw, tph = t->ph, ox = 0, oy = 0;             /* with a clip rectangle, draw into that part of the surface only */
+  if(d->hasclip){ int x0 = d->clip[0] < 0 ? 0 : d->clip[0], y0 = d->clip[1] < 0 ? 0 : d->clip[1], x1 = d->clip[2] > t->pw ? t->pw : d->clip[2], y1 = d->clip[3] > t->ph ? t->ph : d->clip[3];
+    if(x1 <= x0 || y1 <= y0) return 1; tp = t->pix + (u64)y0 * t->stride + x0; tpw = x1 - x0; tph = y1 - y0; ox = x0; oy = y0; }
+  if(dxs){ int cx = x; for(int i = 0; i < n; i++){ int cl = 1; while(i + cl < n && ((unsigned char)s[i + cl] & 0xC0) == 0x80) cl++; if(s[i] != ' ') ui_text_to(f, tp, t->stride, tpw, tph, cx - ox, y - oy, s + i, cl, d->fg); cx += dxs[i]; i += cl - 1; } }
+  else ui_text_to(f, tp, t->stride, tpw, tph, x - ox, y - oy, s, n, d->fg);
   dirty = 1; return 1;
 }
 static i32 WINAPI w_TextOutA(u64 dc, i32 x, i32 y, const char *s, i32 n){ return do_text(dc, x, y, s, n, 0, 0, 0); }
-static i32 WINAPI w_TextOutW(u64 dc, i32 x, i32 y, const u16 *s, i32 n){ char a[600]; if(n < 0){ n = 0; while(s[n]) n++; } if(n > 590) n = 590; for(int i = 0; i < n; i++) a[i] = s[i] < 0x80 ? (char)s[i] : '?'; return do_text(dc, x, y, a, n, 0, 0, 0); }
+/* UTF-16 -> UTF-8 (the text engine works on UTF-8); returns the byte count */
+static int w_to_utf8(const u16 *s, int n, char *out, int max){ int k = 0; if(n < 0){ n = 0; while(s[n]) n++; } for(int i = 0; i < n && k + 4 < max; i++){ u16 c = s[i]; if(c >= 0xD800 && c < 0xE000){ out[k++] = '?'; if(i + 1 < n && s[i + 1] >= 0xDC00 && s[i + 1] < 0xE000) i++; continue; } k += utf8_put_k(out + k, c); } out[k] = 0; return k; }
+static i32 WINAPI w_TextOutW(u64 dc, i32 x, i32 y, const u16 *s, i32 n){ char a[1800]; int k = w_to_utf8(s, n, a, sizeof a); return do_text(dc, x, y, a, k, 0, 0, 0); }
 static i32 WINAPI w_ExtTextOutA(u64 dc, i32 x, i32 y, u32 opts, const i32 *rc, const char *s, u32 n, const i32 *dxs){ if(!s){ if(rc && (opts & 2)){ struct dcst *d = dc_state(dc); if(d) wm_gdi_rect(dc, rc[0], rc[1], rc[2] - rc[0], rc[3] - rc[1], d->bg); } return 1; } return do_text(dc, x, y, s, (int)n, dxs, opts, rc); }
 static i32 WINAPI w_ExtTextOutW(u64 dc, i32 x, i32 y, u32 opts, const i32 *rc, const u16 *s, u32 n, const i32 *dxs){
   if(!s){ return w_ExtTextOutA(dc, x, y, opts, rc, 0, 0, 0); }
@@ -193,7 +219,7 @@ static i32 WINAPI w_ExtTextOutW(u64 dc, i32 x, i32 y, u32 opts, const i32 *rc, c
   return do_text(dc, x, y, a, k, dxs ? dd : 0, opts, rc);
 }
 static i32 WINAPI w_GetTextExtentPoint32A(u64 dc, const char *s, i32 n, i32 *sz){ struct dcst *d = dc_state(dc); const struct font *f = font_of_dc(d); if(n < 0) n = (int)strlen(s); sz[0] = text_w(f, s, n); sz[1] = ui_lineh(f); return 1; }
-static i32 WINAPI w_GetTextExtentPoint32W(u64 dc, const u16 *s, i32 n, i32 *sz){ char a[600]; if(n < 0){ n = 0; while(s[n]) n++; } if(n > 590) n = 590; for(int i = 0; i < n; i++) a[i] = s[i] < 0x80 ? (char)s[i] : '?'; return w_GetTextExtentPoint32A(dc, a, n, sz); }
+static i32 WINAPI w_GetTextExtentPoint32W(u64 dc, const u16 *s, i32 n, i32 *sz){ char a[1800]; int k = w_to_utf8(s, n, a, sizeof a); return w_GetTextExtentPoint32A(dc, a, k, sz); }
 static i32 WINAPI w_GetTextExtentExPointA(u64 dc, const char *s, i32 n, i32 maxw, i32 *fit, i32 *dxs, i32 *sz){
   struct dcst *d = dc_state(dc); const struct font *f = font_of_dc(d); int cnt = 0; int total = 0;
   for(int i = 0; i < n; i++){ int w = text_w(f, s, i + 1); if(maxw > 0 && w > maxw) break; if(dxs) dxs[i] = w; total = w; cnt = i + 1; }
@@ -388,7 +414,7 @@ static i32 WINAPI w_GetUserObjectInformationW(u64 h, i32 idx, u32 *info, u32 len
   {"gdi32","DeleteDC",w_DeleteDC}, {"gdi32","SelectObject",w_SelectObject}, {"gdi32","GetCurrentObject",w_GetCurrentObject}, {"gdi32","GetObjectA",w_GetObjectA}, {"gdi32","SetTextColor",w_SetTextColor}, {"gdi32","GetTextColor",w_GetTextColor}, \
   {"gdi32","SetBkColor",w_SetBkColor}, {"gdi32","SetBkMode",w_SetBkMode}, {"gdi32","GetBkMode",w_GetBkMode}, {"gdi32","SetTextAlign",w_SetTextAlign}, {"gdi32","SetMapMode",w_SetMapMode}, {"gdi32","GetDeviceCaps",w_GetDeviceCaps}, \
   {"gdi32","RealizePalette",w_RealizePalette}, {"gdi32","SelectPalette",w_SelectPalette}, {"gdi32","SetPaletteEntries",w_SetPaletteEntries}, {"gdi32","UnrealizeObject",w_UnrealizeObject}, {"gdi32","UpdateColors",w_UpdateColors}, \
-  {"gdi32","ExcludeClipRect",w_ExcludeClipRect}, {"gdi32","IntersectClipRect",w_IntersectClipRect}, {"gdi32","GetDIBits",w_GetDIBits}, {"gdi32","MoveToEx",w_MoveToEx}, {"gdi32","LineTo",w_LineTo}, {"gdi32","Polyline",w_Polyline}, \
+  {"gdi32","MoveToEx",w_MoveToEx}, {"gdi32","LineTo",w_LineTo}, {"gdi32","Polyline",w_Polyline}, \
   {"gdi32","Rectangle",w_Rectangle}, {"user32","FillRect",w_FillRect}, {"gdi32","PatBlt",w_PatBlt}, {"gdi32","GetPixel",w_GetPixel}, {"gdi32","SetPixel",w_SetPixel}, {"gdi32","BitBlt",w_BitBlt}, {"gdi32","StretchBlt",w_StretchBlt}, \
   {"gdi32","TextOutA",w_TextOutA}, {"gdi32","TextOutW",w_TextOutW}, {"gdi32","ExtTextOutA",w_ExtTextOutA}, {"gdi32","ExtTextOutW",w_ExtTextOutW}, {"gdi32","GetTextExtentPoint32A",w_GetTextExtentPoint32A}, {"gdi32","GetTextExtentPointA",w_GetTextExtentPoint32A}, \
   {"gdi32","GetTextExtentPoint32W",w_GetTextExtentPoint32W}, {"gdi32","GetTextExtentPointW",w_GetTextExtentPoint32W}, {"gdi32","GetTextExtentExPointA",w_GetTextExtentExPointA}, {"gdi32","GetTextMetricsA",w_GetTextMetricsA}, {"gdi32","GetTextMetricsW",w_GetTextMetricsW}, \

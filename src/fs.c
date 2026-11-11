@@ -251,8 +251,11 @@ int fs_is_handle(u64 h){ return h>=H_FILE && h<H_FILE+MAXOPEN && opens[h-H_FILE]
 int fs_hread(u64 h, void *buf, u32 n, u32 *got){ u64 r=c_fread(buf,1,n,&opens[h-H_FILE]); if(got) *got=(u32)r; return 1; }
 int fs_hwrite(u64 h, const void *buf, u32 n, u32 *wr){ u64 r=c_fwrite(buf,1,n,&opens[h-H_FILE]); if(wr) *wr=(u32)r; return r==n; }
 int fs_hclose(u64 h){ struct kfile *k=&opens[h-H_FILE]; k->used=0; if(k->f->dirty) fs_sync(); return 1; }
+struct ramfile *fs_handle_file(u64 h){ return fs_is_handle(h)? opens[h-H_FILE].f : NULL; }
+int fs_file_write_at(struct ramfile *f, u64 pos, const void *d, u64 n){ int r=fs_write(f,pos,d,n); if(!r){ f->persist=1; f->dirty=1; fs_gen++; } return r; }
 static u64 WINAPI k_CreateFileA(const char *name, u32 access, u32 share, void *sa, u32 disp, u32 fl, u64 tmpl){
   (void)share;(void)sa;(void)fl;(void)tmpl;
+  if(pipe_is_path(name)){ u64 ph=pipe_open_client(name); if(!ph) win32_set_last_error(2); return ph? ph : (u64)-1; }          /* \\\\.\\pipe\\name */
   struct ramfile *f=fs_find(name); int w=(access&0x40000000)!=0;
   if(f && f->isdir){ win32_set_last_error(5); return (u64)-1; }
   switch(disp){

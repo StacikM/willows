@@ -31,6 +31,7 @@ void console_init(void){
 }
 #define CAPSZ 32768
 void kputc(char c){
+  if(cur && cur->out_h){ pipe_write(cur->out_h,&c,1,0); return; }                                                                         /* stdout redirected into a pipe by its parent */
   if(cur && cur->cap_on && cur->cap){ u32 w=cur->cap_w; if(w-cur->cap_r<CAPSZ){ cur->cap[w%CAPSZ]=c; cur->cap_w=w+1; } return; }          /* a program started from the terminal: its output goes there */
   while(!(inb(0x3FD)&0x20)); outb(0x3F8,c);          /* serial mirror */
   if(con_on){ con_put(c); return; }                    /* desktop mode: text goes to the Console window */

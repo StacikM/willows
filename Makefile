@@ -11,7 +11,7 @@ OBJ     = $(SRC:.c=.o) src/boot.o $(BROBJ)
 # Use hardware virtualisation (KVM) when the host allows it: far faster than QEMU's software CPU emulation.
 ACCEL   := $(shell test -w /dev/kvm && echo "-enable-kvm -cpu host" || echo "-cpu max")
 DLLS    = apps/wdep.dll apps/wlib.dll apps/wdyn.dll
-APPS    = apps/dlltest.exe $(DLLS) apps/dlgtest.exe apps/hello.exe apps/exit42.exe apps/echo.exe apps/gfx.exe apps/crt.exe apps/paint.exe apps/ping.exe apps/nettest.exe apps/httpd.exe apps/fetch.exe apps/browser.exe apps/terminal.exe apps/notes.exe apps/files.exe apps/settings.exe apps/jstest.exe
+APPS    = apps/apitest.exe apps/apitest2.exe apps/apitest3.exe apps/dlltest.exe $(DLLS) apps/dlgtest.exe apps/hello.exe apps/exit42.exe apps/echo.exe apps/gfx.exe apps/crt.exe apps/paint.exe apps/ping.exe apps/nettest.exe apps/httpd.exe apps/fetch.exe apps/browser.exe apps/terminal.exe apps/notes.exe apps/files.exe apps/settings.exe apps/jstest.exe
 
 all: kernel.elf $(APPS)
 kernel.elf: $(OBJ) linker.ld
@@ -32,7 +32,7 @@ apps/%.o: apps/%.c apps/win.h
 apps/%.exe: apps/%.o tools/mkpe.py
 	python3 tools/mkpe.py $< $@
 # programs that use the libc shim (stdio/stdlib/string) instead of apps/win.h
-apps/terminal.exe apps/notes.exe apps/files.exe apps/settings.exe apps/dlgtest.exe apps/dlltest.exe: apps/%.exe: apps/%.c apps/winui.h $(wildcard apps/web/*.h) apps/shim/shim.c tools/buildc.sh tools/mkpe.py
+apps/terminal.exe apps/notes.exe apps/files.exe apps/settings.exe apps/dlgtest.exe apps/dlltest.exe apps/apitest.exe apps/apitest2.exe apps/apitest3.exe: apps/%.exe: apps/%.c apps/winui.h $(wildcard apps/web/*.h) apps/shim/shim.c tools/buildc.sh tools/mkpe.py
 	./tools/buildc.sh apps/$*.c $@
 
 # programs that embed the QuickJS engine (the browser also embeds apps/web/prelude.js, its DOM layer)

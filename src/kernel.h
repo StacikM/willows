@@ -74,7 +74,14 @@ struct proc {
   u8 tls_used[64], fls_used[128]; u64 fls_slots[128];
   struct msg q[64]; u32 qh, qt; int quit, quit_code;
   char *cap; u32 cap_w, cap_r; u8 cap_on;                         /* console output captured for the parent (terminal) instead of the Console window */
+  u64 out_h, in_h;                                                /* pipe handles standing in for stdout/stdin (CreateProcess with STARTF_USESTDHANDLES) */
 };
+/* ipc.c: anonymous and named pipes, file mappings (shared memory) */
+struct ramfile; struct export;
+int pipe_is_handle(u64 h); int pipe_read(u64 h, void *buf, u32 n, u32 *got); int pipe_write(u64 h, const void *buf, u32 n, u32 *wrote); void pipe_close(u64 h); void pipe_addref(u64 h);
+int pipe_is_path(const char *name); u64 pipe_open_client(const char *name);
+int map_is_handle(u64 h); void map_close(u64 h);
+struct ramfile *fs_handle_file(u64 h); int fs_file_write_at(struct ramfile *f, u64 pos, const void *d, u64 n);
 extern struct proc procs[MAXPROC]; extern struct proc *cur;
 void app_register(const char *name, const void *data, u64 size, int demo); int app_count(void); const char *app_name(int i); int app_is_demo(int i);
 int proc_spawn(const char *name);                 /* start a registered .exe; returns pid or -1 */
@@ -133,7 +140,7 @@ int tcp_state(int s); int tcp_avail(int s); int tcp_pending(int s); int tcp_rst(
 int udp_open(u16 port); int udp_sendto(int s, u32 ip, u16 port, const void *d, u32 n);
 int udp_recvfrom(int s, void *d, u32 n, u32 *ip, u16 *port, int nb); void udp_close(int s); int udp_avail(int s);
 int dns_resolve(const char *name, u32 *ip); int net_ping(u32 ip, u32 timeout_ms);
-void *pe_make_stub(const char *dll, const char *name); extern const struct export crt2_exports[], math_exports[], nt2_exports[], hw_exports[]; extern const unsigned crt2_nexports, math_nexports, nt2_nexports, hw_nexports; const char *hw_gpu_name(void); extern const struct export settings_exports[]; extern const unsigned settings_nexports; void settings_load(void); void settings_set(const char *k,const char *v); const char *settings_get(const char *k); void wm_post_msg(u64 hwnd,u32 msg,u64 wp,i64 lp); void ws_async_poll(void); void *pe_make_soft_stub(const char *name);
+void *pe_make_stub(const char *dll, const char *name); extern const struct export crt2_exports[], math_exports[], nt2_exports[], hw_exports[]; extern const unsigned crt2_nexports, math_nexports, nt2_nexports, hw_nexports; const char *hw_gpu_name(void); extern const struct export settings_exports[], reg_exports[], y_exports[], ipc_exports[], nt_exports[]; extern const unsigned settings_nexports, reg_nexports, y_nexports, ipc_nexports, nt_nexports; void settings_load(void); void settings_set(const char *k,const char *v); const char *settings_get(const char *k); void wm_post_msg(u64 hwnd,u32 msg,u64 wp,i64 lp); void ws_async_poll(void); void *pe_make_soft_stub(const char *name);
 extern const struct export x_exports[]; extern const unsigned x_nexports;
 extern const struct export net_exports[]; extern const unsigned net_nexports;
 

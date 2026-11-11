@@ -45,9 +45,13 @@ void proc_main(void){
   int code=((int (WINAPI*)(void))p->img.entry)();
   proc_exit(code);
 }
+static void release_pipes(struct proc *p){                 /* the child's copies of its redirected stdin/stdout go away with it: readers then see end-of-file */
+  u64 o=p->out_h, i=p->in_h; p->out_h=p->in_h=0; if(o) pipe_close(o); if(i) pipe_close(i);
+}
 void proc_exit(int code){
   struct proc *p=cur; proc_last_exit[p->pid]=code;
-  p->cap_on=0;                                          /* the exit note belongs on the Console, not in the terminal output */
+  release_pipes(p);
+  p->cap_on=0;                                        /* the exit note belongs on the Console, not in the terminal output */
   con_quiet++; kprintf("\n< %s exited with code %u (0x%x)\n",p->name,(u32)code,(u32)code); con_quiet--;
   wm_cleanup(p->pid);
   dll_exit(p->pid);
@@ -60,6 +64,7 @@ void proc_kill(int pid){                              /* close button on a windo
   if(pid<=0||pid>=MAXPROC||!procs[pid].used) return;
   struct proc *p=&procs[pid];
   if(p==cur) proc_exit(0xC000013A);
+  release_pipes(p);
   con_quiet++; kprintf("\n< %s closed\n",p->name); con_quiet--;
   wm_cleanup(pid); dll_cleanup(pid); pe_unload(p->img.base); p->used=0;
 }

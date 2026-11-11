@@ -78,6 +78,7 @@ static HANDLE WINAPI k_GetStdHandle(DWORD n){ return n==STD_IN?H_STDIN: n==STD_O
 static BOOL WINAPI k_WriteFile(HANDLE h, const char *buf, DWORD n, DWORD *written, LPVOID ov){
   (void)ov;
   if(fs_is_handle(h)) return fs_hwrite(h,buf,n,written);
+  if(pipe_is_handle(h)) return pipe_write(h,buf,n,written);
   if(h!=H_STDOUT && h!=H_STDERR){ last_error=6; return 0; }   /* ERROR_INVALID_HANDLE */
   for(DWORD i=0;i<n;i++) kputc(buf[i]);
   if(written) *written=n;
@@ -93,7 +94,9 @@ static BOOL WINAPI k_WriteConsoleW(HANDLE h, const u16 *b, DWORD n, DWORD *w, LP
 static BOOL WINAPI k_ReadFile(HANDLE h, char *buf, DWORD n, DWORD *got, LPVOID ov){
   (void)ov;
   if(fs_is_handle(h)) return fs_hread(h,buf,n,got);
+  if(pipe_is_handle(h)) return pipe_read(h,buf,n,got);
   if(h!=H_STDIN){ last_error=6; return 0; }
+  if(cur->in_h) return pipe_read(cur->in_h,buf,n,got);                    /* stdin redirected from a pipe */
   DWORD r=n? kb_readline(buf,n):0; if(got) *got=r;
   return 1;
 }
@@ -149,7 +152,7 @@ static LPVOID WINAPI k_FlsGetValue(DWORD i){ if(i>=128) return 0; last_error=0; 
 static BOOL WINAPI k_FlsSetValue(DWORD i, LPVOID v){ if(i>=128) return 0; fls_slots[i]=(u64)v; return 1; }
 static HANDLE WINAPI k_GetCurrentProcess(void){ return (HANDLE)-1; }
 static HANDLE WINAPI k_GetCurrentThread(void){ return (HANDLE)-2; }
-static BOOL WINAPI k_CloseHandle(HANDLE h){ if(fs_is_handle(h)) fs_hclose(h); return 1; }
+static BOOL WINAPI k_CloseHandle(HANDLE h){ if(fs_is_handle(h)) fs_hclose(h); else if(pipe_is_handle(h)) pipe_close(h); else if(map_is_handle(h)) map_close(h); return 1; }
 static BOOL WINAPI k_TerminateProcess(HANDLE h, DWORD c){
   if(h>=0x8000 && h<0x8000+MAXPROC){ int pid=(int)(h-0x8000); if(pid!=cur->pid){ proc_last_exit[pid]=c; proc_kill(pid); return 1; } }
   proc_exit(c);
@@ -165,6 +168,11 @@ static BOOL WINAPI k_CreateProcessA(const char *app, char *cmd, void *pa, void *
   if(pid<0){ struct ramfile *f=fs_find(name); if(f && !f->isdir) pid=proc_spawn_data(fs_leaf(f),f->data,f->size,full,cur->cwd); }       /* an .exe stored on disk */
   if(pid<0){ last_error=2; return 0; }
   if((fl&0x40000000u) && pid>0 && pid<MAXPROC){ struct proc *c=&procs[pid]; c->cap=heap_alloc(32768); c->cap_w=c->cap_r=0; c->cap_on=c->cap!=0; }      /* Willows extension: capture the child's console output */
+  if(si && pid>0 && pid<MAXPROC && (*(u32*)((u8*)si+60)&0x100)){                                                                       /* STARTF_USESTDHANDLES: stdin/stdout may be pipes */
+    struct proc *c=&procs[pid]; u64 hin=*(u64*)((u8*)si+80), hout=*(u64*)((u8*)si+88);
+    if(pipe_is_handle(hout)){ c->out_h=hout; pipe_addref(hout); }
+    if(pipe_is_handle(hin)){ c->in_h=hin; pipe_addref(hin); }
+  }
   if(pi){ memset(pi,0,24); *(u64*)pi=0x8000+pid; *(u64*)((u8*)pi+8)=0x8000+pid; pi[4]=pid; pi[5]=pid; }
   return 1;
 }
@@ -190,8 +198,11 @@ static BOOL WINAPI k_GlobalMemoryStatusEx(u8 *ms){
 static BOOL WINAPI k_GetComputerNameA(char *b, DWORD *n){ const char *h="WILLOWS"; if(!b||!n||*n<8){ if(n) *n=8; return 0; } memcpy(b,h,8); *n=7; return 1; }
 static BOOL WINAPI k_GetUserNameA(char *b, DWORD *n){ const char *h="user"; if(!b||!n||*n<5){ if(n) *n=5; return 0; } memcpy(b,h,5); *n=5; return 1; }
 static u64 WINAPI sh_ShellExecuteA(u64 hwnd, const char *verb, const char *file, const char *params, const char *dir, i32 show){
-  (void)hwnd;(void)verb;(void)params;(void)dir;(void)show; if(!file) return 2;
-  if(shell_open(file)>=0) return 33; char t[128]; fs_canon(file,t,sizeof t); int pid=proc_spawn_cwd(file,file,cur->cwd); return pid>=0? 33 : 2;
+  (void)hwnd;(void)verb;(void)show; if(!file) return 2;
+  char cmd[300]; unsigned n=0; for(const char *p=file;*p&&n<250;) cmd[n++]=*p++;                    /* the command line is "file params" */
+  if(params&&*params){ cmd[n++]=' '; for(const char *p=params;*p&&n<298;) cmd[n++]=*p++; } cmd[n]=0;
+  if(!(params&&*params) && shell_open(file)>=0) return 33;
+  int pid=proc_spawn_cwd(file,cmd,dir&&*dir? dir : cur->cwd); if(pid<0 && shell_open(file)>=0) return 33; return pid>=0? 33 : 2;
 }
 static BOOL WINAPI u_ExitWindowsEx(DWORD flags, DWORD reason){ (void)reason; if(flags&2) power_restart(); power_off(); }
 static LPVOID WINAPI k_SetUnhandledExceptionFilter(LPVOID f){ (void)f; return 0; }
@@ -529,10 +540,14 @@ static const struct export *tab(int t, unsigned *n){
     case 8: *n=nt2_nexports; return nt2_exports;
     case 9: *n=hw_nexports; return hw_exports;
     case 10: *n=settings_nexports; return settings_exports;
+    case 11: *n=reg_nexports; return reg_exports;
+    case 12: *n=y_nexports; return y_exports;
+    case 13: *n=ipc_nexports; return ipc_exports;
+    case 14: *n=nt_nexports; return nt_exports;
     default: *n=inet_nexports; return inet_exports;
   }
 }
-#define FOR_ALL(e) for(int _t=0;_t<11;_t++) for(unsigned _n, _i=(tab(_t,&_n),0); _i<_n; _i++) for(const struct export *e=tab(_t,&_n)+_i; e; e=0)
+#define FOR_ALL(e) for(int _t=0;_t<15;_t++) for(unsigned _n, _i=(tab(_t,&_n),0); _i<_n; _i++) for(const struct export *e=tab(_t,&_n)+_i; e; e=0)
 static void *resolve_exact(const char *dll, const char *name){
   FOR_ALL(e) if(dll_eq(dll,e->dll) && strcmp(name,e->name)==0) return e->fn;
   return NULL;

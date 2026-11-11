@@ -100,3 +100,28 @@ Willows loads PE32+ DLLs from its file system ([src/dll.c](src/dll.c)): `LoadLib
 
 ## JavaScript (QuickJS)
 The browser runs page scripts with **QuickJS-ng** (vendored in `apps/qjs`, with a small libc layer and musl's math functions). `apps/web/js.h` exposes node primitives to JavaScript and `apps/web/prelude.js` builds the browser environment on top: `window`, `document`, elements (attributes, classList, style, dataset, innerHTML, querySelector, ...), events with capture/bubble, timers and `requestAnimationFrame`, `fetch`/`XMLHttpRequest` (any method, headers and body), `URL`, storage, `console` (output goes to the program's console/terminal). Scripts run after the first layout; DOM edits restyle and re-layout the page. Click, input, keydown and submit events are delivered to page handlers (`preventDefault()` works). `jstest "1+2"` runs QuickJS directly in the terminal. Not supported yet: ES modules (`type=module`), multipart/file uploads, Web Workers, canvas, media, `<iframe>`, hit-testing clicks on empty boxes (only text, images and controls).
+
+## Win32 coverage, batch 1
+- **Registry** (`src/registry.c`): a real in-memory hive for the `Reg*` functions (open/create/query/set/get/enum/delete/info, A and W). It starts with the values programs commonly read (Windows version, computer name, CPU name, folders) and is not saved between boots yet.
+- **Locks** (`src/win32y.c`): SRW locks, `InitOnce*`, `WaitOnAddress`, SLists. Willows schedules cooperatively, so these are correct but never block for long.
+- **COM/OLE basics**: `CoInitializeEx`, `CoTaskMem*`, GUID strings, `CoCreateGuid`, BSTRs (`Sys*String*`), `VariantInit/Clear`. `CoCreateInstance` reports "class not registered".
+- **Shell**: `SHGetKnownFolderPath`, `SHGetFolderPathA/W`, `SHGetSpecialFolderPath*`, `ShellExecuteW/ExA/ExW` (with arguments), `CommandLineToArgvW`, shlwapi path helpers.
+- **Processes**: `CreateProcessW`, `GetProcessId`, psapi (`EnumProcesses`, `GetProcessMemoryInfo`, module names), job objects (accepted, not enforced).
+- Run `apitest` (Start menu > Demos & tests; `apitest -v` lists every check) to verify: 43 checks.
+
+## Win32 coverage, batch 2
+- **Pipes** (`src/ipc.c`): anonymous pipes (`CreatePipe`, `PeekNamedPipe`) and duplex named pipes (`\\.\pipe\name` with `CreateNamedPipe`, `ConnectNamedPipe`, `CreateFile` as the client). Reads block until data or end-of-file. `CreateProcess` with `STARTF_USESTDHANDLES` redirects a child's stdin/stdout through pipes (so `subprocess`-style capture works); references are counted so the reader sees end-of-file when the child exits.
+- **File mappings**: `CreateFileMapping`/`OpenFileMapping`/`MapViewOfFile`/`Unmap`/`Flush`. Named mappings are real shared memory between programs (all programs share one address space); file-backed mappings read the file and write changes back on unmap.
+- **File helpers**: `LockFileEx`, `GetDiskFreeSpaceExW`, `GetFinalPathNameByHandle`, `SetFileInformationByHandle`, `DeviceIoControl` (fails), `CancelIo`.
+- **Native registry** (`src/registry.c`): `NtOpenKey`, `NtCreateKey`, `NtQueryValueKey`, `NtEnumerateKey/ValueKey`, `NtQueryKey`, `NtSetValueKey`, `NtDeleteKey`, `NtClose`, `RtlOpenCurrentUser` on the same in-memory hive.
+- **System queries** (`src/nt.c`): `NtQuerySystemInformation` (basic, processor, time of day, per-CPU performance), `NtQueryInformationProcess/Token`, `RtlExpandEnvironmentStrings`, `RtlGetNtVersionNumbers`, `BrandingFormatString`.
+- Run `apitest2` to verify: 33 checks (it starts `echo.exe` as a child with redirected stdin/stdout).
+
+## Win32 coverage, batch 3 (GDI)
+- **Clipping and regions** (`src/gdi2.inc`): `IntersectClipRect`, `ExcludeClipRect` (only cuts that remove a whole side), `SelectClipRgn`, `GetClipBox`, `SaveDC`/`RestoreDC`. Regions are rectangles (bounding-box arithmetic for `CombineRgn`); the clip applies to fills, lines, text and blits.
+- **Shapes**: `Ellipse`, `RoundRect`, `Polygon`/`PolyPolygon` (even-odd fill), `Arc`/`Pie`/`Chord`, `PolyBezier(To)`, `PolylineTo`, `FrameRect`, `InvertRect`, `FillRgn`/`FrameRgn`.
+- **Text**: `DrawText(Ex)A/W` (alignment, word-break, single line, `DT_CALCRECT`, `&` prefixes, end ellipsis), `TextOutW`/`GetTextExtentPoint32W` now keep non-ASCII text (UTF-16 to UTF-8), `CreateFontW`/`CreateFontIndirectW`, `EnumFontFamilies(Ex)`, `GetTextFace`.
+- **Bitmaps**: `CreateDIBSection` (32-bit top-down shares the pixel buffer; other formats and bottom-up DIBs are converted when blitted), `GetDIBits`, `SetDIBits`, `SetDIBitsToDevice`, `CreateDIBitmap`, `GetBitmapBits`/`SetBitmapBits`.
+- **Blending**: `AlphaBlend` (constant and per-pixel alpha), `TransparentBlt`, `GradientFill` (horizontal, vertical, triangles).
+- Not done: paths (`BeginPath`...), true complex regions, window/viewport origin translation, `MaskBlt`.
+- Run `apitest3` (`-v` lists each check; 29 checks) or `apitest3 gdi` for a window that shows the shapes.

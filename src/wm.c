@@ -698,10 +698,13 @@ static struct wnd *dc_target(u64 dc){
   if(dc>=DCBASE && dc<DCBASE+MAXW){ struct wnd *w=&W[dc-DCBASE]; return (w->used&&w->pix)? w : 0; }
   return surface();
 }
+int dc_clip(u64 dc, int *r);                                          /* gdi.inc: the DC's clip rectangle, if one is set */
 void wm_gdi_rect(u64 dc,int x,int y,int w,int h,u32 c){
   if(!wm_on){ gfx_rect(x,y,w,h,c); return; }
   struct wnd *s=dc_target(dc); if(!s) return;
-  if(x<0){ w+=x; x=0; } if(y<0){ h+=y; y=0; } if(x+w>s->pw) w=s->pw-x; if(y+h>s->ph) h=s->ph-y; if(w<=0||h<=0) return;
+  if(x<0){ w+=x; x=0; } if(y<0){ h+=y; y=0; } if(x+w>s->pw) w=s->pw-x; if(y+h>s->ph) h=s->ph-y;
+  { int cl[4]; if(dc_clip(dc,cl)){ if(x<cl[0]){ w-=cl[0]-x; x=cl[0]; } if(y<cl[1]){ h-=cl[1]-y; y=cl[1]; } if(x+w>cl[2]) w=cl[2]-x; if(y+h>cl[3]) h=cl[3]-y; } }
+  if(w<=0||h<=0) return;
   for(int j=0;j<h;j++){ u32 *p=s->pix+(u64)(y+j)*s->stride+x; for(int i=0;i<w;i++) p[i]=c; }
   dirty=1;
 }
@@ -1020,8 +1023,10 @@ static i32 WINAPI cd_GetSaveFileNameA(u8 *ofn){ return file_dialog(ofn,1); }
 #define U(n) {"user32", #n, w_##n}
 #include "dialog2.inc"
 #include "gdi.inc"
+#include "gdi2.inc"
 const struct export wm_exports[]={
   GDI_EXPORTS
+  GDI2_EXPORTS
   DLG_EXPORTS
   {"gdi32","StretchDIBits",w_StretchDIBits},
   U(RegisterClassA), {"user32","RegisterClassExA",w_RegisterClassA}, U(CreateWindowExA), U(DefWindowProcA), U(DestroyWindow),
