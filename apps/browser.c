@@ -108,6 +108,27 @@ static void urlenc(char *out, int max, const char *s){
 
 /* ---------- networking ---------- */
 /* Fetches url into a malloc'd buffer (NUL terminated). Returns 0 on failure. */
+/* Open a request. Willows' wininet has one call for any method/headers/body; Windows and Wine do not, so look it up at run time
+   and fall back to the standard InternetConnect/HttpOpenRequest/HttpSendRequest calls. *conn receives a connection handle to close afterwards. */
+static HANDLE open_request(const char *url, const char *method, const char *hdrs, const void *body, int blen, HANDLE *conn){
+  static HANDLE (WINAPI *willows)(HANDLE, const char *, const char *, const char *, const void *, DWORD); static int looked;
+  *conn = 0;
+  if(!looked){ looked = 1; HANDLE m = API(kernel32, LoadLibraryA)("wininet.dll"); willows = m ? API(kernel32, GetProcAddress)(m, "WillowsHttpRequest") : 0; }
+  if(willows) return willows(hnet, url, method, hdrs, body, (DWORD)blen);
+  HANDLE m = API(kernel32, LoadLibraryA)("wininet.dll"); if(!m) return 0;
+  HANDLE (WINAPI *connect_)(HANDLE, const char *, unsigned short, const char *, const char *, DWORD, DWORD, unsigned long long) = API(kernel32, GetProcAddress)(m, "InternetConnectA");
+  HANDLE (WINAPI *openreq)(HANDLE, const char *, const char *, const char *, const char *, const char **, DWORD, unsigned long long) = API(kernel32, GetProcAddress)(m, "HttpOpenRequestA");
+  BOOL (WINAPI *sendreq)(HANDLE, const char *, DWORD, void *, DWORD) = API(kernel32, GetProcAddress)(m, "HttpSendRequestA");
+  if(!connect_ || !openreq || !sendreq) return API(wininet, InternetOpenUrlA)(hnet, url, 0, 0, 0, 0);
+  int https = !strncmp(url, "https://", 8); const char *p = url + (https ? 8 : 7); char host[260]; int k = 0; unsigned port = https ? 443 : 80;
+  while(*p && *p != '/' && *p != ':' && k < 255) host[k++] = *p++; host[k] = 0;
+  if(*p == ':'){ p++; port = 0; while(*p >= '0' && *p <= '9') port = port * 10 + (unsigned)(*p++ - '0'); }
+  const char *path = *p ? p : "/";
+  HANDLE c = connect_(hnet, host, (unsigned short)port, 0, 0, 3, 0, 0); if(!c) return 0;
+  HANDLE r = openreq(c, method, path, 0, 0, 0, (https ? 0x00800000u : 0) | 0x80000000u | 0x04000000u, 0);   /* secure, reload, no cache write */
+  if(!r || !sendreq(r, hdrs && hdrs[0] ? hdrs : 0, hdrs ? (DWORD)strlen(hdrs) : 0, (void *)body, (DWORD)blen)){ if(r) API(wininet, InternetCloseHandle)(r); API(wininet, InternetCloseHandle)(c); return 0; }
+  *conn = c; return r;
+}
 static unsigned char *http_request(const char *url, const char *method, const char *hdrs, const void *body, int blen, int maxbytes, int *outlen, char *ctype, int ctlen, char *final_url, int fulen, DWORD *status, int show_progress){
   if(!strncmp(url, "file://", 7)){
     HANDLE f = API(kernel32, CreateFileA)(url + 7, 0x80000000u, 1, 0, 3, 0x80, 0); if(f == (HANDLE)(long long)-1 || !f) return 0;
@@ -117,20 +138,20 @@ static unsigned char *http_request(const char *url, const char *method, const ch
     if(ctype){ int ul = (int)strlen(url); snprintf(ctype, ctlen, "%s", ul > 4 && (!strcasecmp_(url + ul - 4, ".png")) ? "image/png" : ul > 4 && (!strcasecmp_(url + ul - 4, ".jpg") || !strcasecmp_(url + ul - 5, ".jpeg")) ? "image/jpeg" : ul > 4 && !strcasecmp_(url + ul - 4, ".gif") ? "image/gif" : ul > 4 && !strcasecmp_(url + ul - 4, ".css") ? "text/css" : ul > 4 && !strcasecmp_(url + ul - 4, ".txt") ? "text/plain" : "text/html"); }
     return b;
   }
-  HANDLE h = API(wininet, WillowsHttpRequest)(hnet, url, method, hdrs, body, (DWORD)blen);
+  HANDLE conn; HANDLE h = open_request(url, method, hdrs, body, blen, &conn);
   if(!h) return 0;
   if(final_url){ DWORD fl = (DWORD)fulen; if(!API(wininet, InternetQueryOptionA)(h, 34, final_url, &fl)) snprintf(final_url, fulen, "%s", url); }
   DWORD st = 0, sl = 4; API(wininet, HttpQueryInfoA)(h, 19 | 0x20000000, &st, &sl, 0); if(status) *status = st;
   if(ctype){ ctype[0] = 0; DWORD cl = (DWORD)ctlen; API(wininet, HttpQueryInfoA)(h, 1, ctype, &cl, 0); }
   if(ctype && (!strncmp(ctype, "text/", 5) || !strncmp(ctype, "image/", 6) || strstr(ctype, "json") || strstr(ctype, "xml")) && maxbytes > (6 << 20)) maxbytes = 6 << 20;   /* pages and images stay small; downloads may be big */
-  int cap = 1 << 16, n = 0; unsigned char *buf = malloc(cap); if(!buf){ API(wininet, InternetCloseHandle)(h); return 0; } DWORD got;
+  int cap = 1 << 16, n = 0; unsigned char *buf = malloc(cap); if(!buf){ API(wininet, InternetCloseHandle)(h); if(conn) API(wininet, InternetCloseHandle)(conn); return 0; } DWORD got;
   while(API(wininet, InternetReadFile)(h, buf + n, cap - n - 1, &got) && got){
     n += got;
     if(n + 4096 > cap){ if(cap >= maxbytes) break; cap *= 2; unsigned char *nb = realloc(buf, cap); if(!nb) break; buf = nb; }
     if(show_progress && (n >> 14) != ((n - (int)got) >> 14)){ char pm[120]; snprintf(pm, sizeof pm, "Loading %s ... %d KB", url, n / 1024); set_status(pm); repaint_now(); }
     if(n >= maxbytes) break;
   }
-  buf[n] = 0; API(wininet, InternetCloseHandle)(h); *outlen = n; return buf;
+  buf[n] = 0; API(wininet, InternetCloseHandle)(h); if(conn) API(wininet, InternetCloseHandle)(conn); *outlen = n; return buf;
 }
 static unsigned char *http_get(const char *url, int maxbytes, int *outlen, char *ctype, int ctlen, char *final_url, int fulen, DWORD *status, int show_progress){
   return http_request(url, "GET", 0, 0, 0, maxbytes, outlen, ctype, ctlen, final_url, fulen, status, show_progress);
@@ -482,6 +503,20 @@ static void draw_control(HANDLE dc, struct op *o, int x, int y){
     fill(dc, x + o->w - 18, y + o->h / 2 - 2, 9, 2, 0xFF4B5563); fill(dc, x + o->w - 16, y + o->h / 2, 5, 2, 0xFF4B5563); fill(dc, x + o->w - 14, y + o->h / 2 + 2, 1, 2, 0xFF4B5563);
   }
 }
+static int isqrt_(int v){ int r = 0; while((r + 1) * (r + 1) <= v) r++; return r; }
+static void round_fill(HANDLE dc, int x, int y, int w, int h, int r, unsigned rgb){
+  if(w <= 0 || h <= 0) return; if(r > w / 2) r = w / 2; if(r > h / 2) r = h / 2; if(r < 0) r = 0;
+  for(int i = 0; i < r; i++){                                         /* corner rows: inset from the circle equation (2x scale for half-pixel centres) */
+    int dy = 2 * (r - i) - 1; int inset = r - (isqrt_(4 * r * r - dy * dy) + 1) / 2;
+    fill(dc, x + inset, y + i, w - 2 * inset, 1, rgb); fill(dc, x + inset, y + h - 1 - i, w - 2 * inset, 1, rgb);
+  }
+  fill(dc, x, y + r, w, h - 2 * r, rgb);
+}
+static void round_box(HANDLE dc, int x, int y, int w, int h, struct op *o){
+  int r = o->rad;
+  if(o->bwid > 0){ round_fill(dc, x, y, w, h, r, o->bcol); round_fill(dc, x + o->bwid, y + o->bwid, w - 2 * o->bwid, h - 2 * o->bwid, r - o->bwid > 0 ? r - o->bwid : 0, o->icol); }
+  else round_fill(dc, x, y, w, h, r, o->color);
+}
 static void paint(HANDLE dc){
   int top = TOOLBAR, bottom = view_h + TOOLBAR;
   fill(dc, 0, top, view_w + SCROLLW, view_h, canvas_bg);
@@ -491,7 +526,7 @@ static void paint(HANDLE dc){
     if(y + o->h < top || y > bottom) continue;
     int x = o->x;
     switch(o->kind){
-      case OP_RECT: fill(dc, x, y, o->w, o->h, o->color); break;
+      case OP_RECT: if(o->rad > 0) round_box(dc, x, y, o->w, o->h, o); else fill(dc, x, y, o->w, o->h, o->color); break;
       case OP_TEXT: text_at(dc, o->font, x, y, o->text, o->len, o->color); break;
       case OP_IMG: draw_image(dc, o, x, y); break;
       case OP_INPUT: draw_control(dc, o, x, y); break;

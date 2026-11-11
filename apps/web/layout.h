@@ -16,7 +16,7 @@ static struct res res[MAXRES]; static int nres;
 
 /* ---------- display list ---------- */
 enum { OP_RECT, OP_TEXT, OP_IMG, OP_INPUT, OP_BOX };
-struct op { unsigned char kind, flags; short font; int x, y, w, h; unsigned color; int link, node; const char *text; int len; };
+struct op { unsigned char kind, flags; short font; int x, y, w, h; unsigned color; int link, node; const char *text; int len; short rad, bwid; unsigned bcol, icol; };   /* rad/bwid/bcol/icol: rounded box with a uniform border */
 static struct op *ops; static int nops, opcap;
 static int page_h, page_w; static unsigned canvas_bg = 0xFFFFFFFFu;
 static int g_link_count;
@@ -50,8 +50,8 @@ static int fi_of(const struct style *st){ return font_get(st->mono, st->bold, st
 static int has_class(int n, const char *c){ const char *cl = attr_of(n, "class"); return cl && class_has(cl, c); }
 static int establishes_bfc(int n){
   struct style *s = N(n).st; if(N(n).parent < 0) return 1;
-  { int pp = N(n).parent; if(pp >= 0 && N(pp).st && (N(pp).st->display == D_FLEX || N(pp).st->display == D_INLINE_FLEX)) return 1; }
-  return s->overflow_hidden || s->flt || s->display == D_INLINE_BLOCK || s->display == D_CELL || s->display == D_FLEX || s->display == D_INLINE_FLEX || has_class(n, "clearfix") || has_class(n, "cf") || has_class(n, "clear");
+  { int pp = N(n).parent; if(pp >= 0 && N(pp).st && (N(pp).st->display == D_FLEX || N(pp).st->display == D_INLINE_FLEX || N(pp).st->display == D_GRID)) return 1; }
+  return s->overflow_hidden || s->flt || s->display == D_INLINE_BLOCK || s->display == D_CELL || s->display == D_FLEX || s->display == D_INLINE_FLEX || s->display == D_GRID || has_class(n, "clearfix") || has_class(n, "cf") || has_class(n, "clear");
 }
 
 /* ---------- floats ---------- */
@@ -436,6 +436,7 @@ static void emit_marker(int n, int cx, int base, int fi){
 }
 static void lay_table(int n, int x, int *py, int availw, int bw);
 static void lay_flex(int n, int cx, int *cy, int cw);
+static void lay_grid(int n, int cx, int *cy, int cw);
 
 /* lay out the children of n (a block container) in the content box [cx, cx+cw), starting at *cy */
 static void lay_children(int n, int cx, int *cy, int cw){
@@ -515,6 +516,7 @@ static int lay_block(int n, int x, int y, int availw, int bw){
   int cx = ox + b.bl + b.pl;
   int bgop = -1; unsigned bg = s->bg;
   if(bg >> 24) bgop = op_rect(ox, y, bw, 0, bg);
+  else if(s->radius > 0 && (b.bt || b.br || b.bb || b.bl)){ bgop = op_add(OP_RECT, ox, y, bw, 0); }       /* rounded border without a background */
   int save_nfl = nfl, save_base = fl_base; int bfc = establishes_bfc(n) && N(n).parent >= 0;
   if(bfc){ fl_base = nfl; }
   int cy = y + b.bt + b.pt; int content_top = cy;
@@ -531,6 +533,7 @@ static int lay_block(int n, int x, int y, int availw, int bw){
   }
   if(!mypp){
     if(s->display == D_FLEX || s->display == D_INLINE_FLEX){ lay_flex(n, cx, &cy, cw); }
+    else if(s->display == D_GRID){ lay_grid(n, cx, &cy, cw); }
     else if(s->display == D_TABLE){ /* handled by the caller normally; here via inline-block table */ int ty = cy; lay_table(n, cx, &ty, cw, 0); cy = ty; }
     else lay_children(n, cx, &cy, cw);
   }
@@ -549,7 +552,14 @@ static int lay_block(int n, int x, int y, int availw, int bw){
   if(s->overflow_hidden && (s->height.u == 1 || s->maxh.u == 1)) ops_clip_below(child_ops0, y + bh);
   if(bgop >= 0) ops[bgop].h = bh;
   g_r_bg = bgop; g_r_b0 = -1; g_r_bn = 0;
-  if(b.bt || b.br || b.bb || b.bl){
+  int ring = 0;                                                         /* rounded box: draw the uniform border as a ring in the same op */
+  if(s->radius > 0 && bgop >= 0){
+    int r = s->radius; if(r > bw / 2) r = bw / 2; if(r > bh / 2) r = bh / 2; ops[bgop].rad = (short)r; ops[bgop].icol = (bg >> 24) ? bg : s->eff_bg;
+    if(b.bt && b.bt == b.br && b.br == b.bb && b.bb == b.bl && s->border_c[0] == s->border_c[1] && s->border_c[1] == s->border_c[2] && s->border_c[2] == s->border_c[3]){
+      unsigned bc = s->border_c[0] == COL_CURRENT ? s->color : s->border_c[0]; if(bc >> 24){ ops[bgop].bwid = (short)b.bt; ops[bgop].bcol = bc; ring = 1; } }
+    if(!(bg >> 24) && !ring) ops[bgop].rad = 0;
+  }
+  if(!ring && (b.bt || b.br || b.bb || b.bl)){
     unsigned cc[4]; for(int i = 0; i < 4; i++){ cc[i] = s->border_c[i] == COL_CURRENT ? s->color : s->border_c[i]; if(!(cc[i] >> 24)) cc[i] = 0; }
     int first_i = nops; int ok = 1;
     int i0 = op_add(OP_RECT, ox, y, bw, b.bt); if(i0 < 0) ok = 0; else { ops[i0].color = cc[0]; if(!b.bt || !cc[0]) ops[i0].h = 0; }
@@ -787,6 +797,55 @@ static void lay_flex(int n, int cx, int *cy, int cw){
       else if(mode == 2) ops_shift(it[k].i0, it[k].i1, 0, avail_h - it[k].h);
     }
     y += lineh + (j < cnt ? gy : 0); i = j;
+  }
+  *cy = y; free(it);
+}
+
+/* CSS grid: explicit column tracks (fr/px/%/auto/repeat), auto row placement, gaps, align-items */
+struct gitem { int n, col, span, row, i0, i1, h, mt, mb, ml, mr, bg, b0, bn, x, w; };
+static void lay_grid(int n, int cx, int *cy, int cw){
+  struct style *s = N(n).st; int gx = s->gap_x, gy = s->gap_y;
+  int tt[40], tv[40], nc = 0;                                           /* expanded tracks: type, value */
+  for(int i = 0; i < s->ncols && nc < 32; i++){
+    int t = s->cols[i].t, v = s->cols[i].v;
+    if(t == 5 || t == 6){ int cnt = (cw + gx) / (v + gx > 0 ? v + gx : 1); if(cnt < 1) cnt = 1; if(cnt > 24) cnt = 24; for(int k = 0; k < cnt && nc < 32; k++){ tt[nc] = t == 5 ? 3 : 1; tv[nc] = t == 5 ? 1000 : v; nc++; } }
+    else { tt[nc] = t == 4 ? 3 : t; tv[nc] = t == 4 ? 1000 : v; nc++; }                         /* auto is treated as 1fr */
+  }
+  if(nc == 0){ tt[0] = 3; tv[0] = 1000; nc = 1; }
+  int colw[32], colx[32], fixed = 0, frsum = 0;
+  for(int i = 0; i < nc; i++){ if(tt[i] == 1){ colw[i] = tv[i]; fixed += colw[i]; } else if(tt[i] == 2){ colw[i] = (int)((long long)cw * tv[i] / 100000); fixed += colw[i]; } else { colw[i] = 0; frsum += tv[i]; } }
+  int avail = cw - fixed - gx * (nc - 1); if(avail < 0) avail = 0;
+  for(int i = 0; i < nc; i++) if(tt[i] == 3) colw[i] = frsum ? (int)((long long)avail * tv[i] / frsum) : 0;
+  { int x = 0; for(int i = 0; i < nc; i++){ colx[i] = x; x += colw[i] + gx; } }
+  struct gitem *it = 0; int cnt = 0, cap = 0;
+  for(int c = N(n).first; c >= 0; c = N(c).next){
+    if(N(c).type != 0 || is_display_none(c) || N(c).st->position == POS_ABSOLUTE) continue;
+    if(cnt >= cap){ cap = cap ? cap * 2 : 16; struct gitem *p = realloc(it, (size_t)cap * sizeof *p); if(!p){ free(it); return; } it = p; }
+    struct box b; resolve_box(c, cw, &b); struct gitem *g = &it[cnt++]; memset(g, 0, sizeof *g); g->n = c; g->ml = b.ml; g->mr = b.mr; g->mt = b.mt; g->mb = b.mb;
+    g->span = N(c).st->grid_span > 0 ? N(c).st->grid_span : 1; if(g->span > nc) g->span = nc;
+  }
+  int col = 0, row = 0;
+  for(int i = 0; i < cnt; i++){ if(col + it[i].span > nc){ col = 0; row++; } it[i].col = col; it[i].row = row; col += it[i].span; if(col >= nc){ col = 0; row++; } }
+  int y = *cy, i = 0;
+  while(i < cnt){
+    int r = it[i].row, j = i, rowh = 0;
+    while(j < cnt && it[j].row == r) j++;
+    for(int k = i; k < j; k++){
+      int w = 0; for(int c = it[k].col; c < it[k].col + it[k].span; c++) w += colw[c]; w += gx * (it[k].span - 1);
+      int iw = w - it[k].ml - it[k].mr; if(iw < 0) iw = 0; it[k].w = iw;
+      it[k].i0 = nops; int h = lay_block(it[k].n, cx + colx[it[k].col] + it[k].ml, y + it[k].mt, iw, iw);
+      it[k].i1 = nops; it[k].h = h; it[k].bg = g_r_bg; it[k].b0 = g_r_b0; it[k].bn = g_r_bn;
+      rowh = imax(rowh, h + it[k].mt + it[k].mb);
+    }
+    for(int k = i; k < j; k++){                                           /* align-items: 0 stretch (default), 1 center, 2 end, 4 start */
+      struct style *cs = N(it[k].n).st; int mode = s->align_items;
+      if(cs->align_self == 1) mode = 0; else if(cs->align_self == 2) mode = 1; else if(cs->align_self == 3) mode = 2;
+      int avail_h = rowh - it[k].mt - it[k].mb; if(avail_h <= it[k].h) continue;
+      if(mode == 0 && cs->height.u == 0) stretch_box(it[k].bg, it[k].b0, it[k].bn, avail_h);
+      else if(mode == 1) ops_shift(it[k].i0, it[k].i1, 0, (avail_h - it[k].h) / 2);
+      else if(mode == 2) ops_shift(it[k].i0, it[k].i1, 0, avail_h - it[k].h);
+    }
+    y += rowh + (j < cnt ? gy : 0); i = j;
   }
   *cy = y; free(it);
 }

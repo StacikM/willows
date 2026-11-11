@@ -3,7 +3,7 @@
 #define WEB_CSS_H
 #include "dom.h"
 
-enum { D_NONE, D_BLOCK, D_INLINE, D_INLINE_BLOCK, D_LIST_ITEM, D_TABLE, D_ROW_GROUP, D_ROW, D_CELL, D_CAPTION, D_FLEX, D_INLINE_FLEX, D_COL, D_CONTENTS };
+enum { D_NONE, D_BLOCK, D_INLINE, D_INLINE_BLOCK, D_LIST_ITEM, D_TABLE, D_ROW_GROUP, D_ROW, D_CELL, D_CAPTION, D_FLEX, D_INLINE_FLEX, D_COL, D_CONTENTS, D_GRID };
 enum { POS_STATIC, POS_RELATIVE, POS_ABSOLUTE, POS_FIXED };
 enum { FL_NONE, FL_LEFT, FL_RIGHT };
 enum { TA_LEFT, TA_CENTER, TA_RIGHT, TA_JUSTIFY };
@@ -15,6 +15,7 @@ enum { BS_NONE, BS_SOLID, BS_DASHED, BS_DOTTED };
 #define CV_MAX 320
 struct cvars { int n; struct { const char *name, *val; short nl, vl; } e[CV_MAX]; };      /* custom properties in scope (shared by descendants) */
 struct len { int v; unsigned char u; };                /* u: 0 auto/none, 1 px, 2 percent (v in 1/1000 of a percent... i.e. v/1000 %) */
+struct gtrack { int t, v; };                             /* grid track: t 1 px, 2 % (milli), 3 fr (milli), 4 auto, 5 repeat(auto-fit, minmax(v px, 1fr)), 6 repeat(auto-fit, v px) */
 struct style {
   unsigned char display, position, flt, clear, text_align, white_space, visibility, list_type, text_transform, underline, linethru, bold, italic, mono;
   unsigned char valign, overflow_hidden, box_sizing, flex_dir, flex_wrap, justify, align_items, align_self, hidden_all, border_collapse;
@@ -25,6 +26,9 @@ struct style {
   int border_w[4]; unsigned border_c[4];
   int flex_grow, flex_shrink, gap_x, gap_y, spacing, text_indent, opacity;
   struct cvars *cv;
+  short radius;                                         /* border-radius in px (first value; percentages become large) */
+  unsigned char ncols; int grid_span; struct gtrack cols[10];   /* grid-template-columns, grid-column span */
+  unsigned eff_bg;                                      /* opaque colour behind this element's children (for alpha colours) */
 };
 
 /* ---------- number / colour helpers ---------- */
@@ -51,6 +55,8 @@ static const struct { const char *n; unsigned c; } NAMED[] = {
   {"seashell",0xFFF5EE},{"lightyellow",0xFFFFE0},{"lightcyan",0xE0FFFF},{"lightpink",0xFFB6C1},{"lightsalmon",0xFFA07A},{"darkviolet",0x9400D3},{"darkcyan",0x008B8B},{"darkslategray",0x2F4F4F},
   {"cadetblue",0x5F9EA0},{"darkkhaki",0xBDB76B},{"peru",0xCD853F},{"wheat",0xF5DEB3},{"thistle",0xD8BFD8},{"mediumpurple",0x9370DB},{"slateblue",0x6A5ACD},{"deepskyblue",0x00BFFF},
 };
+static unsigned part_alpha(unsigned r, unsigned g, unsigned b, unsigned a){ if(a >= 254) return 0xFF000000u | (r << 16) | (g << 8) | b; return (a << 24) | (r << 16) | (g << 8) | b; }   /* alpha 1..253: kept until the backdrop is known */
+static unsigned flat_over(unsigned c, unsigned base){ unsigned a = c >> 24; if(a == 0 || a >= 254) return c; unsigned r = (((c >> 16) & 255) * a + ((base >> 16) & 255) * (255 - a)) / 255, g = (((c >> 8) & 255) * a + ((base >> 8) & 255) * (255 - a)) / 255, b = ((c & 255) * a + (base & 255) * (255 - a)) / 255; return 0xFF000000u | (r << 16) | (g << 8) | b; }
 static unsigned blend_white(unsigned r, unsigned g, unsigned b, unsigned a){ r = (r * a + 255 * (255 - a)) / 255; g = (g * a + 255 * (255 - a)) / 255; b = (b * a + 255 * (255 - a)) / 255; return 0xFF000000u | (r << 16) | (g << 8) | b; }
 static int hex1(int c){ return isdigit(c) ? c - '0' : (tolower(c) >= 'a' && tolower(c) <= 'f') ? tolower(c) - 'a' + 10 : -1; }
 static int parse_color(const char *s, int n, unsigned *out){
@@ -61,7 +67,7 @@ static int parse_color(const char *s, int n, unsigned *out){
     for(int i = 0; i < k; i++){ h[i] = hex1((unsigned char)s[1 + i]); if(h[i] < 0) return 0; }
     unsigned r, g, b, a = 255;
     if(k <= 4){ r = h[0] * 17; g = h[1] * 17; b = h[2] * 17; if(k == 4) a = h[3] * 17; } else { r = h[0] * 16 + h[1]; g = h[2] * 16 + h[3]; b = h[4] * 16 + h[5]; if(k == 8) a = h[6] * 16 + h[7]; }
-    *out = a == 255 ? (0xFF000000u | (r << 16) | (g << 8) | b) : (a == 0 ? 0 : blend_white(r, g, b, a)); return 1;
+    *out = a == 255 ? (0xFF000000u | (r << 16) | (g << 8) | b) : (a == 0 ? 0 : part_alpha(r, g, b, a)); return 1;
   }
   if(n > 4 && !strncasecmp_(s, "rgb", 3)){
     const char *p = s + 3; const char *end = s + n; if(p < end && (*p == 'a' || *p == 'A')) p++;
@@ -78,7 +84,7 @@ static int parse_color(const char *s, int n, unsigned *out){
     if(nv < 3) return 0;
     for(int i = 0; i < 3; i++){ v[i] = (v[i] + 500) / 1000; if(v[i] < 0) v[i] = 0; if(v[i] > 255) v[i] = 255; }
     int a = nv == 4 ? v[3] : 1000; if(a < 0) a = 0; if(a > 1000) a = 1000; a = a * 255 / 1000;
-    *out = a >= 255 ? (0xFF000000u | (v[0] << 16) | (v[1] << 8) | v[2]) : (a == 0 ? 0 : blend_white(v[0], v[1], v[2], a)); return 1;
+    *out = a >= 255 ? (0xFF000000u | (v[0] << 16) | (v[1] << 8) | v[2]) : (a == 0 ? 0 : part_alpha(v[0], v[1], v[2], a)); return 1;
   }
   if(n > 4 && !strncasecmp_(s, "hsl", 3)){
     const char *p = s + 3; const char *end = s + n; if(p < end && (*p == 'a' || *p == 'A')) p++;
@@ -101,7 +107,7 @@ static int parse_color(const char *s, int n, unsigned *out){
     int m = ll - c / 2; int R = (r1 + m) * 255 / 1000, G = (g1 + m) * 255 / 1000, B = (b1 + m) * 255 / 1000;
     if(R < 0) R = 0; if(R > 255) R = 255; if(G < 0) G = 0; if(G > 255) G = 255; if(B < 0) B = 0; if(B > 255) B = 255;
     int a = nv == 4 ? v[3] * 255 / 1000 : 255; if(a > 255) a = 255; if(a < 0) a = 0;
-    *out = a >= 255 ? (0xFF000000u | (R << 16) | (G << 8) | B) : (a == 0 ? 0 : blend_white(R, G, B, a)); return 1;
+    *out = a >= 255 ? (0xFF000000u | (R << 16) | (G << 8) | B) : (a == 0 ? 0 : part_alpha(R, G, B, a)); return 1;
   }
   if(n == 11 && !strncasecmp_(s, "transparent", 11)){ *out = 0; return 1; }
   if(n == 12 && !strncasecmp_(s, "currentcolor", 12)){ *out = COL_CURRENT; return 1; }
@@ -116,7 +122,7 @@ static int parse_color(const char *s, int n, unsigned *out){
   X(border_right) X(border_bottom) X(border_left) X(border_top_width) X(border_right_width) X(border_bottom_width) X(border_left_width) X(border_top_color) X(border_right_color) \
   X(border_bottom_color) X(border_left_color) X(border_top_style) X(border_right_style) X(border_bottom_style) X(border_left_style) X(width) X(height) X(min_width) X(max_width) X(min_height) \
   X(max_height) X(box_sizing) X(list_style) X(list_style_type) X(vertical_align) X(flex) X(flex_grow) X(flex_shrink) X(flex_basis) X(flex_direction) X(flex_wrap) X(flex_flow) X(justify_content) \
-  X(align_items) X(align_self) X(gap) X(column_gap) X(row_gap) X(border_collapse) X(border_spacing) X(text_indent) X(inset) X(top) X(left) X(right) X(bottom)
+  X(align_items) X(align_self) X(gap) X(column_gap) X(row_gap) X(border_collapse) X(border_spacing) X(text_indent) X(inset) X(top) X(left) X(right) X(bottom) X(grid_template_columns) X(grid_column) X(border_radius)
 enum { P_NONE,
 #define X(n) P_##n,
   PROPS(X)
@@ -439,6 +445,21 @@ static int len_from(const char *s, int n, int em, struct len *out){
   if(n <= 0) return 0;
   if(n == 4 && !strncasecmp_(s, "auto", 4)){ out->u = 0; out->v = 0; return 1; }
   if((n == 4 && !strncasecmp_(s, "none", 4)) || (n == 7 && !strncasecmp_(s, "initial", 7)) || (n == 5 && !strncasecmp_(s, "unset", 5))){ out->u = 0; out->v = 0; return 1; }
+  if((n > 4 && !strncasecmp_(s, "min(", 4)) || (n > 4 && !strncasecmp_(s, "max(", 4)) || (n > 6 && !strncasecmp_(s, "clamp(", 6))){   /* comparison functions: each argument is itself a length */
+    int kind = s[1] == 'i' || s[1] == 'I' ? 0 : s[1] == 'a' || s[1] == 'A' ? 1 : 2; const char *p = s + (kind == 2 ? 6 : 4), *end = s + n - 1;
+    struct len a[3]; int na = 0; int depth = 0; const char *st0 = p;
+    for(const char *q = p; q <= end && na < 3; q++){
+      if(q < end && *q == '(') depth++; else if(q < end && *q == ')') depth--;
+      if(q == end || (*q == ',' && depth == 0)){ if(!len_from(st0, (int)(q - st0), em, &a[na])) return 0; na++; st0 = q + 1; }
+    }
+    if(na < 1 || (kind == 2 && na != 3)) return 0;
+    for(int i = 1; i < na; i++) if(a[i].u != a[0].u){ *out = a[0]; return 1; }                  /* px and % cannot be compared here: keep the first */
+    int v;
+    if(kind == 0){ v = a[0].v; for(int i = 1; i < na; i++) if(a[i].v < v) v = a[i].v; }
+    else if(kind == 1){ v = a[0].v; for(int i = 1; i < na; i++) if(a[i].v > v) v = a[i].v; }
+    else { v = a[1].v < a[2].v ? a[1].v : a[2].v; if(a[0].v > v) v = a[0].v; }
+    out->u = a[0].u; out->v = v; return 1;
+  }
   if(n > 5 && !strncasecmp_(s, "calc(", 5)){                           /* a sum of terms of a single kind (all px/em, or a single %); mixed terms are not representable */
     const char *p = s + 5, *end = s + n - 1; int sum_px = 0, sum_pc = 0, sign = 1; int havepx = 0, havepc = 0;
     while(p < end){
@@ -544,6 +565,33 @@ static int font_size_value(const char *s, int n, int parent_px, int *out){
   if(*out < 1) *out = 1; return 1;
 }
 static int strstr_n(const char *s, int n, const char *needle);
+/* grid-template-columns: fr / px / % / auto tracks, repeat(n, ...), repeat(auto-fit|auto-fill, minmax(Npx, 1fr)) */
+static void add_track(struct style *st, int t, int v){ if(st->ncols < 10){ st->cols[st->ncols].t = t; st->cols[st->ncols].v = v; st->ncols++; } }
+static void one_track(const char *s, int n, int em, struct style *st){
+  while(n > 0 && css_ws(*s)){ s++; n--; } while(n > 0 && css_ws(s[n - 1])) n--; if(n <= 0) return;
+  if(n > 7 && !strncasecmp_(s, "minmax(", 7)){ const char *c = memchr(s, ',', n); if(!c){ add_track(st, 4, 0); return; } int rest = (int)(s + n - 1 - (c + 1)); one_track(c + 1, rest, em, st); return; }   /* minmax(a, b): use b */
+  int m; const char *q = s; if(parse_milli(&q, s + n, &m) && s + n - q == 2 && !strncasecmp_(q, "fr", 2)){ add_track(st, 3, m); return; }
+  struct len l; if(len_from(s, n, em, &l)){ if(l.u == 1) add_track(st, 1, l.v); else if(l.u == 2) add_track(st, 2, l.v); else add_track(st, 4, 0); return; }
+  add_track(st, 4, 0);
+}
+static void parse_tracks(const char *v, int vl, int em, struct style *st){
+  st->ncols = 0; int i = 0;
+  while(i < vl && st->ncols < 10){
+    while(i < vl && css_ws(v[i])) i++; if(i >= vl) break;
+    int j = i, depth = 0; while(j < vl && (depth || !css_ws(v[j]))){ if(v[j] == '(') depth++; else if(v[j] == ')') depth--; j++; }
+    const char *t = v + i; int tn = j - i; i = j;
+    if(tn > 7 && !strncasecmp_(t, "repeat(", 7)){
+      const char *a = t + 7, *e = t + tn - 1; const char *c = memchr(a, ',', e - a); if(!c) continue;
+      int autofit = (c - a >= 8 && (!strncasecmp_(a, "auto-fit", 8) || !strncasecmp_(a, "auto-fill", 9)));
+      if(autofit){ const char *b = c + 1; int bn = (int)(e - b); while(bn > 0 && css_ws(*b)){ b++; bn--; }
+        struct style tmp; tmp.ncols = 0; one_track(b, bn, em, &tmp); if(tmp.ncols){ int mpx = 0; if(bn > 7 && !strncasecmp_(b, "minmax(", 7)){ struct len l; const char *cc = memchr(b, ',', bn); if(cc && len_from(b + 7, (int)(cc - b - 7), em, &l) && l.u == 1) mpx = l.v; add_track(st, 5, mpx > 0 ? mpx : 100); } else if(tmp.cols[0].t == 1) add_track(st, 6, tmp.cols[0].v); else add_track(st, 5, 100); }
+      } else { int cnt = atoi(a); if(cnt < 1) cnt = 1; if(cnt > 10) cnt = 10; struct style tmp; tmp.ncols = 0; { const char *b = c + 1; int bn = (int)(e - b); int k = 0; while(k < bn && tmp.ncols < 10){ while(k < bn && css_ws(b[k])) k++; if(k >= bn) break; int k2 = k, d2 = 0; while(k2 < bn && (d2 || !css_ws(b[k2]))){ if(b[k2] == '(') d2++; else if(b[k2] == ')') d2--; k2++; } one_track(b + k, k2 - k, em, &tmp); k = k2; } }
+        for(int r = 0; r < cnt; r++) for(int k = 0; k < tmp.ncols; k++) add_track(st, tmp.cols[k].t, tmp.cols[k].v); }
+      continue;
+    }
+    one_track(t, tn, em, st);
+  }
+}
 static void apply_decl(struct style *st, const struct style *par, struct decl *d, int pass){
   char buf[640]; const char *v = d->val; int vl = d->vlen;
   if(vl > 4 && memchr(v, '(', vl) && strstr_n(v, vl, "var(")){ vl = subst_vars(v, vl, buf, sizeof buf, 0, st->cv); v = buf; }
@@ -572,7 +620,7 @@ static void apply_decl(struct style *st, const struct style *par, struct decl *d
       #define DV(x, val) if(vl == (int)sizeof(x) - 1 && !strncasecmp_(v, x, vl)){ st->display = val; return; }
       DV("none", D_NONE) DV("block", D_BLOCK) DV("inline", D_INLINE) DV("inline-block", D_INLINE_BLOCK) DV("list-item", D_LIST_ITEM) DV("table", D_TABLE) DV("inline-table", D_TABLE)
       DV("table-row-group", D_ROW_GROUP) DV("table-header-group", D_ROW_GROUP) DV("table-footer-group", D_ROW_GROUP) DV("table-row", D_ROW) DV("table-cell", D_CELL) DV("table-caption", D_CAPTION)
-      DV("flex", D_FLEX) DV("inline-flex", D_INLINE_FLEX) DV("grid", D_BLOCK) DV("inline-grid", D_INLINE_BLOCK) DV("flow-root", D_BLOCK) DV("table-column", D_COL) DV("table-column-group", D_COL) DV("contents", D_CONTENTS)
+      DV("flex", D_FLEX) DV("inline-flex", D_INLINE_FLEX) DV("grid", D_GRID) DV("inline-grid", D_GRID) DV("flow-root", D_BLOCK) DV("table-column", D_COL) DV("table-column-group", D_COL) DV("contents", D_CONTENTS)
       #undef DV
       return; }
     case P_position: st->position = (vl == 8 && !strncasecmp_(v, "absolute", 8)) ? POS_ABSOLUTE : (vl == 5 && !strncasecmp_(v, "fixed", 5)) ? POS_FIXED : (vl == 8 && !strncasecmp_(v, "relative", 8)) ? POS_RELATIVE : POS_STATIC; return;
@@ -667,9 +715,14 @@ static void apply_decl(struct style *st, const struct style *par, struct decl *d
     case P_flex_wrap: st->flex_wrap = (vl >= 4 && !strncasecmp_(v, "wrap", 4)); return;
     case P_flex_flow: { nt = tokenize(v, vl, t, 3); for(int i = 0; i < nt; i++){ if(tok_is(&t[i], "column") || tok_is(&t[i], "column-reverse")) st->flex_dir = 1; else if(tok_is(&t[i], "row")) st->flex_dir = 0; else if(tok_is(&t[i], "wrap")) st->flex_wrap = 1; } return; }
     case P_justify_content: st->justify = (vl >= 6 && !strncasecmp_(v, "center", 6)) ? 1 : (vl >= 8 && !strncasecmp_(v, "flex-end", 8)) ? 2 : (vl >= 3 && !strncasecmp_(v, "end", 3)) ? 2 : (vl >= 13 && !strncasecmp_(v, "space-between", 13)) ? 3 : (vl >= 12 && !strncasecmp_(v, "space-around", 12)) ? 4 : (vl >= 12 && !strncasecmp_(v, "space-evenly", 12)) ? 4 : 0; return;
-    case P_align_items: st->align_items = (vl >= 6 && !strncasecmp_(v, "center", 6)) ? 1 : (vl >= 8 && !strncasecmp_(v, "flex-end", 8)) ? 2 : (vl >= 3 && !strncasecmp_(v, "end", 3)) ? 2 : (vl >= 8 && !strncasecmp_(v, "baseline", 8)) ? 3 : 0; return;
+    case P_align_items: st->align_items = (vl >= 6 && !strncasecmp_(v, "center", 6)) ? 1 : (vl >= 8 && !strncasecmp_(v, "flex-end", 8)) ? 2 : (vl >= 3 && !strncasecmp_(v, "end", 3)) ? 2 : (vl >= 8 && !strncasecmp_(v, "baseline", 8)) ? 3 : ((vl >= 5 && !strncasecmp_(v, "start", 5)) || (vl >= 10 && !strncasecmp_(v, "flex-start", 10))) ? 4 : 0; return;
     case P_align_self: st->align_self = (vl >= 6 && !strncasecmp_(v, "center", 6)) ? 2 : (vl >= 8 && !strncasecmp_(v, "flex-end", 8)) ? 3 : (vl >= 10 && !strncasecmp_(v, "flex-start", 10)) ? 1 : 0; return;
     case P_gap: { nt = tokenize(v, vl, t, 2); struct len l; if(nt >= 1 && len_from(t[0].s, t[0].n, em, &l) && l.u == 1){ st->gap_y = l.v; st->gap_x = l.v; if(nt >= 2 && len_from(t[1].s, t[1].n, em, &l) && l.u == 1) st->gap_x = l.v; } return; }
+    case P_border_radius: { nt = tokenize(v, vl, t, 1); struct len l; st->radius = 0; if(nt >= 1 && len_from(t[0].s, t[0].n, em, &l)){ if(l.u == 1) st->radius = (short)(l.v > 999 ? 999 : l.v < 0 ? 0 : l.v); else if(l.u == 2 && l.v > 0) st->radius = 999; } return; }
+    case P_grid_template_columns: parse_tracks(v, vl, em, st); return;
+    case P_grid_column: { st->grid_span = 1; const char *sp = 0; for(int i = 0; i + 4 <= vl; i++) if(!strncasecmp_(v + i, "span", 4)){ sp = v + i + 4; break; }
+      if(sp){ while(sp < v + vl && css_ws(*sp)) sp++; int k = atoi(sp); if(k > 0) st->grid_span = k; }
+      else { const char *sl = memchr(v, '/', vl); if(sl){ int a = atoi(v), b = atoi(sl + 1); if(b < 0) st->grid_span = 99; else if(b > a) st->grid_span = b - a; } } return; }
     case P_column_gap: { struct len l; if(len_from(v, vl, em, &l) && l.u == 1) st->gap_x = l.v; return; }
     case P_row_gap: { struct len l; if(len_from(v, vl, em, &l) && l.u == 1) st->gap_y = l.v; return; }
     case P_border_collapse: st->border_collapse = (vl >= 8 && !strncasecmp_(v, "collapse", 8)); return;
@@ -684,7 +737,7 @@ static int strstr_n(const char *s, int n, const char *needle){ int nl = (int)str
 static struct style default_style;
 static void style_defaults(struct style *st){
   memset(st, 0, sizeof *st);
-  st->display = D_INLINE; st->font_px = 16; st->color = 0xFF1F2937u; st->opacity = 100; st->flex_shrink = 1000; st->spacing = 2;
+  st->eff_bg = 0xFFFFFFFFu; st->display = D_INLINE; st->font_px = 16; st->color = 0xFF1F2937u; st->opacity = 100; st->flex_shrink = 1000; st->spacing = 2;
   st->margin[0].u = st->margin[1].u = st->margin[2].u = st->margin[3].u = 1; for(int i = 0; i < 4; i++){ st->padding[i].u = 1; st->border_c[i] = COL_CURRENT; }
   st->list_type = LT_DISC;
 }
@@ -692,7 +745,7 @@ static void style_inherit(struct style *st, const struct style *par){
   style_defaults(st);
   st->font_px = par->font_px; st->color = par->color; st->bold = par->bold; st->italic = par->italic; st->mono = par->mono; st->text_align = par->text_align; st->white_space = par->white_space;
   st->visibility = par->visibility; st->list_type = par->list_type; st->text_transform = par->text_transform; st->underline = par->underline; st->linethru = par->linethru;
-  st->lh_mode = par->lh_mode; st->lh_val = par->lh_val; st->border_collapse = par->border_collapse; st->spacing = par->spacing; st->text_indent = par->text_indent; st->cv = par->cv;
+  st->eff_bg = par->eff_bg; st->lh_mode = par->lh_mode; st->lh_val = par->lh_val; st->border_collapse = par->border_collapse; st->spacing = par->spacing; st->text_indent = par->text_indent; st->cv = par->cv;
 }
 struct cand { int r; int key_spec; int key_order; };
 static void compute_style(int n){
@@ -764,6 +817,10 @@ static void compute_style(int n){
   if(tag == TAG_input){ const char *ty = attr_of(n, "type"); if(ty && !strcasecmp_(ty, "hidden")) st->display = D_NONE; }
   if(st->position == POS_ABSOLUTE) st->display = D_NONE;                 /* absolutely positioned boxes are not supported: hide them */
   if(st->opacity == 0) st->display = D_NONE;
+  { unsigned base = par >= 0 && N(par).st ? N(par).st->eff_bg : 0xFFFFFFFFu; if(!base) base = 0xFFFFFFFFu;
+    st->bg = flat_over(st->bg, base); st->eff_bg = (st->bg >> 24) == 255 ? st->bg : base;
+    for(int i = 0; i < 4; i++) if(st->border_c[i] != COL_CURRENT) st->border_c[i] = flat_over(st->border_c[i], st->eff_bg);
+    if(st->color != COL_CURRENT) st->color = flat_over(st->color, st->eff_bg); }
   N(n).st = st;
 }
 static void compute_all(int n){
