@@ -34,7 +34,7 @@ static int mouse_setup(void){
 }
 void mouse_irq(void){
   u8 b=inb(0x60);
-  if(idx==0 && !(b&8)) return;                        /* out of sync: wait for a flags byte */
+  if(idx==0 && (!(b&8) || (b&0xC0))) return;          /* out of sync: wait for a flags byte (bit 3 set, no overflow bits; a stray 0xFA ack looks like "right button held") */
   pk[idx++]=b; if(idx<pktlen) return; idx=0;
   if(pktlen==4){ int z=pk[3]&0x0F; if(z&8) z-=16; mouse_wheel+=z; }
   int dx=pk[1]-((pk[0]<<4)&0x100), dy=pk[2]-((pk[0]<<3)&0x100);

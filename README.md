@@ -18,7 +18,7 @@ Unimplemented Windows APIs are reported by name when the program calls them (see
 Willows has a real hierarchical filesystem rooted at `C:\` (RAM-backed). Everything in `files/` is loaded at boot
 (`files/Documents/...`); `Desktop/` and `Documents/` are the user's folders. Programs can open, read, create, rename,
 delete and list files and folders (`fopen`, `CreateFileA`, `FindFirstFileA`, `CreateDirectoryA`, `MoveFileA`, the
-Open/Save dialogs). Changes are written to a 4 MB data area on the boot disk (ATA/IDE; LBA 122880), including
+Open/Save dialogs). Changes are written to a 1 GB data area on the boot disk (ATA/IDE; LBA 122880), including
 folders and deletions, so they survive reboots. `make img` keeps that area when rebuilding (delete `willows.img` for a
 clean slate). ISO/CD boots, AHCI-only SATA, NVMe and USB sticks have no writable disk driver yet, so files stay in RAM there.
 
@@ -117,6 +117,12 @@ The browser runs page scripts with **QuickJS-ng** (vendored in `apps/qjs`, with 
 - **System queries** (`src/nt.c`): `NtQuerySystemInformation` (basic, processor, time of day, per-CPU performance), `NtQueryInformationProcess/Token`, `RtlExpandEnvironmentStrings`, `RtlGetNtVersionNumbers`, `BrandingFormatString`.
 - Run `apitest2` to verify: 33 checks (it starts `echo.exe` as a child with redirected stdin/stdout).
 
+## 32-bit programs (stage 1)
+Willows runs 32-bit (PE32) Windows programs in the CPU's compatibility mode (`src/wow.c`, the `wow_*` code in `src/boot.S`, `pe32_load` in `src/pe.c`). A 32-bit program lives below 4 GB on its own stack with its own 32-bit TEB/PEB (FS). Each import is a small stub that switches into 64-bit mode, widens the stdcall arguments and calls the existing Win64 function, then switches back and pops the arguments.
+- The call needs the number of arguments of every API: see the `SIG` list in `src/wow.c` (about 80 kernel32/user32 functions). An API that is not listed gets a stub that names it and ends the program, so a missing function is visible instead of corrupting the stack.
+- Build a 32-bit test program with `tools/build32.sh prog.c out.exe` (see `apps/hello32.c`; imports are `__imp_<dll>__<name>` stdcall pointers). Run `hello32`.
+- Not done yet: 32-bit structures that contain pointers (windows, messages), callbacks into 32-bit code (window procedures), the 32-bit C runtime (cdecl imports), TLS, 32-bit DLLs, SEH.
+
 ## Win32 coverage, batch 3 (GDI)
 - **Clipping and regions** (`src/gdi2.inc`): `IntersectClipRect`, `ExcludeClipRect` (only cuts that remove a whole side), `SelectClipRgn`, `GetClipBox`, `SaveDC`/`RestoreDC`. Regions are rectangles (bounding-box arithmetic for `CombineRgn`); the clip applies to fills, lines, text and blits.
 - **Shapes**: `Ellipse`, `RoundRect`, `Polygon`/`PolyPolygon` (even-odd fill), `Arc`/`Pie`/`Chord`, `PolyBezier(To)`, `PolylineTo`, `FrameRect`, `InvertRect`, `FillRgn`/`FrameRgn`.
@@ -125,3 +131,12 @@ The browser runs page scripts with **QuickJS-ng** (vendored in `apps/qjs`, with 
 - **Blending**: `AlphaBlend` (constant and per-pixel alpha), `TransparentBlt`, `GradientFill` (horizontal, vertical, triangles).
 - Not done: paths (`BeginPath`...), true complex regions, window/viewport origin translation, `MaskBlt`.
 - Run `apitest3` (`-v` lists each check; 29 checks) or `apitest3 gdi` for a window that shows the shapes.
+
+## Win32 coverage, batch 4 (large programs: LibreWolf/Firefox bring-up)
+- **Threads** (`src/thread.c`): `CreateThread`/`_beginthreadex` start real threads (own stack, TEB, TLS, FLS, last error), scheduled cooperatively with the processes. Events, mutexes, semaphores, waitable timers, I/O completion ports, critical sections, SRW locks, condition variables, `InitOnce` and the `Wait*` functions now block for real; APCs run in alertable waits. DLLs with implicit TLS (`thread_local`) work, and get `DLL_THREAD_ATTACH/DETACH`.
+- **Virtual memory** (`src/vmem.c`): `VirtualAlloc`/`VirtualFree`/`VirtualQuery`/`VirtualProtect` (and `Nt*` versions) with real reserve/commit/decommit/release at any address up to 128 TB, backed by 4 KB pages that are freed again. 32-bit programs keep the old allocator.
+- **C runtime** (`src/ucrt.c`, `src/crtfloat.c`): stdio on Win32 handles, printf/scanf with floating point and wide strings, wide start-up (`__p___wargv`...), environment, locale/ctype, string/conversion/time functions, per-thread `errno`; musl's math library (apps/qjs/math) is built into the kernel.
+- **Security objects** (`src/security.c`): real SIDs, ACLs, security descriptors and token queries (Willows enforces no access checks).
+- **Modules**: DLLs are found in the program's folder first; built-in DLLs (`ntdll`, `kernel32`, ...) have small real PE images with export tables; `GetProcAddress` works on the program itself; `GetModuleHandleEx(FROM_ADDRESS)`; imports by ordinal (Winsock, oleaut32). The Windows App SDK (WinUI 3) needs WinRT and is reported as missing.
+- **Windows**: message queues are per thread (`PeekMessage` honours `PM_NOREMOVE` and filters, `PostThreadMessage`), 64 window classes with long names and atoms, `GetClassInfo`, message-only windows, registered messages, DPI functions, `EnumDisplayDevices`, `SystemParametersInfoW`.
+- Status: LibreWolf 159 starts 15+ threads, loads `xul.dll`, runs its JavaScript engine and creates its windows, then stops at `MOZ_CRASH(Could not initialize gfxPlatformFontList)`: Firefox needs DirectWrite, which Willows does not have yet. See `tools/dev/README.md` for the test and debugging tools.

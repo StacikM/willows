@@ -30,7 +30,7 @@ if machine != 0x8664: print("!! Willows runs x64 (PE32+) programs only")
 here = os.path.dirname(os.path.abspath(__file__))
 import glob
 src = "".join(open(f).read() for f in glob.glob(os.path.join(here, "../src/*.c")) + glob.glob(os.path.join(here, "../src/*.inc")))
-have = set(re.findall(r'\b(?:[KUGCWX]|WI|XD)\((?:"\w+",)?(\w+)\)', src)) | set(re.findall(r'\{"\w+","(\w+)"', src)) | set(re.findall(r'CX\("(\w+)"', src))
+have = set(re.findall(r'\b[A-Z][A-Z0-9]{0,2}\((?:"[\w-]+",\s*)?(\w+)\)', src)) | set(re.findall(r'\{"[\w.-]+",\s*"(\w+)"', src)) | set(re.findall(r'CX\("(\w+)"', src))
 total = missing = 0
 o = off(imp_rva) if imp_rva else None
 while o:

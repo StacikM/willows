@@ -89,6 +89,15 @@ static void gmt(i64 t, struct tm_ *o){
   o->sec = (i32)(rem % 60); o->min = (i32)(rem / 60 % 60); o->hour = (i32)(rem / 3600); o->mday = (i32)d; o->mon = (i32)m - 1; o->year = (i32)(y - 1900);
   o->wday = (i32)(((days % 7) + 11) % 7); o->yday = (i32)(days - days_from_civil(y, 1, 1)); o->isdst = 0;
 }
+static i64 WINAPI c2__time64(i64 *p){ i64 t = (i64)rtc_unix(); if(p) *p = t; return t; }
+static i64 WINAPI c2_time(i64 *p){ return c2__time64(p); }
+static int WINAPI c2_system(const char *cmd){                                  /* only the console basics: cls / clear, pause */
+  if(!cmd) return 1;
+  while(*cmd == ' ') cmd++;
+  if(!memcmp(cmd, "cls", 3) || !memcmp(cmd, "clear", 5)){ kputs("\x1b[2J\x1b[H"); return 0; }
+  if(!memcmp(cmd, "pause", 5)){ kputs("Press any key to continue . . . "); kb_getc(); kputc('\n'); return 0; }
+  return -1;
+}
 static struct tm_ *WINAPI c2__localtime64(const i64 *t){ static struct tm_ r; gmt(*t, &r); return &r; }
 static int WINAPI c2__localtime64_s(struct tm_ *o, const i64 *t){ gmt(*t, o); return 0; }
 static i64 WINAPI c2__mktime64(struct tm_ *t){
@@ -133,7 +142,7 @@ const struct export crt2_exports[] = {
   C2(strtol), C2(strtoll), C2(strtoul), C2(strtoull), C2(wcstol), C2(wcstoll), C2(wcstoul), C2(wcstoull), C2(_ultoa), C2(_ultow), C2(_itow), C2(_stricmp), C2(_strnicmp), C2(_wcsnicmp),
   C2(isblank), C2(isxdigit), C2(towlower), C2(iswctype), C2(strcspn), C2(strnlen), C2(strpbrk), C2(strerror), C2(memchr), C2(strrchr), C2(wcschr), C2(wcslen), C2(wcsnlen), C2(wcscpy), C2(wcscat),
   C2(wcscmp), C2(wcsncmp), C2(mbrtowc), C2(mbrlen), C2(wcrtomb), C2(_getpid), C2(ldiv), C2(qsort), C2(getenv), C2(setlocale), C2(localeconv), C2(___lc_codepage_func), C2(___mb_cur_max_func),
-  C2(_localtime64), C2(_localtime64_s), C2(_mktime64), C2(strftime), C2(ungetc), C2(ferror), C2(fgetwc), C2(fputwc), C2(_getc_nolock), C2(_dup), C2(_dup2), C2(_get_osfhandle), C2(_open_osfhandle),
+  C2(_time64), C2(time), C2(system), C2(_localtime64), C2(_localtime64_s), C2(_mktime64), C2(strftime), C2(ungetc), C2(ferror), C2(fgetwc), C2(fputwc), C2(_getc_nolock), C2(_dup), C2(_dup2), C2(_get_osfhandle), C2(_open_osfhandle),
   C2(_lock_file), {"msvcrt", "_unlock_file", c2__lock_file}, C2(_msize), C2(__stdio_common_vfwprintf), C2(__stdio_common_vswprintf),
 };
 const unsigned crt2_nexports = sizeof crt2_exports / sizeof *crt2_exports;

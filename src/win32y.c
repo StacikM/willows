@@ -6,7 +6,7 @@ typedef u32 DWORD; typedef i32 BOOL; typedef u64 HANDLE;
 #define Y(n) {"kernel32", #n, y_##n}
 #define YD(d,n) {d, #n, y_##n}
 static u64 dummy_teb_y[0x2000/8];
-#define last_error (*(u32*)((u8*)(cur->teb? cur->teb : dummy_teb_y)+0x68))
+#define last_error (*(u32*)((u8*)(cur_teb? cur_teb : dummy_teb_y)+0x68))     /* the running thread's last error */
 
 static int wlen(const u16 *s){ int n=0; while(s&&s[n]) n++; return n; }
 static void w2a(const u16 *w, char *a, int n){ int i=0; for(;w&&w[i]&&i<n-1;i++) a[i]= w[i]<0x80? (char)w[i] : '?'; a[i]=0; }
@@ -15,37 +15,12 @@ static void *K32(const char *n){ return win32_resolve("kernel32",n); }
 static void cat_(char *d, const char *s){ while(*d) d++; while((*d++=*s++)); }
 
 /* ================= locks and one-time initialisation ================= */
-/* SRWLOCK is one pointer-sized word: 1 = held exclusively, 2*n = n shared holders. If a lock is still busy after a number of yields
-   (nothing else could release it in a cooperative system) it is taken anyway rather than hanging the program. */
-static void spin_wait(volatile u64 *l, int exclusive){
-  for(int i=0;i<200;i++){ if(exclusive? *l==0 : !(*l&1)) return; idle_wait(); }
-}
-static void WINAPI y_InitializeSRWLock(volatile u64 *l){ *l=0; }
-static void WINAPI y_AcquireSRWLockExclusive(volatile u64 *l){ spin_wait(l,1); *l=1; }
-static void WINAPI y_ReleaseSRWLockExclusive(volatile u64 *l){ *l=0; }
-static void WINAPI y_AcquireSRWLockShared(volatile u64 *l){ spin_wait(l,0); *l = (*l&1)? 2 : *l+2; }
-static void WINAPI y_ReleaseSRWLockShared(volatile u64 *l){ if(*l>=2) *l-=2; }
-static u8 WINAPI y_TryAcquireSRWLockExclusive(volatile u64 *l){ if(*l) return 0; *l=1; return 1; }
-static u8 WINAPI y_TryAcquireSRWLockShared(volatile u64 *l){ if(*l&1) return 0; *l+=2; return 1; }
-static BOOL WINAPI y_TryEnterCriticalSection(void *cs){ (void)cs; return 1; }
-
-/* INIT_ONCE: 0 = not started, 1 = running, otherwise (context | 2) when finished */
-static void WINAPI y_InitOnceInitialize(u64 *o){ *o=0; }
-static BOOL WINAPI y_InitOnceExecuteOnce(u64 *o, BOOL (WINAPI *fn)(void *, void *, void **), void *param, void **ctx){
-  if(*o&2){ if(ctx) *ctx=(void*)(*o&~3ull); return 1; }
-  void *c=0; if(!fn || !fn(o,param,&c)){ *o=0; return 0; }
-  *o=((u64)c&~3ull)|2; if(ctx) *ctx=c; return 1;
-}
-static BOOL WINAPI y_InitOnceBeginInitialize(u64 *o, DWORD fl, BOOL *pending, void **ctx){
-  (void)fl; if(*o&2){ *pending=0; if(ctx) *ctx=(void*)(*o&~3ull); return 1; } *pending=1; *o=1; return 1;
-}
-static BOOL WINAPI y_InitOnceComplete(u64 *o, DWORD fl, void *ctx){ if(fl&2){ *o=0; return 1; } *o=((u64)ctx&~3ull)|2; return 1; }
-
+/* SRW locks, INIT_ONCE and critical sections: see thread.c. WaitOnAddress polls (cooperative scheduling). */
 static BOOL WINAPI y_WaitOnAddress(volatile void *addr, void *cmp, u64 size, DWORD ms){
-  u32 end=ticks+ms;
+  u32 end=ticks+ms; thread_note_wait("WaitOnAddress",(u64)addr,(u64)__builtin_return_address(0));
   for(;;){
-    if(memcmp((const void*)addr,cmp,size)) return 1;
-    if(ms!=0xFFFFFFFF && (i32)(ticks-end)>=0){ last_error=1460; return 0; }
+    if(memcmp((const void*)addr,cmp,size)){ thread_end_wait(); return 1; }
+    if(ms!=0xFFFFFFFF && (i32)(ticks-end)>=0){ thread_end_wait(); last_error=1460; return 0; }
     idle_wait();
   }
 }
@@ -64,13 +39,31 @@ static BOOL WINAPI y_SetThreadStackGuarantee(DWORD *s){ (void)s; return 1; }
 static DWORD WINAPI y_GetCurrentProcessorNumber(void){ return 0; }
 
 /* ================= COM / OLE basics ================= */
-static int com_state[MAXPROC];
-static long WINAPI y_CoInitializeEx(void *r, DWORD m){ (void)r;(void)m; int *s=&com_state[cur->pid&(MAXPROC-1)]; int first=!*s; (*s)++; return first? 0 : 1; }
-static void *WINAPI y_CoTaskMemAlloc(u64 n){ return heap_alloc(n? n : 1); }
+/* COM apartments, per thread (TEB+0x1B10: type 1 = STA, 2 = MTA; TEB+0x1B14: CoInitialize count). mta_users counts the threads of a
+   process that are in the multi-threaded apartment: while there are any, uninitialised threads are implicitly in it too. */
+static int mta_users[MAXPROC];
+void com_proc_reset(int pid){ mta_users[pid]=0; }                   /* a new process in this slot */
+static u32 *apt(void){ u64 *t=win32_cur_teb(); static u32 none[2]; return t? (u32*)((u8*)t+0x1B10) : none; }
+static long WINAPI y_CoInitializeEx(void *r, DWORD m){
+  (void)r; u32 *a=apt(); u32 want=(m&2)? 1 : 2;                                    /* COINIT_APARTMENTTHREADED */
+  if(a[1] && a[0]!=want) return (long)0x80010106;                                   /* RPC_E_CHANGED_MODE */
+  if(a[1]++){ return 1; }                                                           /* S_FALSE: already initialised */
+  a[0]=want; if(want==2) mta_users[cur->pid]++; return 0;
+}
+static long WINAPI y_CoInitialize(void *r){ return y_CoInitializeEx(r,2); }
+static void WINAPI y_CoUninitialize(void){ u32 *a=apt(); if(!a[1]) return; if(--a[1]==0){ if(a[0]==2 && mta_users[cur->pid]>0) mta_users[cur->pid]--; a[0]=0; } }
+static long WINAPI y_CoGetApartmentType(i32 *type, i32 *qual){
+  if(!type || !qual) return (long)0x80070057;
+  u32 *a=apt(); *qual=0;
+  if(a[1]){ *type= a[0]==2? 1 : (cur_thr? 0 : 3); return 0; }                   /* APTTYPE_MTA, APTTYPE_STA, APTTYPE_MAINSTA */
+  if(mta_users[cur->pid]){ *type=1; *qual=1; return 0; }                            /* APTTYPEQUALIFIER_IMPLICIT_MTA */
+  *type=-1; return (long)0x800401F0;                                                /* CO_E_NOTINITIALIZED */
+}
+static void *WINAPI y_CoTaskMemAlloc(u64 n){ return heap_alloc_prog(n? n : 1); }
 static void WINAPI y_CoTaskMemFree(void *p){ heap_free(p); }
 static void *WINAPI y_CoTaskMemRealloc(void *p, u64 n){ return heap_realloc(p,n? n : 1); }
-static long WINAPI y_OleInitialize(void *r){ (void)r; return 0; }
-static void WINAPI y_OleUninitialize(void){}
+static long WINAPI y_OleInitialize(void *r){ return y_CoInitializeEx(r,2); }
+static void WINAPI y_OleUninitialize(void){ y_CoUninitialize(); }
 static long WINAPI y_CoInitializeSecurity(void *a, i32 b, void *c, void *d, DWORD e, DWORD f, void *g, DWORD h, void *i){ (void)a;(void)b;(void)c;(void)d;(void)e;(void)f;(void)g;(void)h;(void)i; return 0; }
 static long WINAPI y_CoSetProxyBlanket(void *a, DWORD b, DWORD c, void *d, DWORD e, DWORD f, void *g, DWORD h){ (void)a;(void)b;(void)c;(void)d;(void)e;(void)f;(void)g;(void)h; return 0; }
 static long WINAPI y_CoGetClassObject(const void *c, DWORD ctx, void *s, const void *iid, void **out){ (void)c;(void)ctx;(void)s;(void)iid; if(out) *out=0; return (long)0x80040154; }   /* REGDB_E_CLASSNOTREG */
@@ -199,12 +192,11 @@ static int WINAPI y_StrCmpIW(const u16 *a, const u16 *b){ for(;*a && (*a|32)==(*
 /* ================= processes ================= */
 static BOOL WINAPI y_CreateProcessW(const u16 *app, u16 *cmd, void *pa, void *ta, BOOL inh, DWORD fl, void *env, const u16 *dir, void *si, u32 *pi){
   BOOL (WINAPI *f)(const char*,char*,void*,void*,BOOL,DWORD,void*,const char*,void*,u32*)=K32("CreateProcessA"); if(!f) return 0;
-  char a[260], c[512], d[200]; char *ap=0, *cp=0, *dp=0;
-  if(app){ w2a(app,a,260); ap=a; } if(cmd){ w2a(cmd,c,512); cp=c; } if(dir){ w2a(dir,d,200); dp=d; }
+  char a[260], d[200]; static char c[2048]; char *ap=0, *cp=0, *dp=0;
+  if(app){ w2a(app,a,260); ap=a; } if(cmd){ w2a(cmd,c,2048); cp=c; } if(dir){ w2a(dir,d,200); dp=d; }
   return f(ap,cp,pa,ta,inh,fl,env,dp,si,pi);
 }
 static DWORD WINAPI y_GetProcessId(HANDLE h){ if(h==(HANDLE)-1) return (DWORD)cur->pid; if(h>=0x8000 && h<0x8000+MAXPROC) return (DWORD)(h-0x8000); return 0; }
-static DWORD WINAPI y_GetThreadId(HANDLE h){ (void)h; return 0x1000; }
 static BOOL WINAPI y_SetPriorityClass(HANDLE h, DWORD c){ (void)h;(void)c; return 1; }
 static DWORD WINAPI y_GetPriorityClass(HANDLE h){ (void)h; return 0x20; }
 static DWORD WINAPI y_WaitForInputIdle(HANDLE h, DWORD ms){ (void)h;(void)ms; return 0; }
@@ -231,13 +223,117 @@ static BOOL WINAPI y_QueryInformationJobObject(HANDLE j, i32 c, void *i, DWORD l
 static BOOL WINAPI y_TerminateJobObject(HANDLE j, DWORD c){ (void)j;(void)c; return 1; }
 static BOOL WINAPI y_IsProcessInJob(HANDLE p, HANDLE j, BOOL *r){ (void)p;(void)j; if(r) *r=0; return 1; }
 
+/* ================= WinRT basics: HSTRING and activation ================= */
+/* An HSTRING points to {flags, length, buffer}. WindowsCreateStringReference keeps it in the caller's HSTRING_HEADER (24 bytes);
+   WindowsCreateString allocates it with a copy of the text. NULL is the empty string. No WinRT classes exist, so activation fails cleanly. */
+struct hstr { u32 flags, len; const u16 *buf; };
+static long WINAPI y_WindowsCreateString(const u16 *s, u32 n, struct hstr **out){
+  if(!out) return (long)0x80070057; if(!n){ *out=0; return 0; } if(!s) return (long)0x80004003;
+  struct hstr *h=heap_alloc(sizeof *h+(u64)(n+1)*2); if(!h) return (long)0x8007000E;
+  u16 *b=(u16*)(h+1); memcpy(b,s,(u64)n*2); b[n]=0; h->flags=1; h->len=n; h->buf=b; *out=h; return 0;
+}
+static long WINAPI y_WindowsCreateStringReference(const u16 *s, u32 n, struct hstr *hdr, struct hstr **out){
+  if(!out || !hdr) return (long)0x80070057; if(!n){ *out=0; return 0; }
+  hdr->flags=0; hdr->len=n; hdr->buf=s; *out=hdr; return 0;
+}
+static long WINAPI y_WindowsDeleteString(struct hstr *h){ if(h && h->flags==1) heap_free(h); return 0; }
+static const u16 *WINAPI y_WindowsGetStringRawBuffer(struct hstr *h, u32 *len){ static const u16 empty[1]; if(len) *len= h? h->len : 0; return h? h->buf : empty; }
+static u32 WINAPI y_WindowsGetStringLen(struct hstr *h){ return h? h->len : 0; }
+static i32 WINAPI y_WindowsIsStringEmpty(struct hstr *h){ return !h || !h->len; }
+static long WINAPI y_WindowsDuplicateString(struct hstr *h, struct hstr **out){ return h? y_WindowsCreateString(h->buf,h->len,out) : (*out=0,0); }
+static long WINAPI y_RoInitialize(i32 type){ long r=y_CoInitializeEx(0,type? 0 : 2); return r==1? 1 : r; }
+static void WINAPI y_RoUninitialize(void){ y_CoUninitialize(); }
+static long WINAPI y_RoGetActivationFactory(struct hstr *cls, void *iid, void **out){ (void)cls;(void)iid; if(out) *out=0; return (long)0x80040154; }   /* REGDB_E_CLASSNOTREG */
+static long WINAPI y_RoActivateInstance(struct hstr *cls, void **out){ (void)cls; if(out) *out=0; return (long)0x80040154; }
+
+/* ================= process creation extras ================= */
+/* PROC_THREAD_ATTRIBUTE_LIST (opaque to programs): u32 count, u32 used, then {attribute, value pointer, size} entries from +16.
+   CreateProcess uses the handle list (PROC_THREAD_ATTRIBUTE_HANDLE_LIST): the child gets its own reference to each of those
+   handles, so they stay valid after the parent closes its copies. Mitigation policies and the parent process change nothing. */
+static BOOL WINAPI y_InitializeProcThreadAttributeList(u8 *list, DWORD count, DWORD fl, u64 *size){
+  (void)fl; u64 need=48+(u64)count*24; if(!list || *size<need){ *size=need; last_error=122; return 0; }   /* ERROR_INSUFFICIENT_BUFFER */
+  memset(list,0,need); *(u32*)list=count; return 1;
+}
+static BOOL WINAPI y_UpdateProcThreadAttribute(u8 *list, DWORD fl, u64 attr, void *val, u64 size, void *prev, u64 *ret){
+  (void)fl;(void)prev;(void)ret; if(!list){ last_error=87; return 0; }
+  u32 n=*(u32*)list, used=*(u32*)(list+4); u64 *e=(u64*)(list+16);
+  for(u32 i=0;i<used;i++) if(e[i*3]==attr){ e[i*3+1]=(u64)val; e[i*3+2]=size; return 1; }
+  if(used>=n){ last_error=122; return 0; }
+  e[used*3]=attr; e[used*3+1]=(u64)val; e[used*3+2]=size; *(u32*)(list+4)=used+1; return 1;
+}
+u64 *proc_attr_find(const u8 *list, u64 attr, u64 *size){                 /* for CreateProcess */
+  if(!list) return 0; u32 used=*(const u32*)(list+4); const u64 *e=(const u64*)(list+16);
+  for(u32 i=0;i<used && i<64;i++) if(e[i*3]==attr){ if(size) *size=e[i*3+2]; return (u64*)e[i*3+1]; }
+  return 0;
+}
+static void WINAPI y_DeleteProcThreadAttributeList(u8 *list){ (void)list; }
+static BOOL WINAPI y_CreateProcessW(const u16 *app, u16 *cmd, void *pa, void *ta, BOOL inh, DWORD fl, void *env, const u16 *dir, void *si, u32 *pi);
+static BOOL WINAPI y_CreateProcessAsUserW(HANDLE tok, const u16 *app, u16 *cmd, void *pa, void *ta, BOOL inh, DWORD fl, void *env, const u16 *dir, void *si, u32 *pi){ (void)tok; return y_CreateProcessW(app,cmd,pa,ta,inh,fl,env,dir,si,pi); }   /* the token is not enforced */
+
+/* ================= window stations and desktops: Willows has one of each; sandboxes ask for separate ones ================= */
+#define WINSTA_H 0x7E10
+#define DESKTOP_HANDLE 0x7E20
+static HANDLE WINAPI y_CreateWindowStationW(const u16 *n, DWORD fl, DWORD acc, void *sa){ (void)n;(void)fl;(void)acc;(void)sa; return WINSTA_H+1; }
+static HANDLE WINAPI y_OpenWindowStationW(const u16 *n, BOOL inh, DWORD acc){ (void)n;(void)inh;(void)acc; return WINSTA_H; }
+static HANDLE WINAPI y_GetProcessWindowStation(void){ return WINSTA_H; }
+static BOOL WINAPI y_SetProcessWindowStation(HANDLE h){ (void)h; return 1; }
+static BOOL WINAPI y_CloseWindowStation(HANDLE h){ (void)h; return 1; }
+static HANDLE WINAPI y_CreateDesktopW(const u16 *n, const u16 *dev, void *dm, DWORD fl, DWORD acc, void *sa){ (void)n;(void)dev;(void)dm;(void)fl;(void)acc;(void)sa; return DESKTOP_HANDLE+1; }
+static HANDLE WINAPI y_OpenDesktopW(const u16 *n, DWORD fl, BOOL inh, DWORD acc){ (void)n;(void)fl;(void)inh;(void)acc; return DESKTOP_HANDLE; }
+static HANDLE WINAPI y_OpenInputDesktop(DWORD fl, BOOL inh, DWORD acc){ (void)fl;(void)inh;(void)acc; return DESKTOP_HANDLE; }
+static HANDLE WINAPI y_GetThreadDesktop(DWORD tid){ (void)tid; return DESKTOP_HANDLE; }
+static BOOL WINAPI y_SetThreadDesktop(HANDLE h){ (void)h; return 1; }
+static BOOL WINAPI y_CloseDesktop(HANDLE h){ (void)h; return 1; }
+static BOOL WINAPI y_SwitchDesktop(HANDLE h){ (void)h; return 1; }
+
+/* ================= time, memory comparison, process info ================= */
+static void WINAPI y_GetSystemTimePreciseAsFileTime(u64 *ft){ void (WINAPI *f)(u64*)=K32("GetSystemTimeAsFileTime"); if(f) f(ft); }
+static void WINAPI y_QueryInterruptTime(u64 *t){ *t=(u64)ticks*10000; }                          /* 100 ns units since boot */
+static BOOL WINAPI y_QueryUnbiasedInterruptTime(u64 *t){ *t=(u64)ticks*10000; return 1; }
+static u64 WINAPI y_RtlCompareMemory(const u8 *a, const u8 *b, u64 n){ u64 i=0; while(i<n && a[i]==b[i]) i++; return i; }   /* number of equal bytes */
+static long WINAPI y_CoIncrementMTAUsage(u64 *cookie){ mta_users[cur->pid]++; if(cookie) *cookie=1; return 0; }
+static long WINAPI y_CoDecrementMTAUsage(u64 cookie){ (void)cookie; if(mta_users[cur->pid]>0) mta_users[cur->pid]--; return 0; }
+static BOOL WINAPI y_IsWow64Process2(HANDLE h, u16 *proc, u16 *native){ (void)h; if(proc) *proc=0; if(native) *native=0x8664; return 1; }   /* not WOW64; x64 machine */
+static DWORD WINAPI y_GetDynamicTimeZoneInformation(u8 *tz){                                   /* UTC, no daylight saving */
+  memset(tz,0,432); const char *n="Coordinated Universal Time"; for(int i=0;n[i];i++){ ((u16*)(tz+4))[i]=(u8)n[i]; ((u16*)(tz+88))[i]=(u8)n[i]; }
+  const char *k="UTC"; for(int i=0;k[i];i++) ((u16*)(tz+172))[i]=(u8)k[i]; return 0;      /* TIME_ZONE_ID_UNKNOWN */
+}
+/* the system clock is UTC: every year has the same rules, and local time = UTC */
+static BOOL WINAPI y_GetTimeZoneInformationForYear(u16 year, const void *dyn, u8 *tz){ (void)year;(void)dyn; u8 d[432]; y_GetDynamicTimeZoneInformation(d); memcpy(tz,d,172); return 1; }
+static BOOL WINAPI y_SystemTimeToTzSpecificLocalTimeEx(const void *tz, const u8 *u, u8 *l){ (void)tz; memcpy(l,u,16); return 1; }
+static BOOL WINAPI y_TzSpecificLocalTimeToSystemTime(const void *tz, const u8 *l, u8 *u){ (void)tz; memcpy(u,l,16); return 1; }
+static DWORD WINAPI y_EnumDynamicTimeZoneInformation(DWORD i, u8 *tz){ if(i) return 259; y_GetDynamicTimeZoneInformation(tz); return 0; }   /* ERROR_NO_MORE_ITEMS after the one zone */
+
+/* ================= setupapi: a machine with no enumerable devices ================= */
+static HANDLE WINAPI y_SetupDiGetClassDevsW(const void *guid, const u16 *en, u64 parent, DWORD fl){ (void)guid;(void)en;(void)parent;(void)fl; return 0x7E00; }   /* an empty device set */
+static HANDLE WINAPI y_SetupDiGetClassDevsA(const void *guid, const char *en, u64 parent, DWORD fl){ (void)guid;(void)en;(void)parent;(void)fl; return 0x7E00; }
+static BOOL WINAPI y_SetupDiEnumDeviceInfo(HANDLE set, DWORD i, void *info){ (void)set;(void)i;(void)info; last_error=259; return 0; }       /* ERROR_NO_MORE_ITEMS */
+static BOOL WINAPI y_SetupDiEnumDeviceInterfaces(HANDLE set, void *info, const void *g, DWORD i, void *out){ (void)set;(void)info;(void)g;(void)i;(void)out; last_error=259; return 0; }
+static BOOL WINAPI y_SetupDiDestroyDeviceInfoList(HANDLE set){ (void)set; return 1; }
+
+/* ================= winmm timing ================= */
+static u32 WINAPI y_timeGetTime(void){ return ticks; }
+static u32 WINAPI y_timeBeginPeriod(u32 ms){ (void)ms; return 0; }
+static u32 WINAPI y_timeGetDevCaps(u32 *tc, u32 n){ if(!tc || n<8) return 97; tc[0]=1; tc[1]=1000000; return 0; }   /* TIMERR_NOCANDO otherwise */
+static u32 WINAPI y_GetShortPathNameW(const u16 *src, u16 *dst, u32 n){ u32 l=0; while(src[l]) l++; if(!dst || n<=l) return l+1; memcpy(dst,src,((u64)l+1)*2); return l; }
+
 #define YP(n) {"psapi", #n, y_##n}
 const struct export y_exports[] = {
-  Y(InitializeSRWLock), Y(AcquireSRWLockExclusive), Y(ReleaseSRWLockExclusive), Y(AcquireSRWLockShared), Y(ReleaseSRWLockShared), Y(TryAcquireSRWLockExclusive), Y(TryAcquireSRWLockShared), Y(TryEnterCriticalSection),
-  Y(InitOnceInitialize), Y(InitOnceExecuteOnce), Y(InitOnceBeginInitialize), Y(InitOnceComplete),
-  {"kernel32","WaitOnAddress",y_WaitOnAddress}, {"api-ms-win-core-synch-l1-2-0","WaitOnAddress",y_WaitOnAddress}, {"kernel32","WakeByAddressSingle",y_WakeByAddressSingle}, {"kernel32","WakeByAddressAll",y_WakeByAddressAll},
+  YD("combase",WindowsCreateString), YD("combase",WindowsCreateStringReference), YD("combase",WindowsDeleteString), YD("combase",WindowsGetStringRawBuffer),
+  YD("combase",WindowsGetStringLen), YD("combase",WindowsIsStringEmpty), YD("combase",WindowsDuplicateString), YD("combase",RoInitialize), YD("combase",RoUninitialize),
+  YD("combase",RoGetActivationFactory), YD("combase",RoActivateInstance),
+  YD("user32",CreateWindowStationW), YD("user32",OpenWindowStationW), YD("user32",GetProcessWindowStation), YD("user32",SetProcessWindowStation), YD("user32",CloseWindowStation),
+  YD("user32",CreateDesktopW), YD("user32",OpenDesktopW), YD("user32",OpenInputDesktop), YD("user32",GetThreadDesktop), YD("user32",SetThreadDesktop), YD("user32",CloseDesktop), YD("user32",SwitchDesktop),
+  Y(InitializeProcThreadAttributeList),Y(UpdateProcThreadAttribute), Y(DeleteProcThreadAttributeList), YD("advapi32",CreateProcessAsUserW), Y(CreateProcessAsUserW),
+  Y(GetSystemTimePreciseAsFileTime),Y(QueryInterruptTime), {"kernel32","QueryInterruptTimePrecise",y_QueryInterruptTime}, Y(QueryUnbiasedInterruptTime),
+  {"kernel32","QueryUnbiasedInterruptTimePrecise",y_QueryUnbiasedInterruptTime}, YD("ntdll",RtlCompareMemory), {"kernel32","RtlCompareMemory",y_RtlCompareMemory},
+  YD("ole32",CoIncrementMTAUsage), YD("ole32",CoDecrementMTAUsage), Y(IsWow64Process2), Y(GetDynamicTimeZoneInformation), Y(GetTimeZoneInformationForYear), Y(SystemTimeToTzSpecificLocalTimeEx),
+  Y(TzSpecificLocalTimeToSystemTime), {"kernel32","TzSpecificLocalTimeToSystemTimeEx",y_TzSpecificLocalTimeToSystemTime}, YD("advapi32",EnumDynamicTimeZoneInformation),
+  YD("setupapi",SetupDiGetClassDevsW), YD("setupapi",SetupDiGetClassDevsA), YD("setupapi",SetupDiEnumDeviceInfo), YD("setupapi",SetupDiEnumDeviceInterfaces), YD("setupapi",SetupDiDestroyDeviceInfoList),
+  YD("winmm",timeGetTime),YD("winmm",timeBeginPeriod), {"winmm","timeEndPeriod",y_timeBeginPeriod}, YD("winmm",timeGetDevCaps), Y(GetShortPathNameW),
+      {"kernel32","WaitOnAddress",y_WaitOnAddress}, {"api-ms-win-core-synch-l1-2-0","WaitOnAddress",y_WaitOnAddress}, {"kernel32","WakeByAddressSingle",y_WakeByAddressSingle}, {"kernel32","WakeByAddressAll",y_WakeByAddressAll},
   Y(InitializeSListHead), Y(InterlockedPushEntrySList), Y(InterlockedPopEntrySList), Y(InterlockedFlushSList), Y(QueryDepthSList), Y(InterlockedPushListSListEx), Y(SetThreadDescription), Y(SetThreadStackGuarantee), Y(GetCurrentProcessorNumber),
-  YD("ole32",CoInitializeEx), YD("ole32",CoTaskMemAlloc), YD("ole32",CoTaskMemFree), YD("ole32",CoTaskMemRealloc), YD("ole32",OleInitialize), YD("ole32",OleUninitialize), YD("ole32",CoInitializeSecurity), YD("ole32",CoSetProxyBlanket),
+  YD("ole32",CoInitializeEx), YD("ole32",CoInitialize), YD("ole32",CoUninitialize), YD("ole32",CoGetApartmentType), YD("combase",CoGetApartmentType), YD("combase",CoInitializeEx),YD("ole32",CoTaskMemAlloc), YD("ole32",CoTaskMemFree), YD("ole32",CoTaskMemRealloc), YD("ole32",OleInitialize), YD("ole32",OleUninitialize), YD("ole32",CoInitializeSecurity), YD("ole32",CoSetProxyBlanket),
   YD("ole32",CoGetClassObject), YD("ole32",CoCreateInstanceEx), YD("ole32",CoFreeUnusedLibraries), YD("ole32",CoCreateGuid), YD("ole32",StringFromGUID2), YD("ole32",CLSIDFromString), {"ole32","IIDFromString",y_CLSIDFromString}, YD("ole32",StringFromCLSID), {"ole32","StringFromIID",y_StringFromCLSID},
   YD("oleaut32",SysAllocString), YD("oleaut32",SysAllocStringLen), YD("oleaut32",SysFreeString), YD("oleaut32",SysStringLen), YD("oleaut32",SysStringByteLen), YD("oleaut32",SysReAllocString), YD("oleaut32",VariantInit), YD("oleaut32",VariantClear),
   YD("shell32",SHGetKnownFolderPath), YD("shell32",SHGetFolderPathW), YD("shell32",SHGetFolderPathA), YD("shell32",SHGetSpecialFolderPathW), YD("shell32",SHGetSpecialFolderPathA), YD("shell32",SHCreateDirectoryExW), YD("shell32",SHCreateDirectoryExA),
@@ -245,7 +341,7 @@ const struct export y_exports[] = {
   YD("shlwapi",PathFileExistsA), YD("shlwapi",PathFileExistsW), YD("shlwapi",PathIsDirectoryA), YD("shlwapi",PathIsDirectoryW), YD("shlwapi",PathFindFileNameA), YD("shlwapi",PathFindFileNameW), YD("shlwapi",PathFindExtensionA), YD("shlwapi",PathFindExtensionW),
   YD("shlwapi",PathRemoveFileSpecA), YD("shlwapi",PathRemoveFileSpecW), YD("shlwapi",PathIsRelativeA), YD("shlwapi",PathIsRelativeW), YD("shlwapi",PathAppendA), YD("shlwapi",PathAppendW), YD("shlwapi",PathCombineA), YD("shlwapi",PathCombineW),
   YD("shlwapi",PathStripPathA), YD("shlwapi",PathStripPathW), YD("shlwapi",PathRemoveExtensionW), YD("shlwapi",PathAddBackslashW), YD("shlwapi",StrStrIW), YD("shlwapi",StrStrW), YD("shlwapi",StrCmpIW), YD("shlwapi",StrStrIA), YD("shlwapi",StrStrA), Y(SetConsoleOutputCP),
-  Y(CreateProcessW), Y(GetProcessId), Y(GetThreadId), Y(SetPriorityClass), Y(GetPriorityClass), Y(WaitForInputIdle), YD("user32",WaitForInputIdle),
+  Y(CreateProcessW), Y(GetProcessId), Y(SetPriorityClass), Y(GetPriorityClass), Y(WaitForInputIdle), YD("user32",WaitForInputIdle),
   YP(EnumProcesses), YP(GetProcessMemoryInfo), YP(EnumProcessModules), YP(GetModuleBaseNameW), YP(GetModuleBaseNameA), YP(GetModuleFileNameExW), YP(GetModuleFileNameExA),
   {"kernel32","K32EnumProcesses",y_EnumProcesses}, {"kernel32","K32GetProcessMemoryInfo",y_GetProcessMemoryInfo}, {"kernel32","K32EnumProcessModules",y_EnumProcessModules}, {"kernel32","K32GetModuleBaseNameW",y_GetModuleBaseNameW},
   {"kernel32","K32GetModuleBaseNameA",y_GetModuleBaseNameA}, {"kernel32","K32GetModuleFileNameExW",y_GetModuleFileNameExW}, {"kernel32","K32GetModuleFileNameExA",y_GetModuleFileNameExA}, Y(QueryFullProcessImageNameW),

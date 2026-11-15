@@ -41,9 +41,18 @@ void kmain(u32 magic, u32 mbi_addr){
     memcpy(c,(void*)(u64)mods[i].start,n); mods[i].start=(u32)(u64)c; mods[i].end=(u32)((u64)c+n);
   }
   mod_lo=~0ull; mod_hi=0;
+  mm_guard_null();                                                /* NULL pointer accesses fault from now on */
+  if(mbi->flags&0x40){                                            /* memory map: usable RAM above 4 GB (QEMU puts everything beyond ~3 GB there) */
+    u64 best=0, blen=0;
+    for(u32 off=0; off+24<=mbi->mmap_len; ){ const u8 *e=(const u8*)(u64)(mbi->mmap_addr+off); u32 sz=*(const u32*)e;
+      u64 base=*(const u64*)(e+4), len=*(const u64*)(e+12); u32 type=*(const u32*)(e+20);
+      if(type==1 && base>=0x100000000ull && len>blen){ best=base; blen=len; }
+      off+=sz+4; }
+    if(blen) mm_high_init(best,blen);
+  }
   if(gfx_ok) kprintf("Video: %ux%u framebuffer\n",gfx_w,gfx_h);
   kprintf("Mouse: %s\n",mouse? (mouse_has_wheel()? "PS/2 detected (with scroll wheel)" : "PS/2 detected") : "none");
-  kprintf("Memory: %u KB upper, heap at %p, %u module(s)\n",mbi->mem_upper,heap,nmods);
+  kprintf("Memory: %u KB upper, %u MB above 4 GB, heap at %p, %u module(s)\n",mbi->mem_upper,(u32)(mm_high_total()>>20),heap,nmods);
 
   fs_init();
   /* modules: .exe files become programs in the Start menu, everything else goes to the RAM filesystem */
@@ -72,11 +81,17 @@ void kmain(u32 magic, u32 mbi_addr){
   for(int i=0;i<app_count();i++){
     if(has_autostart(cmd,app_name(i)) && !seq) proc_spawn(app_name(i));
   }
+  if(gfx_ok){                                                     /* C:\System\autorun.cfg: one command line, run in a terminal at boot (used by tools/dev/mktest.sh) */
+    struct ramfile *ar=fs_find("System/autorun.cfg");
+    if(ar && !ar->isdir && ar->size) proc_spawn_cmd("terminal","terminal -c @/System/autorun.cfg");     /* each line is run in turn */
+  }
   for(;;){
     if(seq){                                                        /* text mode: run every program in order */
       if(procs_alive()==0 && next<app_count()){ if(!cmd||!has_autostart_any(cmd)||has_autostart(cmd,app_name(next))) proc_spawn(app_name(next)); next++; }
       else if(procs_alive()==0 && next>=app_count()){ kputs("\nNothing left to run. System idle.\n"); seq=0; }
     }
+    if(debug_dump_request){ debug_dump_request=0; debug_dump(); }   /* Ctrl+F12 */
+    fs_service();                                                   /* deferred saving of changed files (at most every 2 s) */
     wm_service();
     idle_wait();
   }

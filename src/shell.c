@@ -13,7 +13,7 @@ int shell_open(const char *path){
   struct ramfile *f=fs_find(full); if(!f) return -1;
   const char *lf=fs_leaf(f); char cmd[300];
   if(ends_with(lf,".exe")){ char dir[128]; unsigned n=(unsigned)strlen(c); while(n>0 && c[n-1]!='/') n--; memcpy(dir,c,n? n-1 : 0); dir[n? n-1 : 0]=0; snprintf_(cmd,sizeof cmd,"%s",lf);
-    int pid=proc_spawn_cwd(lf,cmd,dir); if(pid<0) pid=proc_spawn_data(lf,f->data,f->size,cmd,dir); return pid; }
+    int pid=proc_spawn_cwd(lf,cmd,dir); if(pid<0){ proc_set_next_exe(f->name); pid=proc_spawn_data(lf,f->data,f->size,cmd,dir); } return pid; }
   if(ends_with(lf,".html")||ends_with(lf,".htm")){ snprintf_(cmd,sizeof cmd,"browser %s",full); return proc_spawn_cwd("browser",cmd,""); }
   (void)is_text; snprintf_(cmd,sizeof cmd,"notes %s",full); return proc_spawn_cwd("notes",cmd,"");     /* text and everything else: the editor */
 }

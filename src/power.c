@@ -7,7 +7,7 @@ static int sig(const void *a, const char *s, int n){ const char *p=a; for(int i=
 static int csum(const u8 *p, u32 n){ u8 s=0; while(n--) s+=*p++; return s==0; }
 
 static const u8 *find_rsdp(void){
-  const u8 *e=(const u8*)(u64)(*(volatile u16*)0x40E<<4);
+  extern u16 bda_ebda_seg; const u8 *e=(const u8*)(u64)(bda_ebda_seg<<4);           /* saved at boot: page 0 is unmapped (mm_guard_null) */
   for(const u8 *p=e; e && p<e+1024; p+=16) if(sig(p,"RSD PTR ",8) && csum(p,20)) return p;
   for(const u8 *p=(const u8*)0xE0000; p<(const u8*)0x100000; p+=16) if(sig(p,"RSD PTR ",8) && csum(p,20)) return p;
   return NULL;
@@ -35,6 +35,7 @@ static void acpi_off(void){
   }
 }
 void power_off(void){
+  fs_flush();                                                         /* changes not saved yet (saving is deferred up to 2 s) */
   __asm__ volatile("cli");
   acpi_off();
   outw(0x604,0x2000); outw(0xB004,0x2000); outw(0x4004,0x3400);     /* QEMU / Bochs / VirtualBox */
@@ -43,6 +44,7 @@ void power_off(void){
   for(;;) __asm__ volatile("hlt");
 }
 void power_restart(void){
+  fs_flush();
   __asm__ volatile("cli");
   for(int i=0;i<100000 && (inb(0x64)&2);i++);
   outb(0x64,0xFE);                                                   /* pulse CPU reset via the keyboard controller */

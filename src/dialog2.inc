@@ -249,11 +249,15 @@ static i32 WINAPI w_DrawIconEx(u64 dc, i32 x, i32 y, u64 icon, i32 cx, i32 cy, u
 
 /* ---- wide-string window functions (strings are narrowed; windows are ASCII internally) ---- */
 static u64 WINAPI w_RegisterClassW(const u8 *wcw){
-  u8 wc[80]; memcpy(wc, wcw, 80); const u16 *nm = *(const u16 **)(wc + 64); static char names[16][24]; static int nn; char *a = names[nn++ & 15];
-  if((u64)nm < 0x10000) { a[0] = 0; } else wd_to_a(nm, a, 24); *(const char **)(wc + 64) = a; return w_RegisterClassA(wc);
+  u8 wc[80]; memcpy(wc, wcw, 80); const u16 *nm = *(const u16 **)(wc + 64); char a[64];
+  if((u64)nm < 0x10000) return 0; wd_to_a(nm, a, sizeof a); *(const char **)(wc + 64) = a; return w_RegisterClassA(wc);   /* the name is copied into the class */
 }
+static const char *class_arg(const u16 *n, char *buf, int max){ if((u64)n < 0x10000) return (const char *)n; wd_to_a(n, buf, max); return buf; }   /* atoms pass through */
+static i32 WINAPI w_GetClassInfoW(u64 inst, const u16 *n, u8 *wc){ (void)inst; char a[64]; return class_info(class_arg(n, a, sizeof a), n, wc, 0) != 0; }
+static u64 WINAPI w_GetClassInfoExW(u64 inst, const u16 *n, u8 *wc){ (void)inst; char a[64]; return class_info(class_arg(n, a, sizeof a), n, wc, 1); }
+static i32 WINAPI w_UnregisterClassW(const u16 *n, u64 inst){ char a[64]; return w_UnregisterClassA(class_arg(n, a, sizeof a), inst); }
 static u64 WINAPI w_CreateWindowExW(u32 ex, const u16 *cls, const u16 *name, u32 style, i32 x, i32 y, i32 cw, i32 ch, u64 parent, u64 menu, u64 inst, void *param){
-  char c[48], n[300]; const char *cp; if((u64)cls < 0x10000) cp = (const char *)cls; else { wd_to_a(cls, c, sizeof c); cp = c; }
+  char c[64], n[300]; const char *cp = class_arg(cls, c, sizeof c);
   wd_to_a(name, n, sizeof n); return w_CreateWindowExA(ex, cp, name ? n : "", style, x, y, cw, ch, parent, menu, inst, param);
 }
 static i32 WINAPI w_SetWindowTextW(u64 h, const u16 *s){ char a[512]; wd_to_a(s, a, sizeof a); return (i32)send(h, WM_SETTEXT, 0, (i64)a); }
@@ -268,7 +272,10 @@ static i64 wide_msg(u64 h, u32 m, u64 wp, i64 lp, int post_it){
 }
 static i64 WINAPI w_SendMessageW(u64 h, u32 m, u64 wp, i64 lp){ return wide_msg(h, m, wp, lp, 0); }
 static i32 WINAPI w_PostMessageW(u64 h, u32 m, u64 wp, i64 lp){ return (i32)wide_msg(h, m, wp, lp, 1); }
-static i64 WINAPI w_DefWindowProcW(u64 h, u32 m, u64 wp, i64 lp){ return def_proc(h, m, wp, lp); }       /* text reaching a window procedure is already narrow */
+static i64 WINAPI w_DefWindowProcW(u64 h, u32 m, u64 wp, i64 lp){                /* text reaching a window procedure is already narrow ... */
+  if(m == WM_SETTEXT && lp && (const char *)lp != narrowed_text){ char a[512]; wd_to_a((const u16 *)lp, a, sizeof a); return def_proc(h, m, wp, (i64)a); }   /* ... unless the program passes its own wide text (Firefox sets its title this way) */
+  return def_proc(h, m, wp, lp);
+}
 static i32 WINAPI w_PeekMessageW(u8 *msg, u64 h, u32 lo, u32 hi, u32 rm){ return w_PeekMessageA(msg, h, lo, hi, rm); }
 static i32 WINAPI w_GetMessageW(u8 *msg, u64 h, u32 lo, u32 hi){ return w_GetMessageA(msg, h, lo, hi); }
 static i64 WINAPI w_DispatchMessageW(const u8 *msg){ return w_DispatchMessageA(msg); }
@@ -280,4 +287,4 @@ static i64 WINAPI w_DispatchMessageW(const u8 *msg){ return w_DispatchMessageA(m
   U(DefDlgProcA), {"user32","DefDlgProcW",w_DefDlgProcA}, U(MapDialogRect), U(GetDialogBaseUnits), U(GetNextDlgTabItem), U(GetNextDlgGroupItem), U(MessageBeep), U(LoadIconA), {"user32","LoadIconW",w_LoadIconA}, \
   U(LoadImageA), {"user32","LoadImageW",w_LoadImageA}, U(DestroyIcon), U(DrawIconEx), U(LoadStringA), U(LoadStringW), \
   {"kernel32","FindResourceA",k_FindResourceA}, {"kernel32","FindResourceW",k_FindResourceW}, {"kernel32","FindResourceExA",k_FindResourceExA}, {"kernel32","LoadResource",k_LoadResource}, {"kernel32","LockResource",k_LockResource}, {"kernel32","SizeofResource",k_SizeofResource}, \
-  U(RegisterClassW), {"user32","RegisterClassExW",w_RegisterClassW}, U(CreateWindowExW), U(SetWindowTextW), U(GetWindowTextW), U(GetWindowTextLengthW), U(SendMessageW), U(PostMessageW), U(DefWindowProcW), U(PeekMessageW), U(GetMessageW), U(DispatchMessageW),
+  U(RegisterClassW), {"user32","RegisterClassExW",w_RegisterClassW}, U(GetClassInfoW), U(GetClassInfoExW), U(UnregisterClassW), U(GetClassInfoA), U(GetClassInfoExA), U(UnregisterClassA),U(CreateWindowExW), U(SetWindowTextW), U(GetWindowTextW), U(GetWindowTextLengthW), U(SendMessageW), U(PostMessageW), U(DefWindowProcW), U(PeekMessageW), U(GetMessageW), U(DispatchMessageW),

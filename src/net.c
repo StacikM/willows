@@ -17,6 +17,7 @@ static u8 mymac[6]; static u32 myip, netmask, gateway, dnsip; static int nic_ok,
 static const u8 bcast[6]={255,255,255,255,255,255};
 int net_up(void){ return have_ip; }
 u32 net_ip(void){ return myip; }
+void net_info(u32 *mask, u32 *gw, u32 *dns, u8 *mac){ if(mask) *mask=netmask; if(gw) *gw=gateway; if(dns) *dns=dnsip; if(mac) memcpy(mac,mymac,6); }   /* GetAdaptersAddresses */
 void net_ip_str(u32 ip, char *o){ int n=0; for(int i=3;i>=0;i--){ u32 v=(ip>>(i*8))&255; char t[4]; int k=0; do{ t[k++]='0'+v%10; v/=10; }while(v); while(k) o[n++]=t[--k]; if(i) o[n++]='.'; } o[n]=0; }
 
 /* ---- checksums ---- */
@@ -145,20 +146,31 @@ int net_ping(u32 ip, u32 timeout){
   return -1;
 }
 
-/* ---- TCP ---- */
-#define MAXTCP 16
-#define RXSZ 16384
+/* ---- TCP ----
+   Each connection has a 64 KB receive ring and a 64 KB send ring (allocated while it is in use). Sending uses a sliding window:
+   everything the peer's window allows is in flight; on a timeout everything from the oldest unacknowledged byte is sent again
+   (go-back-N). SYN and FIN are tracked separately (has_un). Connections to 127.0.0.1 (or our own address) with a listener here are
+   "loopback" pairs that copy data straight into each other's receive ring. Closing finishes in the background (tcp_timers). */
+#define MAXTCP 128
+#define RXSZ 65536
+#define TXSZ 65536
 enum { T_CLOSED, T_LISTEN, T_SYN_SENT, T_SYN_RCVD, T_ESTAB, T_FIN1, T_FIN2, T_CLOSE_WAIT, T_LAST_ACK };
 struct tsock {
   u8 used, state, eof, rst, has_un, utries, uflags; u32 rip; u16 lport, rport, mss, ulen; u32 snd_una, snd_nxt, rcv_nxt, peer_win, useq, uts;
-  u32 rxh, rxn; u8 ub[1460]; int aq[4]; u8 aqn; int parent;
+  u32 rxh, rxn; u8 ub[1460]; int aq[8]; u8 aqn; int parent;
+  u8 *rx, *tx; u32 txh, txn;                                        /* txn: bytes from snd_una on (sent or not) */
+  u32 dts; u8 dtries;                                               /* data retransmission timer */
+  u8 closing, orphan; u32 close_ts;                                 /* closed by its owner: FIN once the data is out, then freed */
+  int lpeer;                                                        /* loopback: the other end, -1 otherwise */
 };
-static struct tsock T[MAXTCP]; static u8 trx[MAXTCP][RXSZ];
+static struct tsock T[MAXTCP];
+#define trx_(t) ((t)->rx)
 static int seq_le(u32 a, u32 b){ return (i32)(b-a)>=0; }
+static u32 rwin(struct tsock *t){ u32 w=RXSZ-t->rxn; return w>65535? 65535 : w; }
 static void tcp_xmit(struct tsock *t, u8 flags, const void *d, u32 n, u32 seq){
   u8 seg[1480]; struct tcph *h=(void*)seg; u32 hl_=20;
   h->sport=hs(t->lport); h->dport=hs(t->rport); h->seq=hl(seq); h->ack=(flags&0x10)? hl(t->rcv_nxt) : 0;
-  h->flags=flags; h->win=hs(RXSZ-t->rxn>65535? 65535 : RXSZ-t->rxn); h->csum=0; h->urg=0;
+  h->flags=flags; h->win=hs((u16)rwin(t)); h->csum=0; h->urg=0;
   if(flags&0x02){ seg[20]=2; seg[21]=4; *(u16*)(seg+22)=hs(1460); hl_=24; }
   h->off=(hl_/4)<<4;
   if(n) memcpy(seg+hl_,d,n);
@@ -175,7 +187,28 @@ static struct tsock *tfind(u32 rip, u16 rport, u16 lport){
   return NULL;
 }
 static struct tsock *tlisten(u16 lport){ for(int i=0;i<MAXTCP;i++) if(T[i].used && T[i].state==T_LISTEN && T[i].lport==lport) return &T[i]; return NULL; }
-static int talloc(void){ for(int i=0;i<MAXTCP;i++) if(!T[i].used){ memset(&T[i],0,sizeof T[i]); T[i].used=1; T[i].parent=-1; return i; } return -1; }
+static void tfree(struct tsock *t){
+  if(t->lpeer>=0 && T[t->lpeer].used && T[t->lpeer].lpeer==t-T){ struct tsock *p=&T[t->lpeer]; p->eof=1; if(p->state==T_ESTAB) p->state=T_CLOSE_WAIT; p->lpeer=-1; }   /* loopback: the other end sees the close */
+  heap_free(t->rx); heap_free(t->tx); t->rx=t->tx=0; t->used=0;
+}
+static int talloc(void){
+  for(int i=0;i<MAXTCP;i++) if(!T[i].used){ memset(&T[i],0,sizeof T[i]);
+    T[i].rx=heap_alloc(RXSZ); T[i].tx=heap_alloc(TXSZ); if(!T[i].rx || !T[i].tx){ heap_free(T[i].rx); heap_free(T[i].tx); return -1; }
+    T[i].used=1; T[i].parent=-1; T[i].lpeer=-1; return i; }
+  return -1;
+}
+/* send what the window allows from the send ring (data between snd_nxt and the end of the ring) */
+static void tcp_push(struct tsock *t){
+  if(t->lpeer>=0 || (t->state!=T_ESTAB && t->state!=T_CLOSE_WAIT)) return;
+  for(;;){
+    u32 inflight=t->snd_nxt-t->snd_una; if(inflight>=t->txn) break;
+    u32 win=t->peer_win? t->peer_win : 1; if(inflight>=win) break;
+    u32 c=t->txn-inflight; if(c>t->mss) c=t->mss; if(c>win-inflight) c=win-inflight;
+    u8 seg[1460]; for(u32 i=0;i<c;i++) seg[i]=t->tx[(t->txh+inflight+i)%TXSZ];
+    if(!inflight){ t->dts=ticks; t->dtries=0; }
+    tcp_xmit(t,0x18,seg,c,t->snd_nxt); t->snd_nxt+=c;
+  }
+}
 static void rst_reply(u32 src, const struct tcph *h, u32 datalen){
   struct tsock t; memset(&t,0,sizeof t); t.rip=src; t.lport=hs(h->dport); t.rport=hs(h->sport);
   if(h->flags&0x10) tcp_xmit(&t,0x04,NULL,0,hl(h->ack)); else { t.rcv_nxt=hl(h->seq)+datalen+((h->flags&3)?1:0); tcp_xmit(&t,0x14,NULL,0,0); }
@@ -194,7 +227,7 @@ static void tcp_rx(u32 src, const u8 *p, u32 n){
     if(!(f&0x04)) rst_reply(src,h,dl);
     return;
   }
-  if(f&0x04){ if(t->state!=T_LISTEN) tcp_reset(t); return; }
+  if(f&0x04){ if(t->state!=T_LISTEN) tcp_reset(t); if(t->orphan) tfree(t); return; }
   t->peer_win=hs(h->win);
   if(t->state==T_SYN_SENT){
     if((f&0x12)==0x12 && ack==t->snd_nxt){
@@ -205,48 +238,97 @@ static void tcp_rx(u32 src, const u8 *p, u32 n){
     return;
   }
   if(f&0x10){                                                         /* ACK processing */
-    if(seq_le(t->snd_una,ack) && seq_le(ack,t->snd_nxt)){ t->snd_una=ack; if(ack==t->snd_nxt) t->has_un=0; }
+    if(seq_le(t->snd_una,ack) && seq_le(ack,t->snd_nxt)){
+      u32 acked=ack-t->snd_una;
+      if(t->has_un){ if(ack==t->snd_nxt) t->has_un=0; if(acked) acked--; }      /* the SYN or FIN takes one sequence number (and is last) */
+      if(acked>t->txn) acked=t->txn;
+      t->txh=(t->txh+acked)%TXSZ; t->txn-=acked; t->snd_una=ack;
+      if(acked){ t->dts=ticks; t->dtries=0; }
+    }
     if(t->state==T_SYN_RCVD && ack==t->snd_nxt){
       t->state=T_ESTAB; struct tsock *l=(t->parent>=0)? &T[t->parent] : NULL;
-      if(l && l->aqn<4) l->aq[l->aqn++]=t-T;
+      if(l && l->used && l->state==T_LISTEN && l->aqn<8) l->aq[l->aqn++]=t-T;
     } else if(t->state==T_FIN1 && !t->has_un) t->state=T_FIN2;
-    else if(t->state==T_LAST_ACK && !t->has_un){ t->state=T_CLOSED; t->used=0; return; }
+    else if(t->state==T_LAST_ACK && !t->has_un){ t->state=T_CLOSED; tfree(t); return; }
+    tcp_push(t);
   }
   if(t->state==T_ESTAB||t->state==T_FIN1||t->state==T_FIN2||t->state==T_CLOSE_WAIT){
     if(dl){
       if(seq==t->rcv_nxt && RXSZ-t->rxn>=dl){
-        for(u32 i=0;i<dl;i++) trx[t-T][(t->rxh+t->rxn+i)%RXSZ]=data[i];
+        for(u32 i=0;i<dl;i++) t->rx[(t->rxh+t->rxn+i)%RXSZ]=data[i];
         t->rxn+=dl; t->rcv_nxt+=dl; tcp_xmit(t,0x10,NULL,0,t->snd_nxt);
       } else tcp_xmit(t,0x10,NULL,0,t->snd_nxt);                       /* duplicate/out of order: re-ACK, peer retransmits */
     }
     if((f&0x01) && seq+dl==t->rcv_nxt){                               /* FIN */
       t->rcv_nxt++; t->eof=1; tcp_xmit(t,0x10,NULL,0,t->snd_nxt);
-      if(t->state==T_ESTAB) t->state=T_CLOSE_WAIT; else if(t->state==T_FIN1||t->state==T_FIN2){ t->state=T_CLOSED; }
+      if(t->state==T_ESTAB) t->state=T_CLOSE_WAIT; else if(t->state==T_FIN1||t->state==T_FIN2){ t->state=T_CLOSED; if(t->orphan) tfree(t); }
     }
   }
+}
+static void send_fin(struct tsock *t){
+  if(t->lpeer>=0){ t->state=T_CLOSED; tfree(t); return; }                 /* loopback: the peer just sees end of file */
+  if(t->state==T_ESTAB){ t->state=T_FIN1; tcp_send_ctl(t,0x11); }
+  else if(t->state==T_CLOSE_WAIT){ t->state=T_LAST_ACK; tcp_send_ctl(t,0x11); }
+  else { t->state=T_CLOSED; tfree(t); }
 }
 static void tcp_timers(void){
-  for(int i=0;i<MAXTCP;i++){ struct tsock *t=&T[i]; if(!t->used||!t->has_un) continue;
-    u32 rto=400u<<(t->utries>4?4:t->utries);
-    if((u32)(ticks-t->uts)>=rto){
-      if(t->utries>=7){ tcp_reset(t); continue; }
-      t->utries++; t->uts=ticks;
-      if(t->ulen) tcp_xmit(t,t->uflags,t->ub,t->ulen,t->useq); else tcp_xmit(t,t->uflags,NULL,0,t->useq);
+  for(int i=0;i<MAXTCP;i++){ struct tsock *t=&T[i]; if(!t->used) continue;
+    if(t->has_un){                                                    /* SYN / FIN */
+      u32 rto=400u<<(t->utries>4?4:t->utries);
+      if((u32)(ticks-t->uts)>=rto){
+        if(t->utries>=7){ tcp_reset(t); if(t->orphan) tfree(t); continue; }
+        t->utries++; t->uts=ticks;
+        if(t->ulen) tcp_xmit(t,t->uflags,t->ub,t->ulen,t->useq); else tcp_xmit(t,t->uflags,NULL,0,t->useq);
+      }
+    }
+    if(t->lpeer<0 && t->txn && t->snd_nxt!=t->snd_una){               /* data: go back to the oldest unacknowledged byte */
+      u32 rto=300u<<(t->dtries>5?5:t->dtries);
+      if((u32)(ticks-t->dts)>=rto){
+        if(t->dtries>=8){ tcp_reset(t); if(t->orphan) tfree(t); continue; }
+        t->dtries++; t->dts=ticks; t->snd_nxt=t->snd_una; tcp_push(t);
+      }
+    } else if(t->txn && t->lpeer<0) tcp_push(t);                      /* a window opened */
+    if(t->orphan){                                                    /* closed by its owner */
+      if(t->closing && !t->txn && !t->has_un){ t->closing=0; send_fin(t); continue; }
+      if((u32)(ticks-t->close_ts)>20000){ tfree(t); continue; }       /* give up on a peer that never finishes */
+      if(t->state==T_CLOSED || t->rst){ tfree(t); continue; }
     }
   }
 }
-int tcp_connect(u32 ip, u16 port){
-  if(!have_ip) return -1;
-  static u16 eph=49152; int i=talloc(); if(i<0) return -1; struct tsock *t=&T[i];
-  t->rip=ip; t->rport=port; t->lport=eph++; if(eph<49152) eph=49152; t->mss=1460; t->snd_una=t->snd_nxt=ticks*104729u+1;
-  t->state=T_SYN_SENT; tcp_send_ctl(t,0x02);
+static u16 next_eph(void){ static u16 eph=49152; u16 p=eph++; if(eph<49152) eph=49152; return p; }
+u16 tcp_free_port(void){ u16 p; do p=next_eph(); while(tlisten(p)); return p; }   /* bind(port 0): a port of our choosing */
+static struct tsock *loop_listener(u32 ip, u16 port){                 /* a connection to ourselves */
+  if(ip!=0x7F000001 && !(have_ip && ip==myip)) return 0; return tlisten(port);
+}
+/* start connecting; returns the connection (SYN_SENT, or already ESTAB for loopback), or -1 / -2 (refused) */
+int tcp_connect_start(u32 ip, u16 port){
+  struct tsock *l=loop_listener(ip,port);
+  if(ip==0x7F000001 && !l) return -2;                                  /* nobody listens there */
+  if(!l && !have_ip) return -1;
+  int i=talloc(); if(i<0) return -1; struct tsock *t=&T[i];
+  t->rip=ip; t->rport=port; t->lport=next_eph(); t->mss=1460;
+  if(l){                                                               /* loopback pair: both ends established at once */
+    int ci=talloc(); if(ci<0){ tfree(t); return -1; } struct tsock *c=&T[ci];
+    c->rip=ip; c->rport=t->lport; c->lport=port; c->mss=1460; c->state=T_ESTAB; t->state=T_ESTAB; c->parent=l-T; c->lpeer=i; t->lpeer=ci;
+    if(l->aqn<8) l->aq[l->aqn++]=ci; else { tfree(c); tfree(t); return -2; }
+    return i;
+  }
+  t->snd_una=t->snd_nxt=ticks*104729u+1; t->state=T_SYN_SENT; tcp_send_ctl(t,0x02);
+  return i;
+}
+int tcp_connect_failed(int s){ return s<0||s>=MAXTCP||!T[s].used||T[s].rst||(T[s].state==T_CLOSED); }   /* (a pending connect is not "failed") */
+int tcp_connected(int s){ return s>=0&&s<MAXTCP&&T[s].used&&T[s].state!=T_SYN_SENT&&!T[s].rst&&T[s].state!=T_CLOSED; }
+int tcp_connect(u32 ip, u16 port){                                     /* blocking (the built-in programs) */
+  int i=tcp_connect_start(ip,port); if(i<0) return i; struct tsock *t=&T[i];
   u32 end=ticks+9000; while(t->state==T_SYN_SENT && !t->rst && (i32)(ticks-end)<0){ net_poll(); idle_wait(); }
-  if(t->state!=T_ESTAB){ int r=t->rst? -2 : -3; t->used=0; return r; }
+  if(t->state!=T_ESTAB){ int r=t->rst? -2 : -3; tfree(t); return r; }
   return i;
 }
 int tcp_listen(u16 port){
-  if(tlisten(port)) return -1; int i=talloc(); if(i<0) return -1; T[i].state=T_LISTEN; T[i].lport=port; return i;
+  if(!port){ do port=next_eph(); while(tlisten(port)); }               /* port 0: any free one (tcp_local_port tells which) */
+  if(tlisten(port)) return -1; int i=talloc(); if(i<0) return -1; T[i].state=T_LISTEN; T[i].lport=port; heap_free(T[i].rx); heap_free(T[i].tx); T[i].rx=T[i].tx=0; return i;
 }
+u16 tcp_local_port(int s){ return (s>=0&&s<MAXTCP&&T[s].used)? T[s].lport : 0; }
 int tcp_pending(int s){ return s>=0&&s<MAXTCP&&T[s].used&&T[s].aqn>0; }
 int tcp_accept(int lis, int nb, u32 *ip, u16 *port){
   if(lis<0||lis>=MAXTCP||!T[lis].used||T[lis].state!=T_LISTEN) return -1;
@@ -257,39 +339,44 @@ int tcp_accept(int lis, int nb, u32 *ip, u16 *port){
 int tcp_state(int s){ return (s>=0&&s<MAXTCP&&T[s].used)? T[s].state : T_CLOSED; }
 int tcp_rst(int s){ return s>=0&&s<MAXTCP&&T[s].rst; }
 int tcp_avail(int s){ return (s>=0&&s<MAXTCP&&T[s].used)? (int)T[s].rxn : 0; }
-int tcp_writable(int s){ return s>=0&&s<MAXTCP&&T[s].used&&(T[s].state==T_ESTAB||T[s].state==T_CLOSE_WAIT)&&!T[s].has_un; }
+static u32 tx_space(struct tsock *t){
+  if(t->lpeer>=0){ struct tsock *p=&T[t->lpeer]; return p->used? RXSZ-p->rxn : 0; }
+  return TXSZ-t->txn;
+}
+int tcp_writable(int s){ return s>=0&&s<MAXTCP&&T[s].used&&(T[s].state==T_ESTAB||T[s].state==T_CLOSE_WAIT)&&tx_space(&T[s])>0; }
 int tcp_read(int s, void *d, u32 n, int nb){
   if(s<0||s>=MAXTCP||!T[s].used) return -1; struct tsock *t=&T[s];
   while(!t->rxn){
     if(t->rst) return -2; if(t->eof||t->state==T_CLOSED) return 0;
     if(nb) return -3; net_poll(); idle_wait();
   }
-  u32 c=t->rxn<n? t->rxn : n; u8 *o=d;
-  for(u32 i=0;i<c;i++) o[i]=trx[s][(t->rxh+i)%RXSZ];
+  u32 was_full=rwin(t)<t->mss, c=t->rxn<n? t->rxn : n; u8 *o=d;
+  for(u32 i=0;i<c;i++) o[i]=t->rx[(t->rxh+i)%RXSZ];
   t->rxh=(t->rxh+c)%RXSZ; t->rxn-=c;
-  if(c) tcp_xmit(t,0x10,NULL,0,t->snd_nxt);                          /* window update */
+  if(c && t->lpeer<0 && (was_full || rwin(t)>=RXSZ/2)) tcp_xmit(t,0x10,NULL,0,t->snd_nxt);   /* window update when it matters */
   return (int)c;
 }
-int tcp_write(int s, const void *d, u32 n){
-  if(s<0||s>=MAXTCP||!T[s].used) return -1; struct tsock *t=&T[s]; const u8 *p=d; u32 sent=0;
-  while(sent<n){
-    u32 end=ticks+15000;
-    while(t->has_un){ if(t->rst||t->state==T_CLOSED) return -2; if((i32)(ticks-end)>=0){ tcp_reset(t); return -2; } net_poll(); idle_wait(); }
-    if(t->rst||(t->state!=T_ESTAB&&t->state!=T_CLOSE_WAIT)) return -2;
-    u32 c=n-sent; if(c>t->mss) c=t->mss; if(t->peer_win && c>t->peer_win) c=t->peer_win; if(!c) c=1;
-    memcpy(t->ub,p+sent,c); t->ulen=c; t->uflags=0x18; t->useq=t->snd_nxt; t->uts=ticks; t->utries=0; t->has_un=1;
-    tcp_xmit(t,0x18,t->ub,c,t->snd_nxt); t->snd_nxt+=c; sent+=c;
+/* queue data for sending: blocking waits until all of it is queued; non-blocking queues what fits (-3: nothing fits) */
+int tcp_write_nb(int s, const void *d, u32 n, int nb){
+  if(s<0||s>=MAXTCP||!T[s].used) return -1; struct tsock *t=&T[s]; const u8 *p=d; u32 done=0; u32 end=ticks+30000;
+  while(done<n){
+    if(t->rst||(t->state!=T_ESTAB&&t->state!=T_CLOSE_WAIT)) return done? (int)done : -2;
+    u32 sp=tx_space(t);
+    if(!sp){ if(nb) return done? (int)done : -3; if((i32)(ticks-end)>=0){ tcp_reset(t); return -2; } net_poll(); idle_wait(); continue; }
+    u32 c=n-done; if(c>sp) c=sp;
+    if(t->lpeer>=0){ struct tsock *q=&T[t->lpeer]; for(u32 i=0;i<c;i++) q->rx[(q->rxh+q->rxn+i)%RXSZ]=p[done+i]; q->rxn+=c; }
+    else { for(u32 i=0;i<c;i++) t->tx[(t->txh+t->txn+i)%TXSZ]=p[done+i]; t->txn+=c; tcp_push(t); }
+    done+=c;
   }
-  return (int)sent;
+  return (int)done;
 }
-void tcp_close(int s){
+int tcp_write(int s, const void *d, u32 n){ return tcp_write_nb(s,d,n,0); }
+void tcp_close(int s){                                                 /* returns at once: the FIN goes out when the queued data has */
   if(s<0||s>=MAXTCP||!T[s].used) return; struct tsock *t=&T[s];
-  if(t->state==T_LISTEN){ t->used=0; return; }
-  u32 end=ticks+3000; while(t->has_un && (i32)(ticks-end)<0 && !t->rst){ net_poll(); idle_wait(); }
-  if(t->state==T_ESTAB){ t->state=T_FIN1; tcp_send_ctl(t,0x11); }
-  else if(t->state==T_CLOSE_WAIT){ t->state=T_LAST_ACK; tcp_send_ctl(t,0x11); }
-  end=ticks+1500; while(t->used && t->state!=T_CLOSED && (t->has_un||t->state==T_FIN1) && (i32)(ticks-end)<0){ net_poll(); idle_wait(); }
-  t->used=0;
+  if(t->state==T_LISTEN){ for(int i=0;i<t->aqn;i++){ struct tsock *c=&T[t->aq[i]]; if(c->used){ c->orphan=1; c->closing=1; c->close_ts=ticks; } } tfree(t); return; }
+  if(t->rst || t->state==T_CLOSED || t->state==T_SYN_SENT){ tfree(t); return; }
+  t->orphan=1; t->closing=1; t->close_ts=ticks;
+  if(!t->txn || t->lpeer>=0){ t->closing=0; send_fin(t); }
 }
 
 /* ---- DNS ---- */

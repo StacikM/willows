@@ -23,6 +23,7 @@ typedef u64 HANDLE;
 #define WM_CHAR 0x102
 #define WM_COMMAND 0x111
 #define WM_MOUSEMOVE 0x200
+#define WM_W_CLICK 0x03EF                                           /* internal: a click on a program's window, decided in its thread (system range, never sent by programs) */
 #define WM_LBUTTONDOWN 0x201
 #define WM_LBUTTONUP 0x202
 #define WS_CHILD 0x40000000u
@@ -61,11 +62,17 @@ struct wnd {
   char cls[24]; char *text; u32 tlen, tcap;
   u32 caret, top_line, left_col; u8 pressed, paint_pending, mm_pending; u32 *pix; i32 stride;
   void *ext; u8 ctype, disabled, sized; i32 check; u32 seq;
+  u32 tid;                                                        /* the thread that created it: its messages go to that thread's loop */
+  u64 ownerw;                                                     /* top-level windows: the owner window (hWndParent of a popup) */
+  u8 custom_frame;                                                /* the program draws its own title bar (WM_NCCALCSIZE gave it the whole window) */
+  u8 alpha;                                                       /* frameless popup whose pixels carry alpha (Firefox menus): blended over what is behind */
+  u8 ownpix;                                                      /* pix was allocated for this window (backing store): freed with it */
 };
 static u32 g_seq;
 static struct wnd W[MAXW];
 static u64 Z[MAXW]; static int nz;                 /* top-level windows, back to front */
 static u64 g_focus, g_capture, g_drag; static int drag_dx, drag_dy;
+static u64 g_track_leave;                                          /* the window that asked for WM_MOUSELEAVE (TrackMouseEvent) */
 static int dirty=1, created, wm_on, start_open, start_hover=-1;
 static u64 con_win;
 
@@ -78,18 +85,41 @@ static u64 top_visible(void){ for(int i=nz-1;i>=0;i--){ struct wnd *w=get(Z[i]);
 int wm_active(void){ return created; }
 
 /* ---- window classes ---- */
-struct cls { char name[24]; u64 proc; u32 bg; int used; };
-static struct cls classes[16];
+/* WNDCLASSA and WNDCLASSEXA have the same x64 layout from offset 8 on: proc 8, cbClsExtra 16, cbWndExtra 20, hInstance 24, hIcon 32,
+   hCursor 40, hbrBackground 48, menu name 56, class name 64. A class name may also be given as the atom RegisterClass returned. */
+#define MAXCLS 256                                                  /* per-process classes: every Firefox process registers its own */
+struct cls { char name[64]; u64 proc, inst, icon, cursor, bg64; u32 bg, style; i32 clsextra, wndextra; int used, owner; };
+static struct cls classes[MAXCLS];
 static void cpy(char *d, const char *s, int n){ int i=0; for(;s[i]&&i<n-1;i++) d[i]=s[i]; d[i]=0; }
-static u64 WINAPI w_RegisterClassA(const u8 *wc){
-  for(int i=0;i<16;i++) if(!classes[i].used){
-    classes[i].used=1; classes[i].proc=*(u64*)(wc+8); classes[i].bg=(u32)*(u64*)(wc+48);
-    const char *n=*(const char**)(wc+64); if((u64)n<0x10000){ classes[i].used=0; return 0; }
-    cpy(classes[i].name,n,24); return 0xC000+i;
-  }
-  return 0;
+/* window classes belong to the process that registered them (as on Windows): another process - or a new run of the same program
+   - registering the same name gets its own class, with its own window procedure */
+static int class_mine(const struct cls *c){ return c->used && (c->owner==0 || (cur && c->owner==cur->pid)); }
+static struct cls *find_class(const char *n){
+  if((u64)n>=0xC000 && (u64)n<0xC000+MAXCLS){ struct cls *c=&classes[(u64)n-0xC000]; return class_mine(c)? c : 0; }   /* an atom */
+  if((u64)n<0x10000) return 0;
+  for(int i=0;i<MAXCLS;i++) if(class_mine(&classes[i]) && stricmp(classes[i].name,n)==0) return &classes[i]; return 0;
 }
-static struct cls *find_class(const char *n){ for(int i=0;i<16;i++) if(classes[i].used && stricmp(classes[i].name,n)==0) return &classes[i]; return 0; }
+static u64 WINAPI w_RegisterClassA(const u8 *wc){
+  const char *n=*(const char**)(wc+64); if((u64)n<0x10000) return 0;
+  if(find_class(n)){ win32_set_last_error(1410); return 0; }                    /* ERROR_CLASS_ALREADY_EXISTS */
+  for(int i=0;i<MAXCLS;i++) if(!classes[i].used){
+    struct cls *c=&classes[i]; memset(c,0,sizeof *c); c->used=1; c->owner=cur->pid;
+    c->style=*(u32*)(wc+4); c->proc=*(u64*)(wc+8); c->clsextra=*(i32*)(wc+16); c->wndextra=*(i32*)(wc+20); c->inst=*(u64*)(wc+24);
+    c->icon=*(u64*)(wc+32); c->cursor=*(u64*)(wc+40); c->bg64=*(u64*)(wc+48); c->bg=(u32)c->bg64;
+    cpy(c->name,n,64); return 0xC000+i;
+  }
+  win32_set_last_error(8); return 0;
+}
+/* GetClassInfo(Ex): fills WNDCLASS(EX) from offset 4 (style) on; the name pointer is the one the caller passed */
+static u64 class_info(const char *n, const void *callers_name, u8 *wc, int ex){
+  struct cls *c=find_class(n); if(!c){ win32_set_last_error(1411); return 0; }    /* ERROR_CLASS_DOES_NOT_EXIST */
+  *(u32*)(wc+4)=c->style; *(u64*)(wc+8)=c->proc; *(i32*)(wc+16)=c->clsextra; *(i32*)(wc+20)=c->wndextra; *(u64*)(wc+24)=c->inst;
+  *(u64*)(wc+32)=c->icon; *(u64*)(wc+40)=c->cursor; *(u64*)(wc+48)=c->bg64; *(u64*)(wc+56)=0; *(const void**)(wc+64)=callers_name; if(ex) *(u64*)(wc+72)=c->icon;
+  return 0xC000+(u64)(c-classes);
+}
+static i32 WINAPI w_GetClassInfoA(u64 inst, const char *n, u8 *wc){ (void)inst; return class_info(n,n,wc,0)!=0; }
+static u64 WINAPI w_GetClassInfoExA(u64 inst, const char *n, u8 *wc){ (void)inst; return class_info(n,n,wc,1); }
+static i32 WINAPI w_UnregisterClassA(const char *n, u64 inst){ (void)inst; struct cls *c=find_class(n); if(!c){ win32_set_last_error(1411); return 0; } c->used=0; return 1; }
 
 /* ---- text storage ---- */
 static void settext(struct wnd *w, const char *s){
@@ -99,7 +129,7 @@ static void settext(struct wnd *w, const char *s){
 }
 
 /* ---- geometry ---- */
-static int has_frame(struct wnd *w){ return !(w->style&WS_CHILD) && (w->style&WS_CAPTION)==WS_CAPTION; }
+static int has_frame(struct wnd *w){ return !(w->style&WS_CHILD) && (w->style&WS_CAPTION)==WS_CAPTION && !w->custom_frame; }
 static void client_size(struct wnd *w, int *cw, int *ch){
   if(has_frame(w)){ *cw=w->w-2*FRAME; *ch=w->h-FRAME-TITLE_H-FRAME; } else { *cw=w->w; *ch=w->h; }
 }
@@ -120,12 +150,30 @@ static i64 call_proc(u64 proc, u64 h, u32 m, u64 wp, i64 lp){
   if(proc<16) return builtin_proc((int)proc,h,m,wp,lp);
   return ((wndproc_t)proc)(h,m,wp,lp);
 }
-static i64 send(u64 h, u32 m, u64 wp, i64 lp){ struct wnd *w=get(h); return w? call_proc(w->proc,h,m,wp,lp) : 0; }
-/* every process has its own queue; a message goes to the process that owns the target window */
+static const char *narrowed_text;                                     /* WM_SETTEXT text Willows hands to a window procedure (always narrow; see DefWindowProcW) */
+static i64 send(u64 h, u32 m, u64 wp, i64 lp){
+  struct wnd *w=get(h); if(!w) return 0;
+  if(m!=0x000C) return call_proc(w->proc,h,m,wp,lp);                   /* WM_SETTEXT */
+  const char *o=narrowed_text; narrowed_text=(const char*)lp; i64 r=call_proc(w->proc,h,m,wp,lp); narrowed_text=o; return r;
+}
+/* every process has one queue; each message is tagged with the thread that owns the target window, and a thread's GetMessage /
+   PeekMessage only see its own messages (as with Windows' per-thread queues) */
+static void post_to(struct proc *p, u32 tid, u64 h, u32 m, u64 wp, i64 lp){
+  u32 n=(p->qh+1)&(MSGQ-1); if(n!=p->qt){ p->q[p->qh]=(struct msg){h,m,wp,lp,tid}; p->qh=n; }
+}
+static int wm_trace(void){ static int t=-1; if(t<0){ struct ramfile *f=fs_find("/System/apitrace.cfg"); t= f && !f->isdir; } return t; }   /* TRACE=1: log window activity */
+void wm_dump_queue(int pid){                                       /* Ctrl+F12: what sits in a process's message queue */
+  struct proc *p=&procs[pid]; u32 n=(p->qh-p->qt)&(MSGQ-1); if(!n) return;
+  kdbg("    message queue: %u of %u used:",n,MSGQ-1); u32 shown=0;
+  for(u32 i=p->qt; i!=p->qh && shown<12; i=(i+1)&(MSGQ-1), shown++) kdbg(" [tid %x msg %x hwnd %p]",p->q[i].tid,p->q[i].msg,(void*)p->q[i].hwnd);
+  kdbg("\n");
+}
 static void post(u64 h, u32 m, u64 wp, i64 lp){
-  struct wnd *w=get(h); struct proc *p=&procs[w? w->owner : 0];
+  struct wnd *w=get(h); struct proc *p= w? &procs[w->owner] : cur;   /* PostMessage(NULL, ...): the calling thread's own queue */
+  { static int t=-1; if(t<0){ struct ramfile *f=fs_find("/System/apitrace.cfg"); t= f && !f->isdir; }
+    if(t && (m>=0xC000 || (w && w->tid!=thread_cur_tid()))) kdbg("  [msg] post %x to hwnd %p (tid %x, pid %d) from tid %x, queue %u\n",m,(void*)h,w? w->tid:0,(int)(p-procs),thread_cur_tid(),(p->qh-p->qt)&(MSGQ-1)); }
   if(w && m==WM_MOUSEMOVE){ if(w->mm_pending) return; w->mm_pending=1; }
-  u32 n=(p->qh+1)&63; if(n!=p->qt){ p->q[p->qh]=(struct msg){h,m,wp,lp}; p->qh=n; }
+  post_to(p, w? w->tid : thread_cur_tid(), h, m, wp, lp);
 }
 
 static void set_focus(u64 h){
@@ -134,8 +182,12 @@ static void set_focus(u64 h){
   if(get(old)) post(old,WM_KILLFOCUS,h,0);
   if(get(h)) post(h,WM_SETFOCUS,old,0);
 }
-static void raise_top(u64 h){
+static void raise_one(u64 h){
   for(int i=0;i<nz;i++) if(Z[i]==h){ for(int j=i;j<nz-1;j++) Z[j]=Z[j+1]; Z[nz-1]=h; dirty=1; return; }
+}
+static void raise_top(u64 h){                                      /* to the front, with the windows it owns (popups, menus) above it */
+  raise_one(h);
+  for(int pass=0;pass<2;pass++) for(int i=0;i<MAXW;i++) if(W[i].used && W[i].ownerw==h && W[i].visible && !(W[i].style&WS_CHILD)) raise_one(HW(i));
 }
 static u64 first_edit(u64 parent){
   for(int i=0;i<MAXW;i++) if(W[i].used && W[i].parent==parent && W[i].kind==K_EDIT && (W[i].style&WS_CHILD)) return HW(i);
@@ -145,20 +197,37 @@ static void invalidate(struct wnd *w){                              /* ask the p
   if(w->kind==K_APP && !w->paint_pending){ w->paint_pending=1; post(hof(w),WM_PAINT,0,0); }
   dirty=1;
 }
-static void on_show(struct wnd *w){
-  if(!(w->style&WS_CHILD)){ raise_top(hof(w)); u64 e=first_edit(hof(w)); set_focus(e? e : hof(w)); }   /* new windows come to the front */
+/* a window was shown: top-level windows come to the front; they also get the focus unless shown without activation
+   (SWP_NOACTIVATE, SW_SHOWNOACTIVATE / SW_SHOWNA, WS_EX_NOACTIVATE) - menus and tooltips must not take the focus from their owner */
+static void on_show_ex(struct wnd *w, int activate){
+  if(w->exstyle&0x08000000u) activate=0;                            /* WS_EX_NOACTIVATE */
+  if(!(w->style&WS_CHILD)){ raise_top(hof(w)); if(activate){ u64 e=first_edit(hof(w)); set_focus(e? e : hof(w)); } }
   invalidate(w);
 }
+static void on_show(struct wnd *w){ on_show_ex(w,1); }
 
 /* ---- default + built-in window procedures ---- */
 static void destroy(u64 h);
+static void set_max(struct wnd *w, int on, int in_thread); static void minimize(struct wnd *w);
 static i64 def_proc(u64 h, u32 m, u64 wp, i64 lp){
   struct wnd *w=get(h); if(!w) return 0;
   switch(m){
+    case 0x112: switch(wp&0xFFF0){                                      /* WM_SYSCOMMAND: what the caption buttons and the window menu do */
+      case 0xF030: set_max(w,1,1); return 0;                            /* SC_MAXIMIZE */
+      case 0xF120: if(w->minimized){ w->minimized=0; dirty=1; } else set_max(w,0,1); return 0;   /* SC_RESTORE */
+      case 0xF020: minimize(w); return 0;                               /* SC_MINIMIZE */
+      case 0xF060: post(h,WM_CLOSE,0,0); return 0;                      /* SC_CLOSE */
+      } return 0;
+    case 0x83: if(wp && lp && !(w->style&WS_CHILD) && (w->style&WS_CAPTION)==WS_CAPTION){ i32 *r=(i32*)lp; r[0]+=FRAME; r[1]+=FRAME+TITLE_H; r[2]-=FRAME; r[3]-=FRAME; }   /* WM_NCCALCSIZE: our frame */
+      return 0;
+    case 0x47: { const u8 *wpos=(const u8*)lp; u32 fl= wpos? *(const u32*)(wpos+32) : 0;     /* WM_WINDOWPOSCHANGED: as on Windows, WM_SIZE and WM_MOVE follow */
+      if(!(fl&1)){ int a,b; client_size(w,&a,&b); send(h,WM_SIZE,w->maximized? 2 : 0,((i64)b<<16)|(a&0xFFFF)); }
+      if(!(fl&2)){ int x,y; client_origin(w,&x,&y); send(h,3,0,((i64)(y&0xFFFF)<<16)|(x&0xFFFF)); }
+      return 0; }
     case WM_NCCREATE: return 1;
     case WM_ERASEBKGND: return 1;
     case WM_CLOSE: destroy(h); return 0;
-    case WM_SETTEXT: settext(w,(const char*)lp); dirty=1; return 1;
+    case WM_SETTEXT: settext(w,(const char*)lp); dirty=1; if(wm_trace() && !(w->style&WS_CHILD)) kdbg("  [wm] %p title: %s\n",(void*)h,lp? (const char*)lp : "(null)"); return 1;
     case WM_GETTEXT: { u64 n=wp? (w->tlen<wp-1? w->tlen : wp-1) : 0; if(wp){ memcpy((void*)lp,w->text?w->text:"",n); ((char*)lp)[n]=0; } return n; }
     case WM_GETTEXTLENGTH: return w->tlen;
   }
@@ -231,10 +300,15 @@ static i64 builtin_proc(int id, u64 h, u32 m, u64 wp, i64 lp){
 static void kill_window(int i){                         /* silent removal (owner process is gone) */
   u64 h=HW(i); if(g_focus==h) g_focus=0; if(g_capture==h) g_capture=0; if(g_drag==h) g_drag=0;
   for(int k=0;k<nz;k++) if(Z[k]==h){ for(int j=k;j<nz-1;j++) Z[j]=Z[j+1]; nz--; break; }
+  if(W[i].ownpix && W[i].pix){ heap_free(W[i].pix); W[i].pix=0; }
   W[i].used=0; dirty=1;
 }
+static void gdi_cleanup(int pid);
 void wm_cleanup(int pid){
+  gdi_cleanup(pid);
   for(int i=0;i<MAXW;i++) if(W[i].used && W[i].owner==pid) kill_window(i);
+  for(int i=0;i<MAXCLS;i++) if(classes[i].used && classes[i].owner==pid) classes[i].used=0;   /* its window classes go with it */
+  if(!get(g_track_leave)) g_track_leave=0;
   if(!g_focus) g_focus=top_visible(); dirty=1;
 }
 static void destroy(u64 h);
@@ -242,20 +316,25 @@ static void destroy(u64 h){
   struct wnd *w=get(h); if(!w) return;
   for(int i=0;i<MAXW;i++) if(W[i].used && W[i].parent==h) destroy(HW(i));
   send(h,WM_DESTROY,0,0);
-  if(g_focus==h) g_focus=0; if(g_capture==h) g_capture=0; if(g_drag==h) g_drag=0;
+  if(g_focus==h) g_focus=0; if(g_capture==h) g_capture=0; if(g_drag==h) g_drag=0; if(g_track_leave==h) g_track_leave=0;
   for(int i=0;i<nz;i++) if(Z[i]==h){ for(int j=i;j<nz-1;j++) Z[j]=Z[j+1]; nz--; break; }
+  if(w->ownpix && w->pix){ heap_free(w->pix); w->pix=0; }
   w->used=0; dirty=1;
   if(!g_focus && nz) set_focus(top_visible());
 }
 static int ctrl_type_for(const char *cls, u32 style);
+static void ask_frame(struct wnd *w);
 static int is_dialog_wnd(u64 h);
 static u64 make_ctrl(u64 parent, int ct, const char *text, u32 style, int x, int y, int w, int h, u64 id);
 static u64 WINAPI w_CreateWindowExA(u32 ex, const char *cls, const char *name, u32 style, i32 x, i32 y, i32 cw, i32 ch,
                                     u64 parent, u64 menu, u64 inst, void *param){
-  if(!gfx_ok || (u64)cls<0x10000) return 0;
-  int idx=-1; for(int i=0;i<MAXW;i++) if(!W[i].used){ idx=i; break; } if(idx<0) return 0;
-  struct wnd *w=&W[idx]; memset(w,0,sizeof *w); w->used=1; w->owner=cur->pid; cpy(w->cls,cls,24);
   struct cls *c=find_class(cls);
+  if(!gfx_ok || (!c && (u64)cls<0x10000)){ win32_set_last_error(1411); return 0; }
+  if(c) cls=c->name;                                                               /* created by atom */
+  int msgonly= parent==(u64)-3;                                                    /* HWND_MESSAGE: never shown, not in the window list */
+  if(msgonly){ parent=0; style&=~(WS_VISIBLE|WS_CHILD); }
+  int idx=-1; for(int i=0;i<MAXW;i++) if(!W[i].used){ idx=i; break; } if(idx<0){ kdbg("  [wm] window table full\n"); win32_set_last_error(8); return 0; }
+  struct wnd *w=&W[idx]; memset(w,0,sizeof *w); w->used=1; w->owner=cur->pid; w->tid=thread_cur_tid(); cpy(w->cls,cls,24);
   w->seq=++g_seq;
   if(!c){ int ct=ctrl_type_for(cls,style); if(ct && (style&WS_CHILD) && (ct>=CT_LIST || is_dialog_wnd(parent))){ w->used=0; u64 hh=make_ctrl(parent,ct,name,style,x,y,cw,ch,menu); if(hh){ dirty=1; } return hh; } }
   if(c){ w->proc=c->proc; w->kind=K_APP; }
@@ -263,7 +342,7 @@ static u64 WINAPI w_CreateWindowExA(u32 ex, const char *cls, const char *name, u
   else if(!stricmp(cls,"BUTTON")){ w->proc=B_BUTTON; w->kind=K_BUTTON; }
   else if(!stricmp(cls,"STATIC")){ w->proc=B_STATIC; w->kind=K_STATIC; }
   else { w->used=0; return 0; }
-  w->style=style; w->exstyle=ex; w->parent=(style&WS_CHILD)? parent : 0; w->id=(style&WS_CHILD)? menu : 0;
+  w->style=style; w->exstyle=ex; w->parent=(style&WS_CHILD)? parent : 0; w->id=(style&WS_CHILD)? menu : 0; w->ownerw=(style&WS_CHILD)? 0 : parent;
   if(!(style&WS_CHILD)){
     int n=nz;
     w->x=(u32)x==CW_USEDEFAULT? 60+30*n : x; w->y=(u32)y==CW_USEDEFAULT? 40+30*n : y;
@@ -271,13 +350,15 @@ static u64 WINAPI w_CreateWindowExA(u32 ex, const char *cls, const char *name, u
   } else { w->x=x; w->y=y; w->w=cw; w->h=ch; }
   settext(w,name?name:"");
   u64 h=hof(w);
-  if(!(style&WS_CHILD)) Z[nz++]=h;
+  if(!(style&WS_CHILD) && !msgonly) Z[nz++]=h;
+  if(wm_trace() && !(style&WS_CHILD)) kdbg("  [wm] CreateWindow %p class %s style %x ex %x at %d,%d %dx%d%s (pid %d)\n",(void*)h,cls,style,ex,w->x,w->y,w->w,w->h,msgonly? " message-only" : "",cur->pid);
   created=1;
   u64 cs[10]={ (u64)param, inst, menu, parent, 0, 0, 0, 0, 0, 0 };             /* CREATESTRUCTA */
   ((i32*)cs)[8]=w->h; ((i32*)cs)[9]=w->w; ((i32*)cs)[10]=w->y; ((i32*)cs)[11]=w->x; ((u32*)cs)[12]=style;
   cs[7]=(u64)name; cs[8]=(u64)cls; ((u32*)cs)[18]=ex;
   if(w->kind==K_APP){
     if(!send(h,WM_NCCREATE,0,(i64)cs) || (i32)send(h,WM_CREATE,0,(i64)cs)==-1){ destroy(h); return 0; }
+    ask_frame(w);
     if(style&WS_VISIBLE){ int cw2,ch2; client_size(w,&cw2,&ch2); w->sized=1; send(h,WM_SIZE,0,(ch2<<16)|(cw2&0xFFFF)); }     /* like Windows: WM_SIZE arrives when the window is shown */
   }
   if(style&WS_VISIBLE){ w->visible=1; on_show(w); }
@@ -285,15 +366,61 @@ static u64 WINAPI w_CreateWindowExA(u32 ex, const char *cls, const char *name, u
 }
 static i64 WINAPI w_DefWindowProcA(u64 h, u32 m, u64 wp, i64 lp){ return def_proc(h,m,wp,lp); }
 static i32 WINAPI w_DestroyWindow(u64 h){ if(!get(h)) return 0; destroy(h); return 1; }
+static void pos_changed(struct wnd *w, u32 fl);
 static i32 WINAPI w_ShowWindow(u64 h, i32 cmd){
   struct wnd *w=get(h); if(!w) return 0; int was=w->visible; w->visible=cmd!=0;
-  if(w->visible && w->kind==K_APP && !w->sized){ int cw2,ch2; client_size(w,&cw2,&ch2); w->sized=1; send(h,WM_SIZE,0,(ch2<<16)|(cw2&0xFFFF)); }
-  if(w->visible) on_show(w); dirty=1; return was;
+  if(wm_trace() && !(w->style&WS_CHILD)) kdbg("  [wm] ShowWindow(%p %s, %d)\n",(void*)h,w->cls,cmd);
+  if(w->visible && w->kind==K_APP && !w->sized){ w->sized=1; pos_changed(w,4|0x40); }   /* its size and position (WM_WINDOWPOSCHANGED, then WM_SIZE / WM_MOVE), as it is now shown */
+  if(!(w->style&WS_CHILD)){                                            /* SW_MAXIMIZE, SW_RESTORE / SW_SHOWNORMAL, SW_MINIMIZE ... */
+    if(cmd==3) set_max(w,1,1);
+    else if(cmd==9 || cmd==1){ if(w->minimized){ w->minimized=0; dirty=1; } else if(cmd==9) set_max(w,0,1); }
+    else if(cmd==6 || cmd==2 || cmd==7 || cmd==11){ minimize(w); w->visible=1; dirty=1; return was; }
+  }
+  if(w->visible) on_show_ex(w, cmd!=4 && cmd!=8 && cmd!=7);           /* SW_SHOWNOACTIVATE, SW_SHOWNA, SW_SHOWMINNOACTIVE */
+  else if(was && g_focus==h){ u64 o=w->ownerw; set_focus(get(o)? o : top_visible()); }   /* a hidden window gives the focus back to its owner */
+  dirty=1; return was;
+}
+/* Does the program draw its own title bar? Ask with WM_NCCALCSIZE, as Windows does: a program that keeps the area where our title
+   bar would be (Firefox, Chrome, Electron apps with tabs in the title bar) gets no Willows frame; its WM_NCHITTEST answers then say
+   where its caption and buttons are (click_in_context). */
+static void pos_changed(struct wnd *w, u32 fl);
+static void ask_frame(struct wnd *w){
+  if(w->kind!=K_APP || (w->style&WS_CHILD) || (w->style&WS_CAPTION)!=WS_CAPTION) return;
+  struct { i32 r[12]; u64 pos; } p; memset(&p,0,sizeof p);
+  int ox=w->x, oy=w->y; p.r[0]=ox; p.r[1]=oy; p.r[2]=ox+w->w; p.r[3]=oy+w->h; for(int k=0;k<4;k++){ p.r[4+k]=p.r[k]; p.r[8+k]=p.r[k]; }
+  u8 wpos[40]; memset(wpos,0,40); *(u64*)wpos=hof(w); *(i32*)(wpos+16)=ox; *(i32*)(wpos+20)=oy; *(i32*)(wpos+24)=w->w; *(i32*)(wpos+28)=w->h; *(u32*)(wpos+32)=0x20|4;   /* WINDOWPOS: SWP_FRAMECHANGED */
+  p.pos=(u64)wpos;
+  send(hof(w),0x83,1,(i64)&p);
+  u8 custom= p.r[1]-oy < (FRAME+TITLE_H)/2;
+  if(custom!=w->custom_frame){
+    w->custom_frame=custom; dirty=1;
+    if(wm_trace()) kdbg("  [wm] %p %s draws %s title bar\n",(void*)hof(w),w->cls,custom? "its own" : "no");
+    if(w->sized) pos_changed(w,2|4);                                       /* the client area changed size: WM_WINDOWPOSCHANGED, then WM_SIZE */
+  }
+}
+/* a window was moved or resized: WM_WINDOWPOSCHANGED with a WINDOWPOS {hwnd, after, x, y, cx, cy, flags}; DefWindowProc turns it
+   into WM_SIZE / WM_MOVE (programs such as Firefox take the new size from WM_WINDOWPOSCHANGED itself) */
+/* WM_WINDOWPOSCHANGING comes first, with the requested position: the program may change it (or add SWP_NOSIZE / SWP_NOMOVE) and
+   that is what happens - as on Windows. Then the change is made and WM_WINDOWPOSCHANGED reports it. */
+static void pos_changing(struct wnd *w, i32 *x, i32 *y, i32 *cx, i32 *cy, u32 *fl){
+  if(w->kind!=K_APP) return;
+  u8 wpos[40]; memset(wpos,0,40); *(u64*)wpos=hof(w); *(i32*)(wpos+16)=*x; *(i32*)(wpos+20)=*y; *(i32*)(wpos+24)=*cx; *(i32*)(wpos+28)=*cy; *(u32*)(wpos+32)=*fl;
+  send(hof(w),0x46,0,(i64)wpos);                                      /* WM_WINDOWPOSCHANGING */
+  *x=*(i32*)(wpos+16); *y=*(i32*)(wpos+20); *cx=*(i32*)(wpos+24); *cy=*(i32*)(wpos+28); *fl=*(u32*)(wpos+32);
+}
+static void pos_changed(struct wnd *w, u32 fl){
+  if(w->kind!=K_APP) return;
+  u8 wpos[40]; memset(wpos,0,40); *(u64*)wpos=hof(w); *(i32*)(wpos+16)=w->x; *(i32*)(wpos+20)=w->y; *(i32*)(wpos+24)=w->w; *(i32*)(wpos+28)=w->h; *(u32*)(wpos+32)=fl;
+  send(hof(w),0x47,0,(i64)wpos);                                      /* WM_WINDOWPOSCHANGED */
+  if(!(fl&1)) invalidate(w);
 }
 static i32 WINAPI w_MoveWindow(u64 h, i32 x, i32 y, i32 cw, i32 ch, i32 repaint){
   struct wnd *w=get(h); (void)repaint; if(!w) return 0;
-  int resized=(w->w!=cw||w->h!=ch); w->x=x; w->y=y; w->w=cw; w->h=ch; dirty=1;
-  if(resized && w->kind==K_APP){ int a,b; client_size(w,&a,&b); send(h,WM_SIZE,0,(b<<16)|(a&0xFFFF)); invalidate(w); }
+  u32 fl=4|((w->w==cw && w->h==ch)? 1 : 0)|((w->x==x && w->y==y)? 2 : 0);   /* SWP_NOZORDER, SWP_NOSIZE, SWP_NOMOVE */
+  if((fl&3)==3) return 1;
+  pos_changing(w,&x,&y,&cw,&ch,&fl);
+  if(!(fl&2)){ w->x=x; w->y=y; } if(!(fl&1)){ w->w=cw; w->h=ch; } dirty=1;
+  pos_changed(w,fl);
   return 1;
 }
 #define DESKTOP_H 0x7FFF0000ull
@@ -306,14 +433,32 @@ static i32 WINAPI w_GetWindowTextA(u64 h, char *b, i32 n){ return get(h)? (i32)s
 static i32 WINAPI w_GetWindowTextLengthA(u64 h){ return get(h)? (i32)send(h,WM_GETTEXTLENGTH,0,0) : 0; }
 static i64 WINAPI w_GetWindowLongPtrA(u64 h, i32 i){
   struct wnd *w=get(h); if(!w) return 0;
-  switch(i){ case -4: return w->proc; case -21: return w->userdata; case -16: return w->style; case -20: return w->exstyle; case -12: return w->id; case -6: return 0x400000; }
-  return (i>=0 && i<64)? (i64)w->extra[i/8] : 0;
+  switch(i){ case -4: return w->proc; case -21: return w->userdata; case -16: return w->style; case -20: return w->exstyle; case -12: return w->id;
+             case -6: return procs[w->owner].imagebase; case -8: return w->parent; }                  /* GWLP_HINSTANCE, GWLP_HWNDPARENT */
+  if(i>=0 && i+8<=64) return *(i64*)((u8*)w->extra+i);                                             /* cbWndExtra bytes (64 at most) */
+  if(i>=0 && i+4<=64) return *(i32*)((u8*)w->extra+i);
+  win32_set_last_error(1413); return 0;                                                            /* ERROR_INVALID_INDEX */
 }
 static i64 WINAPI w_SetWindowLongPtrA(u64 h, i32 i, i64 v){
   struct wnd *w=get(h); if(!w) return 0; i64 old=w_GetWindowLongPtrA(h,i);
   switch(i){ case -4: w->proc=v; break; case -21: w->userdata=v; break; case -16: w->style=(u32)v; break; case -20: w->exstyle=(u32)v; break; case -12: w->id=v; break;
-             default: if(i>=0&&i<64) w->extra[i/8]=v; }
+             case -8: w->parent=(u64)v; break;
+             default: if(i>=0 && i+8<=64) *(i64*)((u8*)w->extra+i)=v; else if(i>=0 && i+4<=64) *(i32*)((u8*)w->extra+i)=(i32)v; }
   dirty=1; return old;
+}
+static i32 WINAPI w_GetWindowLongA(u64 h, i32 i){                                  /* the 32-bit versions read 4 bytes of the extra area */
+  struct wnd *w=get(h); if(!w) return 0; if(i<0) return (i32)w_GetWindowLongPtrA(h,i);
+  return (i+4<=64)? *(i32*)((u8*)w->extra+i) : 0;
+}
+static i32 WINAPI w_SetWindowLongA(u64 h, i32 i, i32 v){
+  struct wnd *w=get(h); if(!w) return 0; if(i<0) return (i32)w_SetWindowLongPtrA(h,i,v);
+  if(i+4>64) return 0; i32 old=*(i32*)((u8*)w->extra+i); *(i32*)((u8*)w->extra+i)=v; return old;
+}
+static u64 WINAPI w_GetAncestor(u64 h, u32 flags){                                  /* GA_PARENT 1, GA_ROOT 2, GA_ROOTOWNER 3 */
+  struct wnd *w=get(h); if(!w) return 0;
+  if(flags==1) return w->parent? w->parent : DESKTOP_H;
+  while(w->parent && get(w->parent)){ h=w->parent; w=get(h); }
+  return h;
 }
 static i64 WINAPI w_CallWindowProcA(u64 proc, u64 h, u32 m, u64 wp, i64 lp){ return call_proc(proc,h,m,wp,lp); }
 static i64 WINAPI w_SendMessageA(u64 h, u32 m, u64 wp, i64 lp){ return send(h,m,wp,lp); }
@@ -364,10 +509,63 @@ static u32 name_color(const char *n){
   static const u32 pal[8]={0x3B82F6,0x10B981,0xF59E0B,0xEF4444,0x8B5CF6,0x06B6D4,0xEC4899,0x84CC16};
   u32 h=5381; for(;*n;n++) h=h*33+(u8)*n; return pal[h&7];
 }
+/* "C:\P\putty.exe" -> "putty": the bare lower-case program name used to pick an icon and a display name */
+static void app_key(const char *n, char *out, int max){
+  const char *s=n; for(const char *p=n;*p;p++) if(*p=='/'||*p=='\\') s=p+1;
+  int k=0; for(;s[k] && k<max-1;k++) out[k]=(s[k]>='A'&&s[k]<='Z')? s[k]+32 : s[k]; out[k]=0;
+  if(k>4 && !strcmp(out+k-4,".exe")) out[k-4]=0;
+}
+/* name shown in the Start menu: "putty" -> "PuTTY", "notes" -> "Notes" */
+static void app_display(const char *n, char *out, int max){
+  static const char *const known[][2]={{"putty","PuTTY"},{"fastfetch","Fastfetch"},{"tmlwn","TMLWN"},{"librewolf","LibreWolf"},{"firefox","Firefox"},{"jstest","JS test"},{"apitest","API test"},{"apitest2","API test 2"},{"apitest3","API test 3"},{"dlgtest","Dialog test"},{"dlltest","DLL test"},{"nettest","Network test"},{"httpd","Web server"}};
+  char k[32]; app_key(n,k,32);
+  for(unsigned i=0;i<sizeof known/sizeof *known;i++) if(!strcmp(k,known[i][0])){ int j=0; for(;known[i][1][j]&&j<max-1;j++) out[j]=known[i][1][j]; out[j]=0; return; }
+  int j=0; for(;k[j]&&j<max-1;j++) out[j]=k[j]; out[j]=0; if(out[0]>='a'&&out[0]<='z') out[0]-=32;
+}
+#define L16(x0,y0,x1,y1,t,c) gfx_line_aa(x+(x0)*sz/64,y+(y0)*sz/64,x+(x1)*sz/64,y+(y1)*sz/64,(t)*sz/24,c)
 static void app_icon(int x,int y,int sz,const char *name,int selected){
-  gfx_round_rect(x,y,sz,sz,sz/4,name_color(name));
-  char l[2]={*name>='a'&&*name<='z'? *name-32 : *name,0}; const struct font *f=ui(FS_BOLD,sz*5/9);
-  ui_text(f,x+(sz-ui_width(f,l,1))/2,y+(sz-ui_lineh(f))/2,l,1,0xFFFFFF); (void)selected;
+  char k[32]; app_key(name,k,32); (void)selected;
+  #define S(v) ((v)*sz/64)
+  if(!strcmp(k,"terminal")||!strcmp(k,"console")||!strcmp(k,"cmd")||!strcmp(k,"powershell")){
+    gfx_round_rect(x,y,sz,sz,sz/4,0x3A4256); gfx_round_rect(x+1,y+1,sz-2,sz-2,sz/4,0x161B26);
+    L16(16,22,28,32,40,0x4ADE80); L16(28,32,16,42,40,0x4ADE80); L16(32,43,48,43,40,0xE5E7EB); return; }
+  if(!strcmp(k,"files")||!strcmp(k,"explorer")){
+    gfx_round_rect(x+S(4),y+S(10),S(26),S(14),S(5),0xDB9628); gfx_round_rect(x+S(4),y+S(14),S(56),S(42),S(6),0xE3A233);
+    gfx_round_rect(x+S(4),y+S(22),S(56),S(34),S(6),0xFFC94D); gfx_rect_alpha(x+S(9),y+S(23),S(46),1,0xFFFFFF,120); return; }
+  if(!strcmp(k,"browser")){
+    gfx_round_rect(x,y,sz,sz,sz/4,0x0EA5E9); int c=sz/2, r=S(21);
+    gfx_round_rect(x+c-r,y+c-r,2*r,2*r,r,0xFFFFFF); gfx_round_rect(x+c-r+S(4),y+c-r+S(4),2*r-S(8),2*r-S(8),r-S(4),0x0EA5E9);
+    gfx_round_rect(x+c-S(9),y+c-r,S(18),2*r,S(9),0xFFFFFF); gfx_round_rect(x+c-S(5),y+c-r+S(4),S(10),2*r-S(8),S(5),0x0EA5E9);
+    gfx_rect(x+c-r+S(2),y+c-S(2),2*r-S(4),S(4)>0? S(4) : 1,0xFFFFFF); gfx_rect(x+c-S(2),y+c-r+S(2),S(4)>0? S(4) : 1,2*r-S(4),0xFFFFFF); return; }
+  if(!strcmp(k,"notes")||!strcmp(k,"notepad")){
+    gfx_round_rect(x+S(8),y+S(4),S(48),S(56),S(8),0xFBBF24); gfx_round_rect(x+S(8),y+S(14),S(48),S(46),S(8),0xFFF8E1); gfx_rect(x+S(8),y+S(14),S(48),S(8),0xFFF8E1);
+    for(int i=0;i<3;i++) gfx_round_rect(x+S(16),y+S(26+i*9),S(i==2? 20 : 32),S(3)>1? S(3) : 2,1,0xD6A419); return; }
+  if(!strcmp(k,"settings")||!strcmp(k,"control")){
+    gfx_round_rect(x,y,sz,sz,sz/4,0x64748B); int c=sz/2;
+    static const int dx[8]={0,14,20,14,0,-14,-20,-14}, dy[8]={-20,-14,0,14,20,14,0,-14};
+    for(int i=0;i<8;i++) gfx_line_aa(x+c,y+c,x+c+dx[i]*sz/64,y+c+dy[i]*sz/64,sz*9/24,0xF1F5F9);
+    gfx_round_rect(x+c-S(16),y+c-S(16),S(32),S(32),S(16),0xF1F5F9); gfx_round_rect(x+c-S(7),y+c-S(7),S(14),S(14),S(7),0x64748B); return; }
+  if(!strcmp(k,"snake")){
+    gfx_round_rect(x,y,sz,sz,sz/4,0x16A34A); L16(16,46,32,46,72,0xBBF7D0); L16(32,46,32,22,72,0xBBF7D0); L16(32,22,48,22,72,0xBBF7D0);
+    gfx_round_rect(x+S(45),y+S(18),S(5),S(5),S(3),0x14532D); gfx_round_rect(x+S(44),y+S(42),S(8),S(8),S(4),0xF87171); return; }
+  if(!strcmp(k,"paint")){
+    gfx_round_rect(x,y,sz,sz,sz/4,0xF97316); int c=sz/2; gfx_round_rect(x+c-S(20),y+c-S(18),S(40),S(36),S(18),0xFFF7ED);
+    static const u32 dots[4]={0xEF4444,0x3B82F6,0x22C55E,0xEAB308}; for(int i=0;i<4;i++) gfx_round_rect(x+S(18+i*8),y+S(i&1? 30 : 22),S(7),S(7),S(4),dots[i]); return; }
+  if(!strcmp(k,"putty")){
+    gfx_round_rect(x,y,sz,sz,sz/4,0x334155); gfx_round_rect(x+S(10),y+S(12),S(30),S(22),S(4),0xCBD5E1); gfx_round_rect(x+S(13),y+S(15),S(24),S(15),S(2),0x0F172A);
+    gfx_round_rect(x+S(24),y+S(30),S(30),S(22),S(4),0xE2E8F0); gfx_round_rect(x+S(27),y+S(33),S(24),S(15),S(2),0x0F172A); L16(30,37,36,41,24,0x4ADE80); return; }
+  if(!strcmp(k,"fastfetch")){
+    gfx_round_rect(x,y,sz,sz,sz/4,0x7C3AED); for(int i=0;i<4;i++){ gfx_round_rect(x+S(14),y+S(16+i*9),S(6),S(5),S(2),0xC4B5FD); gfx_round_rect(x+S(24),y+S(16+i*9),S(i&1? 18 : 26),S(5),S(2),0xFFFFFF); } return; }
+  #undef S
+  gfx_round_rect(x,y,sz,sz,sz/4,name_color(k));
+  char l[2]={*k>='a'&&*k<='z'? *k-32 : *k? *k : '?',0}; const struct font *f=ui(FS_BOLD,sz*5/9);
+  ui_text(f,x+(sz-ui_width(f,l,1))/2,y+(sz-ui_lineh(f))/2,l,1,0xFFFFFF);
+}
+#undef L16
+/* the program that owns a window, for its taskbar icon */
+static const char *owner_name(struct wnd *w){
+  for(int i=1;i<MAXPROC;i++) if(procs[i].used && procs[i].pid==(int)w->owner) return procs[i].exe[0]? procs[i].exe : procs[i].name;
+  return w->text? w->text : "";
 }
 
 static int hover_part, hover_tb=-1; static u64 hover_win;
@@ -462,6 +660,7 @@ static void draw_wnd_inner(struct wnd *w, int ox, int oy){
     if(g_focus==hof(w) && ((ticks/500)&1)==0) gfx_rect(cx+2+con_cx*cell_w,cy+2+con_cy*cell_h+cell_h-3,cell_w,3,0xD0D4DC);
     return;
   }
+  if(w->kind==K_APP && w->pix && w->alpha){ gfx_blit_alpha(cx,cy,w->pw<cw? w->pw : cw,w->ph<ch? w->ph : ch,w->pix,w->stride); draw_children(hof(w),cx,cy); return; }
   gfx_rect(cx,cy,cw,ch,((w->style&WS_CHILD)||w->kind==K_DIALOG)? CHROME_BG : 0xFFFFFF);
   if(w->kind==K_APP && w->pix) gfx_blit_stride(cx,cy,w->pw<cw? w->pw : cw,w->ph<ch? w->ph : ch,w->pix,w->stride);
   draw_children(hof(w),cx,cy);
@@ -522,7 +721,11 @@ static int start_item_at(int mx,int my){
   return -1;
 }
 static int tb_windows(u64 *out){                                  /* top-level visible windows in creation order */
-  int n=0; for(int i=0;i<MAXW;i++) if(W[i].used && W[i].visible && !(W[i].style&WS_CHILD) && n<16) out[n++]=HW(i); return n;
+  int n=0; for(int i=0;i<MAXW;i++) if(W[i].used && W[i].visible && !(W[i].style&WS_CHILD) && n<16){
+    int appwin=(W[i].exstyle&0x40000)!=0;                                    /* as on Windows: tool windows and owned popups (menus) get no button */
+    if(!appwin && ((W[i].exstyle&0x80) || get(W[i].ownerw))) continue;
+    out[n++]=HW(i); }
+  return n;
 }
 #define DK_X 12                                                    /* the dock floats 12px in from the screen edges */
 static int tb_tile_w(int n){ int avail=(int)gfx_w-DK_X-60-190-(net_up()? 150 : 0)-12; int bw=avail/(n? n : 1); return bw>190? 190 : bw; }
@@ -567,8 +770,9 @@ static void draw_taskbar(void){
       struct wnd *w=get(ws[i]); int act=(ws[i]==top_visible()), hov=(hover_tb==i);
       if(act) gfx_round_rect(x,by+4,bw-4,H-8,10,TB_ACTIVE); else if(hov) gfx_round_rect(x,by+4,bw-4,H-8,10,TB_HOVER);
       if(act) gfx_round_rect(x+bw/2-14,by+H-6,28,3,1,ACCENT); else if(!w->minimized) gfx_round_rect(x+bw/2-4,by+H-6,8,3,1,0x6B7280);
-      const char *nm= w->text&&w->text[0]? w->text : "(window)";
-      app_icon(x+9,by+(H-22)/2,22,w->kind==K_CONSOLE? "Console" : nm,0);
+      char dn[48]; const char *on=w->kind==K_CONSOLE? "Console" : owner_name(w); app_display(on,dn,sizeof dn);
+      const char *nm= w->text&&w->text[0]? w->text : dn;
+      app_icon(x+9,by+(H-22)/2,22,on,0);
       int k=fit(tf,nm,strlen(nm),bw-4-46); ui_text(tf,x+38,by+(H-ui_lineh(tf))/2,nm,k,w->minimized? 0x9CA3AF : 0xF3F4F6);
     }
   }
@@ -598,9 +802,9 @@ static void draw_start_menu(void){
   for(int i=0;i<rows;i++){
     int iy=y0+MPAD+MHEAD+i*ih();
     if(i<nmain){
-      int hov=(start_hover==i); const char *nm=app_name(main_idx[i]); int l=strlen(nm); if(l>4 && !stricmp(nm+l-4,".exe")) l-=4;
+      int hov=(start_hover==i); const char *an=app_name(main_idx[i]); char nm[48]; app_display(an,nm,sizeof nm); int l=strlen(nm);
       if(hov) gfx_round_rect(x0+MPAD,iy,MW-2*MPAD,ih()-2,6,PANEL_HOVER);
-      app_icon(x0+MPAD+8,iy+(ih()-2-26)/2,26,nm,hov); ui_text(nf,x0+MPAD+44,iy+(ih()-2-ui_lineh(nf))/2,nm,l,0xF3F4F6);
+      app_icon(x0+MPAD+8,iy+(ih()-2-26)/2,26,an,hov); ui_text(nf,x0+MPAD+44,iy+(ih()-2-ui_lineh(nf))/2,nm,l,0xF3F4F6);
     } else if(ndemo){                                                 /* "Demos & tests" row with a chevron */
       int hov=(start_hover==100||demo_open);
       if(hov) gfx_round_rect(x0+MPAD,iy,MW-2*MPAD,ih()-2,6,PANEL_HOVER);
@@ -620,9 +824,9 @@ static void draw_start_menu(void){
     int fx=fly_x(), fy=fly_y(), fh=fly_h(), fi=fly_ih();
     shadow(fx,fy,FW,fh); gfx_round_rect(fx,fy,FW,fh,8,PANEL_LINE); gfx_round_rect(fx+1,fy+1,FW-2,fh-2,8,PANEL_BG);
     for(int j=0;j<ndemo;j++){
-      int iy=fy+MPAD+j*fi, hov=(start_hover==200+j); const char *nm=app_name(demo_idx[j]); int l=strlen(nm); if(l>4 && !stricmp(nm+l-4,".exe")) l-=4;
+      int iy=fy+MPAD+j*fi, hov=(start_hover==200+j); const char *an=app_name(demo_idx[j]); char nm[48]; app_display(an,nm,sizeof nm); int l=strlen(nm);
       if(hov) gfx_round_rect(fx+MPAD-4,iy,FW-2*MPAD+8,fi-2,6,PANEL_HOVER);
-      app_icon(fx+MPAD+2,iy+(fi-2-22)/2,22,nm,hov); ui_text(nf,fx+MPAD+34,iy+(fi-2-ui_lineh(nf))/2,nm,l,0xF3F4F6);
+      app_icon(fx+MPAD+2,iy+(fi-2-22)/2,22,an,hov); ui_text(nf,fx+MPAD+34,iy+(fi-2-ui_lineh(nf))/2,nm,l,0xF3F4F6);
     }
   }
 }
@@ -680,14 +884,14 @@ static struct wnd *surface(void){
   int idx=-1; for(int i=0;i<MAXW;i++) if(!W[i].used){ idx=i; break; } if(idx<0) return 0;
   struct wnd *w=&W[idx]; memset(w,0,sizeof *w); w->used=1; w->owner=cur->pid; w->kind=K_SURFACE; w->proc=4;
   w->pw=wm_screen_w(); w->ph=wm_screen_h(); w->stride=w->pw; w->w=w->pw+2*FRAME; w->h=w->ph+FRAME+TITLE_H+FRAME; w->x=24+16*nz; w->y=16+16*nz; w->style=WS_VISIBLE|WS_CAPTION; cpy(w->cls,"GDI",24);
-  w->pix=kmalloc((u64)w->pw*w->ph*4,16); if(!w->pix){ w->used=0; return 0; }
+  w->pix=heap_alloc((u64)w->pw*w->ph*4); if(!w->pix){ w->used=0; return 0; } w->ownpix=1;
   for(i32 k=0;k<w->pw*w->ph;k++) w->pix[k]=0x202020;
   settext(w,cur->name); w->visible=1; Z[nz++]=hof(w); created=1; set_focus(hof(w)); dirty=1; return w;
 }
 /* Windows with a message loop get a backing bitmap (max screen size) on first GetDC/BeginPaint; the compositor shows it. */
 static void ensure_backing(struct wnd *w){
   if(w->kind!=K_APP) return;
-  if(!w->pix){ w->pix=kmalloc((u64)gfx_w*gfx_h*4,4096); if(!w->pix) return; w->stride=gfx_w; for(u64 k=0;k<(u64)gfx_w*gfx_h;k++) w->pix[k]=0xFFFFFF; }
+  if(!w->pix){ w->pix=heap_alloc((u64)gfx_w*gfx_h*4); if(!w->pix) return; w->ownpix=1; w->stride=gfx_w; for(u64 k=0;k<(u64)gfx_w*gfx_h;k++) w->pix[k]=0xFFFFFF; }
   client_size(w,&w->pw,&w->ph);
 }
 u64 wm_get_dc(u64 hwnd){
@@ -696,6 +900,7 @@ u64 wm_get_dc(u64 hwnd){
 }
 static struct wnd *dc_target(u64 dc){
   if(dc>=DCBASE && dc<DCBASE+MAXW){ struct wnd *w=&W[dc-DCBASE]; return (w->used&&w->pix)? w : 0; }
+  for(int i=0;i<MAXW;i++) if(W[i].used && W[i].kind==K_APP && W[i].owner==cur->pid) return 0;   /* drawing on the screen DC by a program with windows: nothing to show (Windows paints the desktop, briefly) */
   return surface();
 }
 int dc_clip(u64 dc, int *r);                                          /* gdi.inc: the DC's clip rectangle, if one is set */
@@ -720,21 +925,29 @@ void wm_gdi_text(u64 dc,const struct font *f,int x,int y,const char *str,int n,u
 }
 /* StretchDIBits for 32-bit DIBs (top-down if biHeight<0). rop 0x00CC0020 = copy (alpha ignored), 0x00AA0029 = alpha-blend with the source alpha byte. */
 static i32 WINAPI w_StretchDIBits(u64 dc,int dx,int dy,int dw,int dh,int sx,int sy,int sw,int sh,const u32 *bits,const u8 *bmi,u32 usage,u32 rop){
-  (void)usage; struct wnd *t=dc_target(dc); if(!t||!bits||!bmi||dw<=0||dh<=0||sw<=0||sh<=0) return 0;
+  (void)usage; struct wnd *t=dc_target(dc);
+  if(!t||!bits||!bmi||!dw||!dh||!sw||!sh) return 0;
   int bw=*(const i32*)(bmi+4), bh=*(const i32*)(bmi+8); int bpp=*(const u16*)(bmi+14); if(bpp!=32) return 0;
   int topdown=bh<0; if(topdown) bh=-bh;
+  /* As on Windows (and Wine): the source y is measured from the bottom of the image, for top-down DIBs too; a negative width or
+     height mirrors that rectangle (it then spans x+w .. x-1), and the copy is flipped when source and destination signs differ. */
+  int syt=bh-sy-sh;                                                  /* top of the source rectangle, counting rows from the top of the image */
+  int hflip=(dw<0)!=(sw<0), vflip=(dh<0)!=(sh<0);
+  if(dw<0){ dx+=dw; dw=-dw; } if(dh<0){ dy+=dh; dh=-dh; } if(sw<0){ sx+=sw; sw=-sw; } if(sh<0){ syt+=sh; sh=-sh; }
   u64 xs=((u64)sw<<16)/(u64)dw, ys=((u64)sh<<16)/(u64)dh;
+  int keep_alpha= !(t->style&WS_CHILD) && (t->style&0x80000000u) && !has_frame(t) && dw>=t->pw && dh>=t->ph;   /* a whole frame for a popup: keep its alpha */
+  if(keep_alpha) t->alpha=1;
   for(int j=0;j<dh;j++){
     int y=dy+j; if(y<0||y>=t->ph) continue;
-    int srow=sy+(int)(((u64)j*ys)>>16); if(srow<0||srow>=bh) continue; if(!topdown) srow=bh-1-srow;
+    int oj=(int)(((u64)j*ys)>>16); int srow=syt+(vflip? sh-1-oj : oj); if(srow<0||srow>=bh) continue; if(!topdown) srow=bh-1-srow;
     const u32 *srcrow=bits+(u64)srow*bw; u32 *dstrow=t->pix+(u64)y*t->stride;
     for(int i=0;i<dw;i++){
       int x=dx+i; if(x<0||x>=t->pw) continue;
-      int scol=sx+(int)(((u64)i*xs)>>16); if(scol<0||scol>=bw) continue;
+      int oi=(int)(((u64)i*xs)>>16); int scol=sx+(hflip? sw-1-oi : oi); if(scol<0||scol>=bw) continue;
       u32 p=srcrow[scol];
       if(rop==0x00AA0029u){ u32 a=p>>24; if(a==0) continue; if(a==255){ dstrow[x]=p&0xFFFFFF; continue; }
         u32 d=dstrow[x]; u32 r=(((p>>16)&255)*a+((d>>16)&255)*(255-a))/255, g=(((p>>8)&255)*a+((d>>8)&255)*(255-a))/255, b=((p&255)*a+(d&255)*(255-a))/255; dstrow[x]=(r<<16)|(g<<8)|b; }
-      else dstrow[x]=p&0xFFFFFF;
+      else dstrow[x]= keep_alpha? p : (p&0xFFFFFF);
     }
   }
   dirty=1; return dh;
@@ -796,11 +1009,18 @@ static u64 hit(int mx, int my, int *part, int *lx, int *ly){
   }
   return 0;
 }
-static void toggle_max(struct wnd *w){
-  if(!w->maximized){ w->rx=w->x; w->ry=w->y; w->rw=w->w; w->rh=w->h; w->x=0; w->y=0; w->w=gfx_w; w->h=gfx_h-TB_H; w->maximized=1; }
+/* maximize / restore. In the window's own thread (ShowWindow, WM_SYSCOMMAND, a click on its own caption buttons) it is told at once
+   with WM_WINDOWPOSCHANGED (then WM_SIZE with SIZE_MAXIMIZED / SIZE_RESTORED), as on Windows - programs such as Firefox take their
+   size from that; from elsewhere (our own caption buttons, handled in whichever thread runs the input) WM_SIZE is posted. */
+static void set_max(struct wnd *w, int on, int in_thread){
+  if(on==w->maximized) return;
+  if(on){ w->rx=w->x; w->ry=w->y; w->rw=w->w; w->rh=w->h; w->x=0; w->y=0; w->w=gfx_w; w->h=gfx_h-TB_H; w->maximized=1; }
   else { w->x=w->rx; w->y=w->ry; w->w=w->rw; w->h=w->rh; w->maximized=0; }
-  int cw,ch; client_size(w,&cw,&ch); post(hof(w),WM_SIZE,w->maximized?2:0,((i64)ch<<16)|(cw&0xFFFF)); invalidate(w);
+  if(in_thread && w->kind==K_APP) pos_changed(w,4);
+  else { int cw,ch; client_size(w,&cw,&ch); post(hof(w),WM_SIZE,w->maximized?2:0,((i64)ch<<16)|(cw&0xFFFF)); }
+  invalidate(w); dirty=1;
 }
+static void toggle_max(struct wnd *w){ set_max(w,!w->maximized,0); }
 static void minimize(struct wnd *w){
   w->minimized=1; if(g_focus==hof(w) || get(g_focus)==0 || get(g_focus)->minimized){ u64 t=top_visible(); g_focus=0; if(t){ u64 e=first_edit(t); set_focus(e? e : t); } }
   dirty=1;
@@ -821,15 +1041,20 @@ static void pump_input(void){
     if(desktop_has_focus()) continue;                                  /* the desktop has the keyboard: typing goes nowhere */
     u64 t=g_focus; if(!get(t)) t=top_visible(); if(!t) continue;
     struct wnd *tw=get(t);
-    if(tw->kind==K_CONSOLE){ if(ch){ if(ch==13) ch='\n'; if(ch=='\n'||ch==8||ch>=32) { kb_inject(ch); } } continue; }
+    if(tw->kind==K_CONSOLE){ ci_key(vk,ch); if(ch){ if(ch==13) ch='\n'; if(ch=='\n'||ch==8||ch>=32) { kb_inject(ch); } } continue; }
     post(t,WM_KEYDOWN,vk,1|((u64)(u16)ch<<32));                       /* the character rides along; TranslateMessage turns it into WM_CHAR like on Windows */
   }
   int mx=mouse_x, my=mouse_y, b=mouse_buttons&1;
   static int lb;
   if(start_open){ menu_build(); int it=start_item_at(mx,my); if(it!=start_hover){ start_hover=it; dirty=1; } }
   desktop_hover(mx,my);
-  { static int lrb; int rb=(mouse_buttons>>1)&1;                          /* right button: desktop context menu */
-    if(rb && !lrb && my<tb_y() && !start_open){ int part=0,ax=0,ay=0; if(!hit(mx,my,&part,&ax,&ay)){ if(g_focus) set_focus(0); desktop_rclick(mx,my); } }
+  { static int lrb; static u64 rtarget; int rb=(mouse_buttons>>1)&1;      /* right button: the desktop's context menu, or the program's window */
+    if(rb && !lrb && my<tb_y() && !start_open){ int part=0,ax=0,ay=0; u64 h=hit(mx,my,&part,&ax,&ay);
+      if(!h){ if(g_focus) set_focus(0); desktop_rclick(mx,my); }
+      else { struct wnd *w=get(h); rtarget=0; if(w && part==0 && w->owner!=0){ int cx,cy; client_origin(w,&cx,&cy); rtarget=h; post(h,0x204,2,((i64)((my-cy)&0xFFFF)<<16)|((mx-cx)&0xFFFF)); } } }   /* WM_RBUTTONDOWN */
+    if(!rb && lrb && get(rtarget)){ struct wnd *w=get(rtarget); int cx,cy; client_origin(w,&cx,&cy);
+      post(rtarget,0x205,0,((i64)((my-cy)&0xFFFF)<<16)|((mx-cx)&0xFFFF));                                       /* WM_RBUTTONUP */
+      post(rtarget,0x7B,rtarget,((i64)(my&0xFFFF)<<16)|(mx&0xFFFF)); rtarget=0; }                                  /* WM_CONTEXTMENU (screen coordinates) */
     lrb=rb; }
   { int nt=-1; u64 nw=0; int np=0;                                      /* hover state for taskbar and caption buttons */
     if(my>=tb_y()){ nt= in_start_btn(mx,my)? -2 : tb_button_at(mx,my); }
@@ -841,6 +1066,7 @@ static void pump_input(void){
       if(my>=tb_y() || (start_open && start_item_at(mx,my)>=0)) target=0;
       else if(!target) target=hit(mx,my,&part,&ax,&ay);
       if(target!=last_win){ gfx_cursor_shape(0); last_win=target; }
+      if(g_track_leave && g_track_leave!=target){ if(get(g_track_leave)) post(g_track_leave,0x2A3,0,0); g_track_leave=0; }   /* TrackMouseEvent(TME_LEAVE): WM_MOUSELEAVE */
       struct wnd *tw=get(target);
       if(tw && part==0 && tw->owner!=0){ int cx,cy; client_origin(tw,&cx,&cy); post(target,WM_MOUSEMOVE,(mouse_buttons&1)|((mouse_buttons&2)?2:0),((i64)(my-cy)<<16)|((mx-cx)&0xFFFF)); }
     }
@@ -867,6 +1093,11 @@ static void pump_input(void){
       int part=0, ax=0, ay=0; u64 h=hit(mx,my,&part,&ax,&ay);
       if(h){
         struct wnd *w=get(h); u64 top=h; while(get(top) && (get(top)->style&WS_CHILD)) top=get(top)->parent;
+        if(get(top)->kind==K_APP && part==0){                               /* a program's window: it decides (in its own thread) whether */
+          g_capture=h;                                                       /* the click activates it and whether it hit its own title bar */
+          post(h,WM_W_CLICK,((u64)(u32)ay<<32)|(u32)ax,((i64)(u32)my<<32)|(u32)mx);
+          return;
+        }
         raise_top(top);
         if(part==2){ if(w->kind==K_CONSOLE) destroy(h); else if(w->kind==K_SURFACE) proc_kill(w->owner); else post(h,WM_CLOSE,0,0); }
         else if(part==3) toggle_max(w);
@@ -894,27 +1125,73 @@ void wm_service(void){
   static u32 last_paint;
   if(dirty && (u32)(ticks-last_paint)>=16){ dirty=0; last_paint=ticks; wm_paint(); }
 }
-static i32 pop_msg(u8 *msg){
-  struct proc *p=cur;
-  if(p->qh==p->qt) return 0;
-  struct msg m=p->q[p->qt]; p->qt=(p->qt+1)&63;
-  { struct wnd *tw=get(m.hwnd); if(tw){ if(m.msg==WM_PAINT) tw->paint_pending=0; if(m.msg==WM_MOUSEMOVE) tw->mm_pending=0; } }
-  *(u64*)(msg+0)=m.hwnd; *(u32*)(msg+8)=m.msg; *(u64*)(msg+16)=m.wp; *(i64*)(msg+24)=m.lp; *(u32*)(msg+32)=ticks;
-  *(i32*)(msg+36)=mouse_x; *(i32*)(msg+40)=mouse_y; return 1;
+/* the first queued message for the calling thread that matches the filters (hwnd: 0 = any, -1 = thread messages only;
+   lo..hi: message range, 0..0 = all); remove = PM_REMOVE */
+static int msg_matches(const struct msg *m, u32 me, u64 h, u32 lo, u32 hi){
+  if(m->tid && m->tid!=me) return 0;
+  if(h==(u64)-1){ if(m->hwnd) return 0; } else if(h && m->hwnd!=h) return 0;
+  if((lo||hi) && (m->msg<lo || m->msg>hi)) return 0;
+  return 1;
 }
+/* A click on a program's window, handled in the window's own thread (its window procedure may only run there):
+   WM_MOUSEACTIVATE decides whether it takes the focus (menus say no), WM_NCHITTEST whether a program that draws its own title
+   bar was hit there (drag, close, maximize, minimize). Returns 1 if the click goes on as WM_LBUTTONDOWN. */
+static int click_in_context(u64 h, int mx, int my){
+  struct wnd *w=get(h); if(!w) return 0;
+  u64 top=h; while(get(top) && (get(top)->style&WS_CHILD)) top=get(top)->parent; struct wnd *tw=get(top); if(!tw) return 0;
+  i64 ma=send(top,0x21,top,((i64)WM_LBUTTONDOWN<<16)|1);                 /* WM_MOUSEACTIVATE, HTCLIENT */
+  if(ma==4){ g_capture=0; return 0; }                                      /* MA_NOACTIVATEANDEAT */
+  if(ma==3) return 1;                                                      /* MA_NOACTIVATE */
+  raise_top(top);
+  if(tw->custom_frame){
+    i64 ht=send(top,0x84,0,((i64)(my&0xFFFF)<<16)|(mx&0xFFFF));            /* WM_NCHITTEST */
+    if(wm_trace()) kdbg("  [wm] click at %d,%d: hit test %d\n",mx,my,(int)ht);
+    if(ht==2){ g_capture=0; if(!tw->maximized){ g_drag=top; drag_dx=mx-tw->x; drag_dy=my-tw->y; } set_focus(top); return 0; }   /* HTCAPTION */
+    if(ht==20){ g_capture=0; post(top,WM_CLOSE,0,0); return 0; }           /* HTCLOSE */
+    if(ht==9){ g_capture=0; set_max(tw,!tw->maximized,1); return 0; }      /* HTMAXBUTTON */
+    if(ht==8){ g_capture=0; minimize(tw); return 0; }                      /* HTMINBUTTON */
+  }
+  if(w->kind!=K_EDIT && !(w->style&WS_CHILD)) set_focus(first_edit(h)?:h);
+  return 1;
+}
+int wm_has_msg(void){ struct proc *p=cur; u32 me=thread_cur_tid(); for(u32 i=p->qt;i!=p->qh;i=(i+1)&(MSGQ-1)) if(msg_matches(&p->q[i],me,0,0,0)) return 1; return 0; }
+static i32 pop_msg_ex(u8 *msg, u64 h, u32 lo, u32 hi, int remove){
+  struct proc *p=cur; u32 me=thread_cur_tid();
+  for(u32 i=p->qt;i!=p->qh;i=(i+1)&(MSGQ-1)){
+    if(p->q[i].msg==WM_W_CLICK && p->q[i].tid==me){                      /* our click: decide now, in the window's thread */
+      struct msg c=p->q[i]; int mx=(int)(u32)c.lp, my=(int)(u32)((u64)c.lp>>32), ax=(int)(u32)c.wp, ay=(int)(u32)(c.wp>>32);
+      if(click_in_context(c.hwnd,mx,my)){ p->q[i].msg=WM_LBUTTONDOWN; p->q[i].wp=1; p->q[i].lp=((i64)(ay&0xFFFF)<<16)|(ax&0xFFFF); }
+      else { for(u32 j=i;j!=p->qt;j=(j-1)&(MSGQ-1)) p->q[j]=p->q[(j-1)&(MSGQ-1)]; p->qt=(p->qt+1)&(MSGQ-1); i=(p->qt-1)&(MSGQ-1); continue; }   /* dropped: rescan */
+    }
+    if(!msg_matches(&p->q[i],me,h,lo,hi)) continue;
+    struct msg m=p->q[i];
+    if(remove){ for(u32 j=i;j!=p->qt;j=(j-1)&(MSGQ-1)) p->q[j]=p->q[(j-1)&(MSGQ-1)]; p->qt=(p->qt+1)&(MSGQ-1);   /* close the gap */
+      struct wnd *tw=get(m.hwnd); if(tw){ if(m.msg==WM_PAINT) tw->paint_pending=0; if(m.msg==WM_MOUSEMOVE) tw->mm_pending=0; }
+      { static int t=-1; if(t<0){ struct ramfile *f=fs_find("/System/apitrace.cfg"); t= f && !f->isdir; } if(t && m.msg>=0xC000) kdbg("  [msg] got %x hwnd %p (tid %x, pid %d)\n",m.msg,(void*)m.hwnd,me,p->pid); } }
+    *(u64*)(msg+0)=m.hwnd; *(u32*)(msg+8)=m.msg; *(u64*)(msg+16)=m.wp; *(i64*)(msg+24)=m.lp; *(u32*)(msg+32)=ticks;
+    *(i32*)(msg+36)=mouse_x; *(i32*)(msg+40)=mouse_y; return 1;
+  }
+  return 0;
+}
+static i32 pop_msg(u8 *msg){ return pop_msg_ex(msg,0,0,0,1); }
 static i32 WINAPI w_GetMessageA(u8 *msg, u64 h, u32 lo, u32 hi){
-  (void)h;(void)lo;(void)hi;
+  thread_note_wait("GetMessage",h,(u64)__builtin_return_address(0));
   for(;;){
-    if(cur->quit){ cur->quit=0; memset(msg,0,48); *(u32*)(msg+8)=WM_QUIT; *(u64*)(msg+16)=cur->quit_code; return 0; }
+    if(cur->quit){ cur->quit=0; memset(msg,0,48); *(u32*)(msg+8)=WM_QUIT; *(u64*)(msg+16)=cur->quit_code; thread_end_wait(); return 0; }
     wm_service();
-    if(pop_msg(msg)) return 1;
+    if(pop_msg_ex(msg,h,lo,hi,1)){ thread_end_wait(); return 1; }
     idle_wait();
   }
 }
 static i32 WINAPI w_PeekMessageA(u8 *msg, u64 h, u32 lo, u32 hi, u32 rm){
-  (void)h;(void)lo;(void)hi;(void)rm;
-  if(cur->quit){ cur->quit=0; memset(msg,0,48); *(u32*)(msg+8)=WM_QUIT; *(u64*)(msg+16)=cur->quit_code; return 1; }
-  wm_service(); return pop_msg(msg);
+  if(cur->quit){ if(rm&1) cur->quit=0; memset(msg,0,48); *(u32*)(msg+8)=WM_QUIT; *(u64*)(msg+16)=cur->quit_code; return 1; }
+  wm_service(); return pop_msg_ex(msg,h,lo,hi,rm&1);                 /* PM_REMOVE = 1; PM_NOREMOVE leaves it queued */
+}
+/* PostThreadMessage: a message with no window for one thread (of any process) */
+static i32 WINAPI w_PostThreadMessageA(u32 tid, u32 m, u64 wp, i64 lp){
+  for(int i=0;i<MAXTHR;i++) if(threads[i].used && !threads[i].done && threads[i].tid==tid){ post_to(&procs[threads[i].pid],tid,0,m,wp,lp); return 1; }
+  for(int p=1;p<MAXPROC;p++) if(procs[p].used && procs[p].teb && *(u32*)((u8*)procs[p].teb+0x48)==tid){ post_to(&procs[p],tid,0,m,wp,lp); return 1; }
+  win32_set_last_error(1444); return 0;                                     /* ERROR_INVALID_THREAD_ID */
 }
 static i32 WINAPI w_TranslateMessage(const u8 *msg){
   if(*(const u32*)(msg+8)==WM_KEYDOWN){ u64 lp=*(const u64*)(msg+24); u32 ch=(u32)((lp>>32)&0xFFFF); if(ch) post(*(const u64*)msg,WM_CHAR,ch,1); }
@@ -1032,6 +1309,9 @@ const struct export wm_exports[]={
   U(RegisterClassA), {"user32","RegisterClassExA",w_RegisterClassA}, U(CreateWindowExA), U(DefWindowProcA), U(DestroyWindow),
   U(ShowWindow), U(MoveWindow), U(GetClientRect), U(GetWindowRect), U(GetParent), U(IsWindow), U(SetWindowTextA),
   U(GetWindowTextA), U(GetWindowTextLengthA), U(GetWindowLongPtrA), U(SetWindowLongPtrA), U(CallWindowProcA),
+  U(PostThreadMessageA), {"user32","PostThreadMessageW",w_PostThreadMessageA},
+  {"user32","GetWindowLongPtrW",w_GetWindowLongPtrA}, {"user32","SetWindowLongPtrW",w_SetWindowLongPtrA}, U(GetWindowLongA), U(SetWindowLongA),
+  {"user32","GetWindowLongW",w_GetWindowLongA}, {"user32","SetWindowLongW",w_SetWindowLongA}, U(GetAncestor),
   U(SendMessageA), U(PostMessageA), U(PostQuitMessage), U(LoadCursorA), {"user32","LoadIconA",w_LoadCursorA}, {"user32","LoadCursorW",w_LoadCursorA},
   U(SetFocus), U(GetFocus), U(InvalidateRect), U(UpdateWindow), U(BeginPaint), U(EndPaint), U(SetCursor), U(GetMessageA), U(PeekMessageA), U(TranslateMessage), U(DispatchMessageA),
   {"comdlg32","GetOpenFileNameA",cd_GetOpenFileNameA}, {"comdlg32","GetSaveFileNameA",cd_GetSaveFileNameA},

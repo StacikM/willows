@@ -4,7 +4,7 @@
 typedef u64 HANDLE; typedef i32 BOOL; typedef u32 DWORD;
 void win32_set_last_error(u32 e);
 #define MAXHC 8
-struct hc { u8 used; int sock, tls, status, chunked, eof; i64 clen, chunk_left; u8 rb[2048]; u32 rbp, rbn; char loc[512], ctype[96], url[640]; };
+struct hc { u8 used; int sock, tls, status, chunked, eof; i64 clen, chunk_left; u8 rb[2048]; u32 rbp, rbn; char loc[512], ctype[96], cdisp[200], url[640]; };
 static struct hc H[MAXHC];
 static u32 ie_err;                                        /* ERROR_INTERNET_* */
 static int WINAPI fmt(char *b, u32 n, const char *f, ...){ margs ap; __builtin_ms_va_start(ap,f); int r=kvsnprintf(b,n,f,ap); __builtin_ms_va_end(ap); return r; }
@@ -45,12 +45,13 @@ static int parse_headers(struct hc *c){
   char line[600]; if(read_line(c,line,sizeof line)<0) return -1;
   const char *p=line; while(*p && *p!=' ') p++; while(*p==' ') p++;
   c->status=0; while(*p>='0'&&*p<='9') c->status=c->status*10+(*p++-'0');
-  c->clen=-1; c->chunked=0; c->loc[0]=0; c->ctype[0]=0;
+  c->clen=-1; c->chunked=0; c->loc[0]=0; c->ctype[0]=0; c->cdisp[0]=0;
   for(;;){
     int n=read_line(c,line,sizeof line); if(n<0) return -1; if(n==0) break;
     if(startswith_i(line,"content-length:")){ const char *v=line+15; while(*v==' ') v++; i64 x=0; while(*v>='0'&&*v<='9') x=x*10+(*v++-'0'); c->clen=x; }
     else if(startswith_i(line,"transfer-encoding:")){ const char *v=line+18; for(;*v;v++) if(startswith_i(v,"chunked")){ c->chunked=1; break; } }
     else if(startswith_i(line,"content-type:")){ const char *v=line+13; while(*v==' ') v++; int k=0; while(*v && k<95) c->ctype[k++]=*v++; c->ctype[k]=0; }
+    else if(startswith_i(line,"content-disposition:")){ const char *v=line+20; while(*v==' ') v++; int k=0; while(*v && k<199) c->cdisp[k++]=*v++; c->cdisp[k]=0; }
     else if(startswith_i(line,"location:")){ const char *v=line+9; while(*v==' ') v++; int k=0; while(*v && k<511) c->loc[k++]=*v++; c->loc[k]=0; }
   }
   return 0;
@@ -129,6 +130,7 @@ static BOOL WINAPI i_InternetQueryDataAvailable(HANDLE h, DWORD *avail, DWORD f,
 static BOOL WINAPI i_InternetCloseHandle(HANDLE h){ struct hc *c=hget(h); if(c) hc_close(c); return 1; }
 static BOOL WINAPI i_HttpQueryInfoA(HANDLE h, DWORD level, void *buf, DWORD *len, DWORD *idx){
   (void)idx; struct hc *c=hget(h); if(!c||!len) return 0;
+  if((level&0xFFFF)==47){ u32 n=strlen(c->cdisp); if(!n){ win32_set_last_error(12150); return 0; } if(*len<=n){ *len=n+1; return 0; } memcpy(buf,c->cdisp,n+1); *len=n; return 1; }      /* HTTP_QUERY_CONTENT_DISPOSITION */
   if((level&0xFFFF)==1){ u32 n=strlen(c->ctype); if(*len<=n){ *len=n+1; return 0; } memcpy(buf,c->ctype,n+1); *len=n; return 1; }   /* HTTP_QUERY_CONTENT_TYPE */
   i64 v= (level&0xFFFF)==19? c->status : (level&0xFFFF)==5? c->clen : -2; if(v==-2){ win32_set_last_error(12150); return 0; }
   if(level&0x20000000){ if(*len<4){ *len=4; return 0; } *(DWORD*)buf=(DWORD)v; *len=4; return 1; }      /* HTTP_QUERY_FLAG_NUMBER */
@@ -157,13 +159,14 @@ static BOOL WINAPI a_CryptAcquireContext(u64 *prov, const void *c, const void *p
 static BOOL WINAPI a_CryptGenRandom(u64 prov, DWORD n, u8 *buf){ (void)prov; random_bytes(buf,n); return 1; }
 static BOOL WINAPI a_CryptReleaseContext(u64 prov, DWORD f){ (void)prov;(void)f; return 1; }
 static u8 WINAPI a_SystemFunction036(void *buf, DWORD n){ random_bytes(buf,n); return 1; }
+static BOOL WINAPI b_ProcessPrng(u8 *buf, u64 n){ random_bytes(buf,(DWORD)n); return 1; }     /* bcryptprimitives.dll */
 
 #define WI(n) {"wininet", #n, i_##n}
 const struct export inet_exports[]={
   WI(InternetOpenA), WI(InternetOpenW), WI(InternetOpenUrlA), WI(InternetOpenUrlW), WI(WillowsHttpRequest), WI(InternetReadFile), WI(InternetQueryDataAvailable),
   WI(InternetCloseHandle), WI(HttpQueryInfoA), WI(InternetQueryOptionA), WI(InternetSetOptionA), WI(InternetGetConnectedState),
   {"urlmon","URLDownloadToFileA",u_URLDownloadToFileA}, {"urlmon","URLDownloadToFileW",u_URLDownloadToFileW},
-  {"bcrypt","BCryptGenRandom",b_BCryptGenRandom},
+  {"bcrypt","BCryptGenRandom",b_BCryptGenRandom}, {"bcryptprimitives","ProcessPrng",b_ProcessPrng},
   {"advapi32","CryptAcquireContextA",a_CryptAcquireContext}, {"advapi32","CryptAcquireContextW",a_CryptAcquireContext},
   {"advapi32","CryptGenRandom",a_CryptGenRandom}, {"advapi32","CryptReleaseContext",a_CryptReleaseContext},
   {"advapi32","SystemFunction036",a_SystemFunction036},

@@ -44,6 +44,7 @@ void keyboard_irq(void){
   else if(sc==0x2A||sc==0x36){ shift=!up; code=0x10; }
   else if(sc==0x1D){ ctrl=!up; code=0x11; }
   else if(sc==0x3A){ if(!up) caps^=1; }
+  else if(sc==0x58 && ctrl){ if(!up) debug_dump_request=1; return; }      /* Ctrl+F12: dump processes and threads to the serial log (thread.c) */
   else if(sc<NSC && key_lo(sc)){
     unsigned char c=key_lo(sc), u=sc<58? (unsigned char)lo[sc] : 0;
     if(c>='a'&&c<='z') code=c-32;                                              /* letters: VK = the letter the layout produces */
@@ -60,6 +61,18 @@ void keyboard_irq(void){
   }
 }
 void kb_inject(char c){ push(c); }
+/* Console input events (ReadConsoleInput): every key with its virtual-key code, arrows and function keys included. A key-up follows each key-down. */
+struct cikey { u16 vk, ch; u8 down; u16 ctrl; };
+static struct cikey ciq[128]; static u8 cih, cit;
+void ci_push(int vkc, int ch, int down){
+  u8 n=(cih+1)&127; if(n==cit) return;
+  u16 st=0; if(ctrl) st|=0x8; if(shift) st|=0x10; if(caps) st|=0x80; if(vkc>=0x21 && vkc<=0x28) st|=0x100;       /* LEFT_CTRL, SHIFT, CAPSLOCK_ON, ENHANCED_KEY (arrows, Home/End...) */
+  ciq[cih].vk=(u16)vkc; ciq[cih].ch=(u16)ch; ciq[cih].down=(u8)down; ciq[cih].ctrl=st; cih=n;
+}
+void ci_key(int vkc, int ch){ ci_push(vkc,ch,1); ci_push(vkc,ch,0); }
+int ci_count(void){ return (cih-cit)&127; }
+int ci_pop(int *vkc, int *ch, int *down, int *st, int remove){ if(cih==cit) return 0; *vkc=ciq[cit].vk; *ch=ciq[cit].ch; *down=ciq[cit].down; *st=ciq[cit].ctrl; if(remove) cit=(cit+1)&127; return 1; }
+void ci_flush(void){ cit=cih; }
 int kb_poll(void){ return head!=tail; }
 int kb_getc(void){
   while(head==tail) idle_wait();

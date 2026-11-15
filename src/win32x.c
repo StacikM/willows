@@ -3,7 +3,7 @@ typedef u32 DWORD; typedef i32 BOOL; typedef u64 HANDLE; typedef void *LPVOID;
 /* More Win32: wide-char variants, locale/codepage, environment, events/mutexes, version info, registry (empty),
    memory (Local/Global), time conversion, misc. Everything here is a small, honest implementation or a safe default. */
 static u64 dummy_teb_x[0x2000/8];
-#define last_error (*(u32*)((u8*)(cur->teb? cur->teb : dummy_teb_x)+0x68))
+#define last_error (*(u32*)((u8*)(cur_teb? cur_teb : dummy_teb_x)+0x68))     /* the running thread's last error */
 #define X(n) {"kernel32", #n, x_##n}
 #define XD(d,n) {d, #n, x_##n}
 
@@ -86,17 +86,22 @@ static DWORD WINAPI x_GetCurrentDirectoryW(DWORD n, u16 *b){ char t[260]; f_gcd 
 typedef BOOL (WINAPI *f_pa)(const char*);
 static BOOL WINAPI x_SetCurrentDirectoryW(const u16 *p){ char t[260]; w2a(p,t,260); f_pa f=K32("SetCurrentDirectoryA"); return f? f(t):0; }
 static BOOL WINAPI x_DeleteFileW(const u16 *p){ char t[260]; w2a(p,t,260); f_pa f=K32("DeleteFileA"); return f? f(t):0; }
-static DWORD WINAPI x_GetFileAttributesW(const u16 *p){ char t[260]; w2a(p,t,260); DWORD (WINAPI *f)(const char*)=K32("GetFileAttributesA"); return f? f(t):(DWORD)-1; }
-static BOOL WINAPI x_CreateDirectoryW(const u16 *p, void *sa){ char t[260]; w2a(p,t,260); BOOL (WINAPI *f)(const char*,void*)=K32("CreateDirectoryA"); return f? f(t,sa):0; }
+static int file_trace(void){ struct ramfile *f=fs_find("/System/apitrace.cfg"); return f && !f->isdir; }      /* log file calls while tracing */
+static DWORD WINAPI x_GetFileAttributesW(const u16 *p){ char t[260]; w2a(p,t,260); DWORD (WINAPI *f)(const char*)=K32("GetFileAttributesA"); DWORD r= f? f(t):(DWORD)-1;
+  if(file_trace()) kdbg("  [file] GetFileAttributes(%s) = %x\n",t,r); return r; }
+static BOOL WINAPI x_CreateDirectoryW(const u16 *p, void *sa){ char t[260]; w2a(p,t,260); BOOL (WINAPI *f)(const char*,void*)=K32("CreateDirectoryA"); BOOL r= f? f(t,sa):0;
+  if(file_trace()) kdbg("  [file] CreateDirectory(%s) = %d (error %u)\n",t,r,last_error); return r; }
 static HANDLE WINAPI x_CreateFileW(const u16 *p, DWORD a, DWORD sh, void *sa, DWORD cd, DWORD fl, HANDLE tm){
-  char t[260]; w2a(p,t,260); HANDLE (WINAPI *f)(const char*,DWORD,DWORD,void*,DWORD,DWORD,HANDLE)=K32("CreateFileA"); return f? f(t,a,sh,sa,cd,fl,tm) : (HANDLE)(i64)-1;
+  char t[260]; w2a(p,t,260); HANDLE (WINAPI *f)(const char*,DWORD,DWORD,void*,DWORD,DWORD,HANDLE)=K32("CreateFileA"); HANDLE r= f? f(t,a,sh,sa,cd,fl,tm) : (HANDLE)(i64)-1;
+  if(file_trace()) kdbg("  [file] CreateFile(%s, access %x, share %x, disp %u, flags %x) = %p (error %u)\n",t,a,sh,cd,fl,(void*)r,last_error); return r;
 }
 static DWORD WINAPI x_GetFullPathNameW(const u16 *p, DWORD n, u16 *b, u16 **fp){
   char t[260],o[300]; w2a(p,t,260); DWORD (WINAPI *f)(const char*,DWORD,char*,char**)=K32("GetFullPathNameA"); if(!f) return 0; char *leaf=0; DWORD r=f(t,300,o,&leaf);
   if(!r||r+1>n) return r? r+1 : 0; a2w(o,b,(int)n); if(fp) *fp= leaf? b+(leaf-o) : 0; return r;
 }
-static DWORD WINAPI x_GetTempPathA(DWORD n, char *b){ const char *s="C:\\Temp\\"; if(n<10) return 10; strcpy_(b,s); return 8; }
-static DWORD WINAPI x_GetTempPathW(DWORD n, u16 *b){ if(n<10) return 10; a2w("C:\\Temp\\",b,(int)n); return 8; }
+static void ensure_temp(void){ if(!fs_isdir("C:\\Temp")) fs_mkdir("C:\\Temp"); }
+static DWORD WINAPI x_GetTempPathA(DWORD n, char *b){ const char *s="C:\\Temp\\"; if(n<10) return 10; ensure_temp(); strcpy_(b,s); return 8; }
+static DWORD WINAPI x_GetTempPathW(DWORD n, u16 *b){ if(n<10) return 10; ensure_temp(); a2w("C:\\Temp\\",b,(int)n); return 8; }
 static DWORD WINAPI x_GetWindowsDirectoryA(char *b, DWORD n){ if(n<11) return 11; strcpy_(b,"C:\\Willows"); return 10; }
 static DWORD WINAPI x_GetWindowsDirectoryW(u16 *b, DWORD n){ if(n<11) return 11; a2w("C:\\Willows",b,(int)n); return 10; }
 static DWORD WINAPI x_GetSystemDirectoryA(char *b, DWORD n){ if(n<18) return 18; strcpy_(b,"C:\\Willows\\System32"); return 18; }
@@ -109,25 +114,71 @@ static BOOL WINAPI x_GetVolumeInformationA(const char *r, char *vn, DWORD vl, DW
   (void)r; if(vn&&vl>7) strcpy_(vn,"Willows"); if(sn) *sn=0x57494C4C; if(mc) *mc=255; if(fl) *fl=0x3; if(fs&&fl2>4) strcpy_(fs,"WFS"); return 1;
 }
 static BOOL WINAPI x_FlushFileBuffers(HANDLE h){ (void)h; return 1; }
-static BOOL WINAPI x_SetEndOfFile(HANDLE h){ (void)h; return 1; }
-static BOOL WINAPI x_GetFileSizeEx(HANDLE h, i64 *sz){ DWORD (WINAPI *f)(HANDLE,DWORD*)=K32("GetFileSize"); if(!f) return 0; DWORD hi=0; DWORD lo_=f(h,&hi); if(lo_==0xFFFFFFFF) return 0; *sz=(i64)lo_; return 1; }
-static BOOL WINAPI x_SetFilePointerEx(HANDLE h, i64 d, i64 *np, DWORD m){
-  DWORD (WINAPI *f)(HANDLE,i32,i32*,DWORD)=K32("SetFilePointer"); if(!f) return 0; DWORD r=f(h,(i32)d,0,m); if(r==0xFFFFFFFF) return 0; if(np) *np=(i64)r; return 1;
-}
+static BOOL WINAPI x_SetEndOfFile(HANDLE h){ return fs_is_handle(h)? fs_set_eof(h) : 1; }
 
-/* ---- environment (tiny table) ---- */
-static char envk[16][32], envv[16][128];
-static int env_find(const char *k){ for(int i=0;i<16;i++) if(envk[i][0]&&!stricmp(envk[i],k)) return i; return -1; }
+/* ---- environment: one per process (as on Windows), copied from the parent or taken from CreateProcess's environment block ---- */
+static int strncmp_ci_(const char *a, const char *b, int n){ for(int i=0;i<n;i++){ char x=a[i], y=b[i]; if(x>='a'&&x<='z') x-=32; if(y>='a'&&y<='z') y-=32; if(x!=y) return 1; if(!x) return 0; } return 0; }
+static const char *strchr_(const char *s, char c){ for(;*s;s++) if(*s==c) return s; return 0; }
+#define NENV 64
+static struct penv { char k[NENV][48]; char v[NENV][320]; } penv_[MAXPROC];
+static struct penv *myenv(void){ return &penv_[cur? cur->pid : 0]; }
+#define envk (myenv()->k)
+#define envv (myenv()->v)
+static int env_find(const char *k){ for(int i=0;i<NENV;i++) if(envk[i][0]&&!stricmp(envk[i],k)) return i; return -1; }
+static void env_set_in(struct penv *e, const char *k, int kl, const char *v){
+  int i=-1; for(int j=0;j<NENV;j++) if(e->k[j][0] && (int)strlen(e->k[j])==kl && !strncmp_ci_(e->k[j],k,kl)){ i=j; break; }
+  if(i<0) for(int j=0;j<NENV;j++) if(!e->k[j][0]){ i=j; break; } if(i<0) return;
+  int n=kl<47? kl : 47; memcpy(e->k[i],k,n); e->k[i][n]=0;
+  unsigned j=0; for(;v[j]&&j<319;j++) e->v[i][j]=v[j]; e->v[i][j]=0;
+}
+void env_reset(int pid){ if(pid>0 && pid<MAXPROC) memset(&penv_[pid],0,sizeof penv_[pid]); }   /* a new process in this slot (CreateProcess then fills it) */
+/* a new process: its environment is its parent's, or the block given to CreateProcess ("k=v\0...\0\0", narrow or UTF-16) */
+void env_inherit(int child, int parent, const void *block, int wide){
+  if(child<=0 || child>=MAXPROC) return; struct penv *e=&penv_[child];
+  if(!block){ if(parent>=0 && parent<MAXPROC && parent!=child) *e=penv_[parent]; return; }
+  memset(e,0,sizeof *e);
+  if(wide){ const u16 *p=block; while(*p){ char t[400]; int n=0; const u16 *q=p; while(*q && n<399){ t[n++]= *q<0x80? (char)*q : '?'; q++; } t[n]=0; while(*q) q++;
+      const char *eq= t[0]=='='? 0 : strchr_(t,'='); if(eq) env_set_in(e,t,(int)(eq-t),eq+1); p=q+1; } }
+  else { const char *p=block; while(*p){ const char *eq= p[0]=='='? 0 : strchr_(p,'='); if(eq) env_set_in(e,p,(int)(eq-p),eq+1); p+=strlen(p)+1; } }
+}
+/* Firefox's process sandbox (Chromium's) cannot protect anything on Willows - every program runs in ring 0 in one address space - and
+   its launcher patches the child's ntdll, which here is shared kernel code. These documented switches make Firefox start its child
+   processes the plain way. A program can still set them itself.
+   Networking stays in the main process (MOZ_DISABLE_SOCKET_PROCESS: one process less, and its poll loop busy-waits here). The GPU
+   process keeps its sandbox, so its launch fails at once and Firefox composites in the main process: its own GPU process stalls
+   during start-up on Willows (not solved yet), and in-process compositing also saves a whole process's memory. */
+static const char *sys_default_env(const char *k){
+  static const char *const off[]={"MOZ_DISABLE_CONTENT_SANDBOX","MOZ_DISABLE_RDD_SANDBOX","MOZ_DISABLE_UTILITY_SANDBOX",
+    "MOZ_DISABLE_GMP_SANDBOX","MOZ_DISABLE_VR_SANDBOX","MOZ_DISABLE_SOCKET_PROCESS"};
+  for(unsigned j=0;j<sizeof off/sizeof *off;j++) if(!stricmp(k,off[j])) return "1";
+  return !stricmp(k,"TEMP")||!stricmp(k,"TMP")? "C:\\Temp" : !stricmp(k,"SystemRoot")||!stricmp(k,"windir")? "C:\\Willows" : !stricmp(k,"PATH")? "C:\\Willows\\System32" : 0;
+}
 static DWORD WINAPI x_GetEnvironmentVariableA(const char *k, char *b, DWORD n){
-  int i=env_find(k); const char *v= i>=0? envv[i] : !stricmp(k,"TEMP")||!stricmp(k,"TMP")? "C:\\Temp" : !stricmp(k,"SystemRoot")||!stricmp(k,"windir")? "C:\\Willows" : !stricmp(k,"PATH")? "C:\\Willows\\System32" : 0;
+  int i=env_find(k); const char *v= i>=0? envv[i] : sys_default_env(k);
   if(!v){ last_error=203; return 0; } DWORD l=(DWORD)strlen(v); if(l+1>n) return l+1; memcpy(b,v,l+1); return l;
 }
-static DWORD WINAPI x_GetEnvironmentVariableW(const u16 *k, u16 *b, DWORD n){ char kk[64],t[160]; w2a(k,kk,64); DWORD r=x_GetEnvironmentVariableA(kk,t,160); if(!r||r+1>n) return r; a2w(t,b,(int)n); return r; }
+static DWORD WINAPI x_GetEnvironmentVariableW(const u16 *k, u16 *b, DWORD n){ char kk[64],t[400]; w2a(k,kk,64); DWORD r=x_GetEnvironmentVariableA(kk,t,400); if(!r||r+1>n) return r; a2w(t,b,(int)n); return r; }
 static BOOL WINAPI x_SetEnvironmentVariableA(const char *k, const char *v){
-  int i=env_find(k); if(i<0){ if(!v) return 1; for(i=0;i<16&&envk[i][0];i++); if(i==16) return 0; unsigned j=0; for(;k[j]&&j<31;j++) envk[i][j]=k[j]; envk[i][j]=0; }
-  if(!v){ envk[i][0]=0; return 1; } unsigned j=0; for(;v[j]&&j<127;j++) envv[i][j]=v[j]; envv[i][j]=0; return 1;
+  if(!k || !*k || strchr_(k,'=')){ last_error=87; return 0; }
+  if(!v){ int i=env_find(k); if(i>=0) envk[i][0]=0; return 1; }
+  struct penv *e=myenv(); int before=env_find(k), full=1; for(int j=0;j<NENV;j++) if(!e->k[j][0]) full=0;
+  if(before<0 && full){ last_error=8; return 0; }
+  env_set_in(e,k,(int)strlen(k),v); return 1;
 }
-static BOOL WINAPI x_SetEnvironmentVariableW(const u16 *k, const u16 *v){ char kk[64],vv[128]; w2a(k,kk,64); if(v) w2a(v,vv,128); return x_SetEnvironmentVariableA(kk,v? vv:0); }
+static BOOL WINAPI x_SetEnvironmentVariableW(const u16 *k, const u16 *v){ char kk[64],vv[400]; w2a(k,kk,64); if(v) w2a(v,vv,400); return x_SetEnvironmentVariableA(kk,v? vv:0); }
+/* the whole environment as one block "k=v\0...\0\0" (the program frees it with FreeEnvironmentStrings) */
+static void *env_block(int wide){
+  struct penv *e=myenv(); u64 n=2; for(int i=0;i<NENV;i++) if(e->k[i][0]) n+=strlen(e->k[i])+strlen(e->v[i])+2;
+  u8 *b=heap_alloc_prog(n*(wide? 2 : 1)); if(!b) return 0; u64 o=0;
+  for(int i=0;i<NENV;i++) if(e->k[i][0]){ const char *parts[2]={e->k[i],e->v[i]};
+    for(int p=0;p<2;p++){ for(const char *c=parts[p];*c;c++){ if(wide) ((u16*)b)[o++]=(u8)*c; else b[o++]=*c; } if(!p){ if(wide) ((u16*)b)[o++]='='; else b[o++]='='; } }
+    if(wide) ((u16*)b)[o++]=0; else b[o++]=0; }
+  if(wide){ ((u16*)b)[o]=0; ((u16*)b)[o+1]=0; } else { b[o]=0; b[o+1]=0; }
+  return b;
+}
+static void *WINAPI x_GetEnvironmentStringsA(void){ return env_block(0); }
+static void *WINAPI x_GetEnvironmentStringsW(void){ return env_block(1); }
+static BOOL WINAPI x_FreeEnvironmentStringsA(void *p){ heap_free(p); return 1; }
 static DWORD WINAPI x_ExpandEnvironmentStringsA(const char *s, char *d, DWORD n){
   char out[512]; int o=0; for(const char *p=s;*p&&o<500;){
     if(*p=='%'){ const char *e=p+1; while(*e&&*e!='%') e++; if(*e=='%'&&e>p+1){ char k[40]; int kl=(int)(e-p-1); if(kl<40){ memcpy(k,p+1,kl); k[kl]=0; char v[160]; DWORD r=x_GetEnvironmentVariableA(k,v,160); if(r&&r<160){ for(DWORD j=0;j<r&&o<500;j++) out[o++]=v[j]; p=e+1; continue; } } } }
@@ -135,37 +186,9 @@ static DWORD WINAPI x_ExpandEnvironmentStringsA(const char *s, char *d, DWORD n)
 }
 static DWORD WINAPI x_ExpandEnvironmentStringsW(const u16 *s, u16 *d, DWORD n){ char a[300],t[512]; w2a(s,a,300); DWORD r=x_ExpandEnvironmentStringsA(a,t,512); if(r>n) return r; a2w(t,d,(int)n); return r; }
 
-/* ---- events, mutexes, waiting. Handles are small tagged numbers; processes are cooperative so no real blocking is needed. ---- */
-#define OBJ_BASE 0x6000
-struct kobj { u8 used, kind, sig, manual; };
-static struct kobj objs[128];
-static HANDLE obj_new(int kind, int sig, int manual){ for(int i=0;i<128;i++) if(!objs[i].used){ objs[i]=(struct kobj){1,(u8)kind,(u8)sig,(u8)manual}; return OBJ_BASE+(HANDLE)i*4; } last_error=8; return 0; }
-static struct kobj *obj_get(HANDLE h){ if(h<OBJ_BASE||h>=OBJ_BASE+128*4||((h-OBJ_BASE)&3)) return 0; struct kobj *o=&objs[(h-OBJ_BASE)/4]; return o->used? o : 0; }
-int kobj_signaled(u64 h){ struct kobj *o = obj_get(h); if(!o || !o->sig) return 0; if(!o->manual) o->sig = 0; return 1; }
-static HANDLE WINAPI x_CreateEventA(void *sa, BOOL man, BOOL init, const char *n){ (void)sa;(void)n; return obj_new(1,init!=0,man!=0); }
-static HANDLE WINAPI x_CreateEventW(void *sa, BOOL man, BOOL init, const u16 *n){ (void)sa;(void)n; return obj_new(1,init!=0,man!=0); }
-static HANDLE WINAPI x_CreateMutexA(void *sa, BOOL own, const char *n){ (void)sa;(void)n; return obj_new(2,!own,0); }
-static HANDLE WINAPI x_CreateMutexW(void *sa, BOOL own, const u16 *n){ (void)sa;(void)n; return obj_new(2,!own,0); }
-static HANDLE WINAPI x_CreateSemaphoreA(void *sa, i32 init, i32 mx, const char *n){ (void)sa;(void)mx;(void)n; return obj_new(3,init>0,0); }
-static BOOL WINAPI x_SetEvent(HANDLE h){ struct kobj *o=obj_get(h); if(!o){ last_error=6; return 0; } o->sig=1; return 1; }
-static BOOL WINAPI x_ResetEvent(HANDLE h){ struct kobj *o=obj_get(h); if(!o){ last_error=6; return 0; } o->sig=0; return 1; }
-static BOOL WINAPI x_ReleaseMutex(HANDLE h){ struct kobj *o=obj_get(h); if(!o) return 0; o->sig=1; return 1; }
-static BOOL WINAPI x_ReleaseSemaphore(HANDLE h, i32 c, i32 *prev){ struct kobj *o=obj_get(h); if(!o) return 0; if(prev) *prev=o->sig; o->sig=1; (void)c; return 1; }
-static DWORD WINAPI x_WaitForSingleObjectEx(HANDLE h, DWORD ms, BOOL al){
-  (void)al; struct kobj *o=obj_get(h); if(!o){ DWORD (WINAPI *f)(HANDLE,DWORD)=K32("WaitForSingleObject"); return f? f(h,ms) : 0; }
-  for(u32 t0=ticks; !o->sig; ){ if(ms!=(DWORD)-1 && (u32)(ticks-t0)>=ms) return 0x102; idle_wait(); }
-  if(!o->manual&&o->kind!=2) o->sig=0; if(o->kind==2) o->sig=0; return 0;
-}
-static DWORD WINAPI x_WaitForMultipleObjects(DWORD n, const HANDLE *hs, BOOL all, DWORD ms){
-  for(u32 t0=ticks;;){ int ready=-1, cnt=0; for(DWORD i=0;i<n;i++){ struct kobj *o=obj_get(hs[i]); if(!o||o->sig){ cnt++; if(ready<0) ready=(int)i; } }
-    if(all? cnt==(int)n : ready>=0){ for(DWORD i=0;i<n;i++){ struct kobj *o=obj_get(hs[i]); if(o&&!o->manual) o->sig=0; if(!all) break; } return (DWORD)(all?0:ready); }
-    if(ms!=(DWORD)-1 && (u32)(ticks-t0)>=ms) return 0x102; idle_wait(); }
-}
-static BOOL WINAPI x_DuplicateHandle(HANDLE sp, HANDLE sh, HANDLE tp, HANDLE *th, DWORD a, BOOL i, DWORD o){ (void)sp;(void)tp;(void)a;(void)i; if(pipe_is_handle(sh)){ pipe_addref(sh); if(o&1) pipe_close(sh); } if(th) *th=sh; return 1; }   /* handles are global: a duplicate is the same value (pipes count references) */
-static DWORD WINAPI x_SleepEx(DWORD ms, BOOL al){ (void)al; void (WINAPI *f)(DWORD)=K32("Sleep"); if(f) f(ms); return 0; }
-
+/* ---- events, mutexes, waiting and threads: see thread.c ---- */
 /* ---- memory ---- */
-static HANDLE WINAPI x_LocalAlloc(u32 fl, u64 n){ (void)fl; void *p=heap_alloc(n); if(!p){ last_error=8; return 0; } if(fl&0x40) memset(p,0,n); return (HANDLE)p; }
+static HANDLE WINAPI x_LocalAlloc(u32 fl, u64 n){ (void)fl; void *p=heap_alloc_prog(n); if(!p){ last_error=8; return 0; } if(fl&0x40) memset(p,0,n); return (HANDLE)p; }
 static HANDLE WINAPI x_LocalFree(HANDLE h){ heap_free((void*)h); return 0; }
 static HANDLE WINAPI x_LocalReAlloc(HANDLE h, u64 n, u32 fl){ (void)fl; return (HANDLE)heap_realloc((void*)h,n); }
 static void *WINAPI x_GlobalLock(HANDLE h){ return (void*)h; }
@@ -179,17 +202,27 @@ static HANDLE WINAPI x_LoadLibraryW(const u16 *n){ char t[260]; w2a(n,t,260); HA
 static HANDLE WINAPI x_LoadLibraryExA(const char *n, HANDLE f, DWORD fl){ (void)f;(void)fl; HANDLE (WINAPI *g)(const char*)=K32("LoadLibraryA"); return g? g(n):0; }
 static HANDLE WINAPI x_LoadLibraryExW(const u16 *n, HANDLE f, DWORD fl){ (void)f;(void)fl; return x_LoadLibraryW(n); }
 static BOOL WINAPI x_FreeLibrary(HANDLE h){ return dll_freelib(h); }
-static BOOL WINAPI x_GetModuleHandleExW(DWORD fl, const u16 *n, HANDLE *out){ (void)fl; HANDLE (WINAPI *f)(const char*)=K32("GetModuleHandleA"); char t[260]; if((u64)n>0x10000) w2a(n,t,260); HANDLE h= f? f((u64)n>0x10000? t : 0) : 0; if(out) *out=h; return h!=0; }
+static BOOL WINAPI x_GetModuleHandleExA(DWORD fl, const char *n, HANDLE *out){
+  HANDLE h; if(fl&4) h=dll_module_at((u64)n);                                     /* GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS */
+  else { HANDLE (WINAPI *f)(const char*)=K32("GetModuleHandleA"); h= f? f(n) : 0; }
+  if(out) *out=h; if(!h) last_error=126; return h!=0;
+}
+static BOOL WINAPI x_GetModuleHandleExW(DWORD fl, const u16 *n, HANDLE *out){ if(fl&4 || !n) return x_GetModuleHandleExA(fl,(const char*)n,out); char t[260]; w2a(n,t,260); return x_GetModuleHandleExA(fl,t,out); }
 static BOOL WINAPI x_DisableThreadLibraryCalls(HANDLE h){ (void)h; return 1; }
 static void WINAPI x_OutputDebugStringW(const u16 *s){ (void)s; }
 static void WINAPI x_DebugBreak(void){}
 static u32 WINAPI x_SetErrorMode(u32 m){ (void)m; return 0; }
-static BOOL WINAPI x_SetThreadPriority(HANDLE h, int p){ (void)h;(void)p; return 1; }
-static int WINAPI x_GetThreadPriority(HANDLE h){ (void)h; return 0; }
 static BOOL WINAPI x_IsWow64Process(HANDLE h, BOOL *w){ (void)h; if(w) *w=0; return 1; }
 static BOOL WINAPI x_GetSystemPowerStatus(u8 *s){ memset(s,0,12); s[1]=1; s[2]=100; s[3]=0x80; return 1; }
-static void WINAPI x_ExitThread(DWORD c){ void (WINAPI *f)(DWORD)=K32("ExitProcess"); if(f) f(c); }
-static void WINAPI x_RaiseException(DWORD code, DWORD fl, DWORD n, const u64 *a){ (void)fl;(void)n;(void)a; void (WINAPI *f)(DWORD)=K32("ExitProcess"); if(f) f(code); }
+static void WINAPI x_RaiseFailFastException(const u32 *rec, void *ctx, DWORD fl){      /* immediate termination, as on Windows; the log says who asked */
+  (void)ctx;(void)fl; char at[64]; if(!dll_addr_name((u64)__builtin_return_address(0),at,sizeof at)) ksnprintf(at,sizeof at,"%p",__builtin_return_address(0));
+  u32 code= rec? rec[0] : 0xC0000409; kprintf("\n*** RaiseFailFastException 0x%x from %s: the program ends\n",code,at); kdbg("  [exit] RaiseFailFastException 0x%x from %s\n",code,at);
+  proc_terminate((int)code);
+}
+static void WINAPI x_RaiseException(DWORD code, DWORD fl, DWORD n, const u64 *a){
+  char at[64]; if(!dll_addr_name((u64)__builtin_return_address(0),at,sizeof at)) ksnprintf(at,sizeof at,"%p",__builtin_return_address(0));
+  kprintf("\n*** RaiseException 0x%x (flags %x, %u args%s%p) from %s: no handler support, the program ends\n",code,fl,n,n? ", first " : "",n? (void*)a[0] : 0,at);
+  void (WINAPI *f)(DWORD)=K32("ExitProcess"); if(f) f(code); }
 static BOOL WINAPI x_GetSystemTimes(u64 *i, u64 *k, u64 *u){ u64 t=(u64)ticks*10000; if(i) *i=t; if(k) *k=t/10; if(u) *u=t/10; return 1; }
 static BOOL WINAPI x_GetProcessTimes(HANDLE h, u64 *c, u64 *e, u64 *k, u64 *u){ (void)h; if(c) *c=0; if(e) *e=0; if(k) *k=(u64)ticks*10000; if(u) *u=(u64)ticks*10000; return 1; }
 static u64 WINAPI x_GetCurrentProcessToken(void){ return (u64)-4; }
@@ -197,12 +230,12 @@ static BOOL WINAPI x_OpenProcessToken(HANDLE p, DWORD a, HANDLE *t){ (void)p;(vo
 static BOOL WINAPI x_GetTokenInformation(HANDLE t, u32 c, void *i, DWORD n, DWORD *r){ (void)t;(void)c; if(r) *r=4; if(n>=4&&i){ *(u32*)i=1; return 1; } last_error=122; return 0; }
 static DWORD WINAPI x_FormatMessageA(DWORD fl, const void *src, DWORD id, DWORD lang, char *b, DWORD n, void *args){
   (void)src;(void)lang;(void)args; char t[64]; int l=kvsnprintf_s(t,sizeof t,id);
-  if(fl&0x100){ char *p=kmalloc((u64)l+1,16); memcpy(p,t,l+1); *(char**)b=p; return (DWORD)l; }
+  if(fl&0x100){ char *p=heap_alloc_prog((u64)l+1); if(!p) return 0; memcpy(p,t,l+1); *(char**)b=p; return (DWORD)l; }   /* the program LocalFree()s it */
   if((DWORD)l+1>n) return 0; memcpy(b,t,l+1); return (DWORD)l;
 }
 static DWORD WINAPI x_FormatMessageW(DWORD fl, const void *src, DWORD id, DWORD lang, u16 *b, DWORD n, void *args){
   (void)src;(void)lang;(void)args; char t[64]; int l=kvsnprintf_s(t,sizeof t,id);
-  if(fl&0x100){ u16 *p=kmalloc(((u64)l+1)*2,16); a2w(t,p,l+1); *(u16**)b=p; return (DWORD)l; }
+  if(fl&0x100){ u16 *p=heap_alloc_prog(((u64)l+1)*2); if(!p) return 0; a2w(t,p,l+1); *(u16**)b=p; return (DWORD)l; }
   if((DWORD)l+1>n) return 0; a2w(t,b,(int)n); return (DWORD)l;
 }
 
@@ -273,22 +306,38 @@ static int WINAPI x_LCIDToLocaleName(u32 l, u16 *b, int n, DWORD f){ (void)l;(vo
 static int WINAPI x_MulDiv(int a, int b, int c){ if(!c) return -1; i64 r=(i64)a*b; r= r>=0? (r+c/2)/c : (r-c/2)/c; return (int)r; }
 static BOOL WINAPI x_SetFileAttributesA(const char *p, DWORD a){ (void)p;(void)a; return 1; }
 static BOOL WINAPI x_SetFileAttributesW(const u16 *p, DWORD a){ (void)p;(void)a; return 1; }
-static BOOL WINAPI x_SetFileTime(HANDLE h, const u64 *c, const u64 *a, const u64 *w){ (void)h;(void)c;(void)a;(void)w; return 1; }
+static BOOL WINAPI x_SetFileTime(HANDLE h, const u64 *c, const u64 *a, const u64 *w){ (void)c;(void)a; struct ramfile *f=fs_handle_file(h); if(f && w && *w) f->mtime=*w; return 1; }   /* the write time is kept */
+static BOOL WINAPI x_GetFileTime(HANDLE h, u64 *c, u64 *a, u64 *w){ struct ramfile *f=fs_handle_file(h); if(!f){ last_error=6; return 0; } u64 t=fs_mtime(f); if(c) *c=t; if(a) *a=t; if(w) *w=t; return 1; }
 static BOOL WINAPI x_MoveFileW(const u16 *a, const u16 *b){ char x[260],y[260]; w2a(a,x,260); w2a(b,y,260); BOOL (WINAPI *f)(const char*,const char*)=K32("MoveFileA"); return f? f(x,y):0; }
-static BOOL WINAPI x_MoveFileExW(const u16 *a, const u16 *b, DWORD fl){ (void)fl; return x_MoveFileW(a,b); }
+static BOOL WINAPI x_MoveFileExW(const u16 *a, const u16 *b, DWORD fl){ char x[260],y[260]; w2a(a,x,260); if(b) w2a(b,y,260); BOOL (WINAPI *f)(const char*,const char*,DWORD)=K32("MoveFileExA"); return f? f(x,b? y : 0,fl) : 0; }
+static BOOL WINAPI x_ReplaceFileW(const u16 *dst, const u16 *src, const u16 *backup, DWORD fl, void *e, void *r){ (void)backup;(void)fl;(void)e;(void)r; return x_MoveFileExW(src,dst,1); }
 static BOOL WINAPI x_CopyFileW(const u16 *a, const u16 *b, BOOL fail){ char x[260],y[260]; w2a(a,x,260); w2a(b,y,260); BOOL (WINAPI *f)(const char*,const char*,BOOL)=K32("CopyFileA"); return f? f(x,y,fail):0; }
-static BOOL WINAPI x_GetFileAttributesExW(const u16 *p, u32 lvl, void *out){ (void)lvl; DWORD a=x_GetFileAttributesW(p); if(a==(DWORD)-1) return 0; memset(out,0,36); *(DWORD*)out=a; return 1; }
-static BOOL WINAPI x_GetFileInformationByHandle(HANDLE h, void *i){ (void)h; memset(i,0,52); return 1; }
+/* file times: one stored time per file (its last change, see fs_mtime), reported as creation, access and write time */
+static void fill_times(u8 *p, const struct ramfile *f){ u64 t=fs_mtime(f); memcpy(p,&t,8); memcpy(p+8,&t,8); memcpy(p+16,&t,8); }
+/* WIN32_FILE_ATTRIBUTE_DATA: attributes, 3 FILETIMEs, size high, size low */
+static BOOL WINAPI x_GetFileAttributesExA(const char *p, u32 lvl, u8 *out){
+  (void)lvl; struct ramfile *f=fs_find(p); if(file_trace()) kdbg("  [file] GetFileAttributesEx(%s) = %s\n",p,!f? "missing" : f->isdir? "dir" : "file");
+  if(!f){ last_error=2; return 0; }
+  memset(out,0,36); *(DWORD*)out= f->isdir? 0x10 : 0x80; fill_times(out+4,f); if(!f->isdir){ *(DWORD*)(out+28)=(DWORD)(f->size>>32); *(DWORD*)(out+32)=(DWORD)f->size; } return 1;
+}
+static BOOL WINAPI x_GetFileAttributesExW(const u16 *p, u32 lvl, void *out){ char t[260]; w2a(p,t,260); return x_GetFileAttributesExA(t,lvl,out); }
+/* BY_HANDLE_FILE_INFORMATION: attributes, 3 FILETIMEs, volume serial, size high/low, links, index high/low */
+static BOOL WINAPI x_GetFileInformationByHandle(HANDLE h, u8 *i){
+  memset(i,0,52); struct ramfile *f=fs_handle_file(h);
+  if(!f){ if(pipe_is_handle(h)){ *(DWORD*)i=0x80; return 1; } last_error=6; return 0; }
+  *(DWORD*)i= f->isdir? 0x10 : 0x80; fill_times(i+4,f); *(DWORD*)(i+28)=0x57494C4C;
+  if(!f->isdir){ *(DWORD*)(i+32)=(DWORD)(f->size>>32); *(DWORD*)(i+36)=(DWORD)f->size; }
+  *(DWORD*)(i+40)=1; u64 idx=(u64)f; *(DWORD*)(i+44)=(DWORD)(idx>>32); *(DWORD*)(i+48)=(DWORD)idx; return 1;   /* the entry's address is its file id */
+}
 static BOOL WINAPI x_GetVolumeInformationW(const u16 *r, u16 *vn, DWORD vl, DWORD *sn, DWORD *mc, DWORD *fl, u16 *fs, DWORD fl2){
   (void)r; if(vn&&vl>7) a2w("Willows",vn,(int)vl); if(sn) *sn=0x57494C4C; if(mc) *mc=255; if(fl) *fl=3; if(fs&&fl2>4) a2w("WFS",fs,(int)fl2); return 1;
 }
 static DWORD WINAPI x_GetLogicalDriveStringsA(DWORD n, char *b){ if(n<5) return 5; memcpy(b,"C:\\\0\0",5); return 4; }
 static BOOL WINAPI x_GetVolumePathNameA(const char *p, char *b, DWORD n){ (void)p; if(n<4) return 0; strcpy_(b,"C:\\"); return 1; }
+static BOOL WINAPI x_GetVolumePathNameW(const u16 *p, u16 *b, DWORD n){ (void)p; if(n<4) return 0; a2w("C:\\",b,(int)n); return 1; }
+static BOOL WINAPI x_RemoveDirectoryW(const u16 *p){ char t[260]; w2a(p,t,260); BOOL (WINAPI *f)(const char*)=K32("RemoveDirectoryA"); return f? f(t) : 0; }
 static DWORD WINAPI x_GetTempFileNameW(const u16 *dir, const u16 *pre, u32 u, u16 *out){ static u32 seq=1; char d[200],p[8],t[260]; w2a(dir,d,200); w2a(pre,p,8); int l=(int)strlen(d); if(l&&d[l-1]=='\\') d[--l]=0; char *q=t; for(const char *z=d;*z;) *q++=*z++; *q++='\\'; for(const char *z=p;*z;) *q++=*z++; DWORD v=u? u : seq++; const char *hx="0123456789ABCDEF"; for(int i=12;i>=0;i-=4) *q++=hx[(v>>i)&15]; *q++='.'; *q++='t'; *q++='m'; *q++='p'; *q=0; a2w(t,out,260); return v; }
 /* condition variables: cooperative scheduling, so a sleep is a yield */
-static void WINAPI x_InitializeConditionVariable(u64 *c){ *c=0; }
-static void WINAPI x_WakeConditionVariable(u64 *c){ (void)c; }
-static BOOL WINAPI x_SleepConditionVariableCS(u64 *c, void *cs, DWORD ms){ (void)c;(void)cs;(void)ms; idle_wait(); return 1; }
 static BOOL WINAPI x_SetDefaultDllDirectories(DWORD f){ (void)f; return 1; }
 static u64 WINAPI x_SetThreadAffinityMask(HANDLE h, u64 m){ (void)h; return m; }
 static BOOL WINAPI x_GetProcessAffinityMask(HANDLE h, u64 *p, u64 *s){ (void)h; if(p) *p=1; if(s) *s=1; return 1; }
@@ -325,7 +374,7 @@ static i32 WINAPI x_WillowsReadOutput(u32 pid, char *buf, u32 n){
   if(!buf && !n){ p->cap_on = 0; return 0; }
   u32 avail = p->cap_w - p->cap_r; if(n > avail) n = avail; for(u32 i = 0; i < n; i++) buf[i] = p->cap[(p->cap_r + i) % 32768]; p->cap_r += n; return (i32)n;
 }
-static i32 WINAPI x_WillowsProcessRunning(u32 pid){ return pid > 0 && pid < MAXPROC && procs[pid].used; }
+static i32 WINAPI x_WillowsProcessRunning(u32 pid){ if(!(pid > 0 && pid < MAXPROC && procs[pid].used)) return 0; return 1 | (procs[pid].con_in? 2 : 0); }   /* bit 1: it reads console input */
 static BOOL WINAPI x_Beep(DWORD f, DWORD d){ (void)f;(void)d; return 1; }
 static BOOL WINAPI x_SetHandleInformation(HANDLE h, DWORD m, DWORD f){ (void)h;(void)m;(void)f; return 1; }
 static BOOL WINAPI x_IsDBCSLeadByteEx(u32 cp, u8 c){ (void)cp;(void)c; return 0; }
@@ -337,14 +386,6 @@ static void WINAPI x_RtlUnwindEx(void *a, void *b, void *c, void *d, void *e, vo
 static void *WINAPI x_RtlPcToFileHeader(void *pc, void **base){ void *b = (void *)cur->imagebase; if(base) *base = b; (void)pc; return b; }
 static BOOL WINAPI x_fail0(void){ last_error = 5; return 0; }
 static HANDLE WINAPI x_failh(void){ last_error = 5; return 0; }
-static BOOL WINAPI x_GetOverlappedResult(HANDLE h, void *o, DWORD *n, BOOL w){ (void)h;(void)o;(void)w; if(n) *n = 0; return 0; }
-static HANDLE WINAPI x_CreateThread(void *sa, u64 stk, DWORD (WINAPI *fn)(void *), void *arg, DWORD fl, DWORD *tid){
-  (void)sa;(void)stk;(void)fl; static DWORD next_tid = 0x1000; if(tid) *tid = next_tid; next_tid += 4;
-  if(fn) fn(arg);                                                       /* cooperative system: the thread body runs to completion right away */
-  return obj_new(1, 1, 1);
-}
-static BOOL WINAPI x_GetExitCodeThread(HANDLE h, DWORD *c){ (void)h; if(c) *c = 0; return 1; }
-static BOOL WINAPI x_TerminateThread(HANDLE h, DWORD c){ (void)h;(void)c; return 1; }
 struct fdw { DWORD attr; u64 ct, at, wt; DWORD hi, lo, r0, r1; u16 name[260]; u16 alt[14]; };
 static void fda_to_w(const u8 *a, struct fdw *w){ memset(w, 0, sizeof *w); w->attr = *(const DWORD *)a; w->ct = *(const u64 *)(a + 4); w->at = *(const u64 *)(a + 12); w->wt = *(const u64 *)(a + 20); w->hi = *(const DWORD *)(a + 28); w->lo = *(const DWORD *)(a + 32); a2w((const char *)(a + 44), w->name, 260); }
 static HANDLE WINAPI x_FindFirstFileW(const u16 *p, struct fdw *out){ char t[260]; w2a(p, t, 260); u8 a[320]; HANDLE (WINAPI *f)(const char *, void *) = K32("FindFirstFileA"); if(!f) return (HANDLE)(i64)-1; HANDLE h = f(t, a); if(h != (HANDLE)(i64)-1 && h) fda_to_w(a, out); return h; }
@@ -352,8 +393,6 @@ static BOOL WINAPI x_FindNextFileW(HANDLE h, struct fdw *out){ u8 a[320]; BOOL (
 static HANDLE WINAPI x_FindFirstFileExW(const u16 *p, u32 lvl, struct fdw *out, u32 op, void *flt, DWORD fl){ (void)lvl;(void)op;(void)flt;(void)fl; return x_FindFirstFileW(p, out); }
 static int WINAPI x_GetDateFormatW(u32 loc, DWORD fl, const struct systime *st, const u16 *fmt, u16 *out, int n){ (void)loc;(void)fl;(void)fmt; struct systime t; if(st) t = *st; else x_GetLocalTime(&t); char b[32]; int k = kvsnprintf_s(b, sizeof b, t.d); (void)k; char o[40]; int l = 0; { char x[12]; int m = t.d, q = 0; do x[q++] = (char)('0' + m % 10); while((m /= 10)); while(q) o[l++] = x[--q]; o[l++] = '/'; m = t.mo; q = 0; do x[q++] = (char)('0' + m % 10); while((m /= 10)); while(q) o[l++] = x[--q]; o[l++] = '/'; m = t.y; q = 0; do x[q++] = (char)('0' + m % 10); while((m /= 10)); while(q) o[l++] = x[--q]; } o[l] = 0; if(!n) return l + 1; a2w(o, out, n); return l + 1; }
 static int WINAPI x_GetTimeFormatW(u32 loc, DWORD fl, const struct systime *st, const u16 *fmt, u16 *out, int n){ (void)loc;(void)fl;(void)fmt; struct systime t; if(st) t = *st; else x_GetLocalTime(&t); char o[16]; o[0] = (char)('0' + t.h / 10); o[1] = (char)('0' + t.h % 10); o[2] = ':'; o[3] = (char)('0' + t.mi / 10); o[4] = (char)('0' + t.mi % 10); o[5] = ':'; o[6] = (char)('0' + t.s / 10); o[7] = (char)('0' + t.s % 10); o[8] = 0; if(!n) return 9; a2w(o, out, n); return 9; }
-static long WINAPI x_CoInitialize(void *r){ (void)r; return 0; }
-static void WINAPI x_CoUninitialize(void){}
 static long WINAPI x_CoCreateInstance(void *a, void *b, DWORD c, void *d, void **e){ (void)a;(void)b;(void)c;(void)d; if(e) *e = 0; return (long)0x80040154; }                       /* REGDB_E_CLASSNOTREG */
 static BOOL WINAPI x_AllocateAndInitializeSid(void *a, u8 n, DWORD s0, DWORD s1, DWORD s2, DWORD s3, DWORD s4, DWORD s5, DWORD s6, DWORD s7, void **sid){ (void)a;(void)n;(void)s0;(void)s1;(void)s2;(void)s3;(void)s4;(void)s5;(void)s6;(void)s7; static u8 fake[16]; if(sid) *sid = fake; return 1; }
 static BOOL WINAPI x_EqualSid(void *a, void *b){ return a == b; }
@@ -370,18 +409,17 @@ static HANDLE WINAPI x_imm0(void){ return 0; }
 
 const struct export x_exports[] = {
   XD("secur32",GetUserNameExW), XD("secur32",LsaGetUserName), XD("advapi32",LsaGetUserName), XD("advapi32",LsaFreeMemory), XD("secur32",LsaFreeMemory), X(GetComputerNameExW), X(AreFileApisANSI), X(WillowsReadOutput), X(WillowsProcessRunning), X(Beep), X(SetHandleInformation), X(IsDBCSLeadByteEx), X(LocalFileTimeToFileTime), X(GlobalMemoryStatus), X(ReadConsoleW), X(RtlUnwind), X(RtlUnwindEx), X(RtlPcToFileHeader),
-  X(GetOverlappedResult), X(CreateThread), X(GetExitCodeThread), X(TerminateThread), X(FindFirstFileW), X(FindNextFileW), X(FindFirstFileExW), X(GetDateFormatW), X(GetTimeFormatW),
+  X(FindFirstFileW), X(FindNextFileW), X(FindFirstFileExW), X(GetDateFormatW), X(GetTimeFormatW),
   {"kernel32","GetCommState",x_fail0}, {"kernel32","SetCommState",x_fail0}, {"kernel32","SetCommBreak",x_fail0}, {"kernel32","ClearCommBreak",x_fail0}, {"kernel32","SetCommTimeouts",x_fail0},
-  {"ole32","CoInitialize",x_CoInitialize}, {"ole32","CoUninitialize",x_CoUninitialize}, {"ole32","CoCreateInstance",x_CoCreateInstance},
+{"ole32","CoCreateInstance",x_CoCreateInstance},
   XD("advapi32",AllocateAndInitializeSid), XD("advapi32",EqualSid), XD("advapi32",GetLengthSid), XD("advapi32",CopySid), XD("advapi32",InitializeSecurityDescriptor), XD("advapi32",SetSecurityDescriptorDacl), XD("advapi32",SetSecurityDescriptorOwner),
   XD("comdlg32",ChooseColorA), XD("comdlg32",ChooseFontA), {"comdlg32","GetOpenFileNameW",x_GetFileNameW}, {"comdlg32","GetSaveFileNameW",x_GetFileNameW},
   {"imm32","ImmGetContext",x_imm0}, {"imm32","ImmReleaseContext",x_imm0}, {"imm32","ImmGetCompositionStringW",x_imm0}, {"imm32","ImmSetCompositionFontA",x_imm0}, {"imm32","ImmSetCompositionWindow",x_imm0},
 
   X(GetSystemDefaultLCID), X(GetSystemDefaultLangID), X(GetUserDefaultUILanguage), X(SetThreadUILanguage), {"kernel32","GetThreadUILanguage",x_GetUserDefaultUILanguage}, X(SetThreadLocale),
-  X(EnumSystemLocalesW), X(EnumUILanguagesW), X(LCMapStringEx), X(LCIDToLocaleName), X(MulDiv), X(SetFileAttributesA), X(SetFileAttributesW), X(SetFileTime),
-  X(MoveFileW), X(MoveFileExW), X(CopyFileW), X(GetFileAttributesExW), X(GetFileInformationByHandle), X(GetVolumeInformationW), X(GetLogicalDriveStringsA), X(GetVolumePathNameA), X(GetTempFileNameW),
-  X(InitializeConditionVariable), X(WakeConditionVariable), {"kernel32","WakeAllConditionVariable",x_WakeConditionVariable}, X(SleepConditionVariableCS),
-  X(SetDefaultDllDirectories), X(SetThreadAffinityMask), X(GetProcessAffinityMask), X(VerifyVersionInfoA), X(GetProductInfo), X(AttachConsole), X(FreeConsole), X(GetConsoleWindow), X(SetStdHandle),
+  X(EnumSystemLocalesW), X(EnumUILanguagesW), X(LCMapStringEx), X(LCIDToLocaleName), X(MulDiv), X(SetFileAttributesA), X(SetFileAttributesW), X(SetFileTime), X(GetFileTime),
+  X(MoveFileW), X(MoveFileExW), X(ReplaceFileW), X(CopyFileW), X(GetFileAttributesExW), X(GetFileAttributesExA), X(GetFileInformationByHandle), X(GetVolumeInformationW), X(GetLogicalDriveStringsA), X(GetVolumePathNameA), X(GetVolumePathNameW), X(RemoveDirectoryW),X(GetTempFileNameW),
+    X(SetDefaultDllDirectories), X(SetThreadAffinityMask), X(GetProcessAffinityMask), X(VerifyVersionInfoA), X(GetProductInfo), X(AttachConsole), X(FreeConsole), X(GetConsoleWindow), X(SetStdHandle),
   X(SystemTimeToTzSpecificLocalTime), X(HeapQueryInformation), XD("ntdll",RtlInitUnicodeString), XD("ntdll",RtlNtStatusToDosError),
   XD("user32",GetDesktopWindow), XD("user32",GetSysColor), XD("user32",MessageBeep), XD("user32",CharUpperBuffW), XD("user32",IsWindowVisible), XD("user32",EnableWindow), XD("user32",IsWindowEnabled),
   XD("user32",SetProcessDefaultLayout), XD("user32",ChangeWindowMessageFilterEx), XD("user32",InflateRect), XD("user32",OffsetRect), XD("user32",CopyRect), XD("user32",IntersectRect),
@@ -392,14 +430,12 @@ const struct export x_exports[] = {
   XD("user32",wsprintfA), XD("user32",wvsprintfA), XD("user32",wsprintfW),
   X(GetModuleFileNameW), X(GetCurrentDirectoryW), X(SetCurrentDirectoryW), X(DeleteFileW), X(GetFileAttributesW), X(CreateDirectoryW), X(CreateFileW), X(GetFullPathNameW),
   X(GetTempPathA), X(GetTempPathW), X(GetWindowsDirectoryA), X(GetWindowsDirectoryW), X(GetSystemDirectoryA), X(GetSystemDirectoryW),
-  X(GetLogicalDrives), X(GetDriveTypeA), X(GetDriveTypeW), X(GetDiskFreeSpaceExA), X(GetVolumeInformationA), X(FlushFileBuffers), X(SetEndOfFile), X(GetFileSizeEx), X(SetFilePointerEx),
-  X(GetEnvironmentVariableA), X(GetEnvironmentVariableW), X(SetEnvironmentVariableA), X(SetEnvironmentVariableW), X(ExpandEnvironmentStringsA), X(ExpandEnvironmentStringsW),
-  X(CreateEventA), X(CreateEventW), X(CreateMutexA), X(CreateMutexW), X(CreateSemaphoreA), X(SetEvent), X(ResetEvent), X(ReleaseMutex), X(ReleaseSemaphore),
-  X(WaitForSingleObjectEx), X(WaitForMultipleObjects), X(DuplicateHandle), X(SleepEx),
-  X(LocalAlloc), X(LocalFree), X(LocalReAlloc), {"kernel32","GlobalAlloc",x_LocalAlloc}, {"kernel32","GlobalFree",x_LocalFree}, {"kernel32","GlobalReAlloc",x_LocalReAlloc},
+  X(GetLogicalDrives), X(GetDriveTypeA), X(GetDriveTypeW), X(GetDiskFreeSpaceExA), X(GetVolumeInformationA), X(FlushFileBuffers), X(SetEndOfFile),  X(GetEnvironmentVariableA), X(GetEnvironmentVariableW), X(GetEnvironmentStringsA), X(GetEnvironmentStringsW), {"kernel32","GetEnvironmentStrings",x_GetEnvironmentStringsA},
+  X(FreeEnvironmentStringsA), {"kernel32","FreeEnvironmentStringsW",x_FreeEnvironmentStringsA}, X(SetEnvironmentVariableA), X(SetEnvironmentVariableW), X(ExpandEnvironmentStringsA), X(ExpandEnvironmentStringsW),
+      X(LocalAlloc), X(LocalFree), X(LocalReAlloc), {"kernel32","GlobalAlloc",x_LocalAlloc}, {"kernel32","GlobalFree",x_LocalFree}, {"kernel32","GlobalReAlloc",x_LocalReAlloc},
   X(GlobalLock), X(GlobalUnlock), X(HeapSetInformation), X(HeapValidate), X(IsBadReadPtr), {"kernel32","IsBadWritePtr",x_IsBadReadPtr},
-  X(LoadLibraryW), X(LoadLibraryExA), X(LoadLibraryExW), X(FreeLibrary), X(GetModuleHandleExW), X(DisableThreadLibraryCalls),
-  X(OutputDebugStringW), X(DebugBreak), X(SetErrorMode), X(SetThreadPriority), X(GetThreadPriority), X(IsWow64Process), X(GetSystemPowerStatus), X(ExitThread), X(RaiseException),
+  X(LoadLibraryW), X(LoadLibraryExA), X(LoadLibraryExW), X(FreeLibrary), X(GetModuleHandleExW), X(GetModuleHandleExA), X(DisableThreadLibraryCalls),
+  X(OutputDebugStringW), X(DebugBreak), X(SetErrorMode), X(IsWow64Process), X(GetSystemPowerStatus), X(RaiseException), X(RaiseFailFastException),
   X(GetSystemTimes), X(GetProcessTimes), {"kernel32","GetThreadTimes",x_GetProcessTimes},
   XD("advapi32",GetCurrentProcessToken), XD("advapi32",OpenProcessToken), XD("advapi32",GetTokenInformation),
   X(FormatMessageA), X(FormatMessageW),

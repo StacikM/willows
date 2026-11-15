@@ -7,11 +7,18 @@ BROBJ   = $(BRSRC:.c=.o)
 BRFLAGS = -m64 -ffreestanding -fno-pie -fno-pic -mcmodel=small -mno-red-zone -fno-stack-protector -mgeneral-regs-only -O2 -nostdinc \
           -isystem $(shell gcc -print-file-name=include) -Ithird_party/shim -Ithird_party/bearssl/inc -Ithird_party/bearssl/src \
           -DBR_AES_X86NI=0 -DBR_SSE2=0 -DBR_RDRAND=0 -DBR_USE_UNIX_TIME=0 -DBR_USE_WIN32_TIME=0
-OBJ     = $(SRC:.c=.o) src/boot.o $(BROBJ)
+# musl's math functions (apps/qjs/math) also serve as the C runtime's math library: built with the Microsoft ABI and SSE
+KMSRC   = $(wildcard apps/qjs/math/*.c)
+KMOBJ   = $(patsubst apps/qjs/math/%.c,build/kmath/%.o,$(KMSRC))
+KMFLAGS = -m64 -mabi=ms -ffreestanding -fno-pie -fno-pic -mcmodel=small -mno-red-zone -fno-stack-protector -O2 -nostdinc \
+          -isystem $(shell gcc -print-file-name=include) -fno-math-errno -msse2 -w
+OBJ     = $(SRC:.c=.o) src/boot.o $(BROBJ) $(KMOBJ)
+# Guest RAM in MB for every run target (the kernel uses up to 3 GB):  make run-img MEM=2048
+MEM     ?= 3072
 # Use hardware virtualisation (KVM) when the host allows it: far faster than QEMU's software CPU emulation.
 ACCEL   := $(shell test -w /dev/kvm && echo "-enable-kvm -cpu host" || echo "-cpu max")
 DLLS    = apps/wdep.dll apps/wlib.dll apps/wdyn.dll
-APPS    = apps/apitest.exe apps/apitest2.exe apps/apitest3.exe apps/dlltest.exe $(DLLS) apps/dlgtest.exe apps/hello.exe apps/exit42.exe apps/echo.exe apps/gfx.exe apps/crt.exe apps/paint.exe apps/ping.exe apps/nettest.exe apps/httpd.exe apps/fetch.exe apps/browser.exe apps/terminal.exe apps/notes.exe apps/files.exe apps/settings.exe apps/jstest.exe
+APPS    = apps/hello32.exe apps/apitest.exe apps/apitest2.exe apps/apitest3.exe apps/dlltest.exe $(DLLS) apps/dlgtest.exe apps/hello.exe apps/exit42.exe apps/echo.exe apps/gfx.exe apps/crt.exe apps/paint.exe apps/ping.exe apps/nettest.exe apps/httpd.exe apps/fetch.exe apps/browser.exe apps/terminal.exe apps/notes.exe apps/files.exe apps/settings.exe apps/jstest.exe
 
 all: kernel.elf $(APPS)
 kernel.elf: $(OBJ) linker.ld
@@ -39,6 +46,10 @@ apps/terminal.exe apps/notes.exe apps/files.exe apps/settings.exe apps/dlgtest.e
 apps/jstest.exe apps/browser.exe: apps/%.exe: apps/%.c apps/winui.h apps/web/prelude.js $(wildcard apps/web/*.h) $(wildcard apps/qjs/*.[ch] apps/qjs/*/*.[ch]) tools/buildjs.sh tools/mkpe.py
 	./tools/buildjs.sh apps/$*.c $@
 
+# 32-bit (PE32) programs, run by Willows in compatibility mode
+apps/hello32.exe: apps/hello32.c tools/build32.sh tools/mkpe32.py
+	./tools/build32.sh $< $@
+
 # DLLs (functions named EXPORT_<name> are exported); wlib imports wdep, so wdep is built first
 apps/%.dll: apps/dll/%.c tools/builddll.sh tools/mkpe.py
 	./tools/builddll.sh $< $@
@@ -47,14 +58,14 @@ apps/dlltest.exe: $(DLLS)
 
 # fast test without GRUB (QEMU's built-in multiboot loader)
 run: all
-	qemu-system-x86_64 $(ACCEL) -m 256 -nic user,model=e1000,hostfwd=tcp::18080-:8080 -kernel kernel.elf -initrd "apps/exit42.exe,apps/hello.exe,apps/crt.exe" -serial stdio -display none -no-reboot
+	qemu-system-x86_64 $(ACCEL) -m $(MEM) -nic user,model=e1000,hostfwd=tcp::18080-:8080 -kernel kernel.elf -initrd "apps/exit42.exe,apps/hello.exe,apps/crt.exe" -serial stdio -display none -no-reboot
 run-gui: all
-	qemu-system-x86_64 $(ACCEL) -m 256 -nic user,model=e1000,hostfwd=tcp::18080-:8080 -kernel kernel.elf -initrd "apps/exit42.exe,apps/hello.exe,apps/crt.exe" -serial stdio
+	qemu-system-x86_64 $(ACCEL) -m $(MEM) -nic user,model=e1000,hostfwd=tcp::18080-:8080 -kernel kernel.elf -initrd "apps/exit42.exe,apps/hello.exe,apps/crt.exe" -serial stdio
 
 img: all
 	./tools/mkdisk.sh willows.img
 run-img: img
-	qemu-system-x86_64 $(ACCEL) -m 256 -nic user,model=e1000,hostfwd=tcp::18080-:8080 -drive file=willows.img,format=raw -serial stdio
+	qemu-system-x86_64 $(ACCEL) -m $(MEM) -nic user,model=e1000,hostfwd=tcp::18080-:8080 -drive file=willows.img,format=raw -serial stdio
 
 # BIOS-only ISO (UEFI needs mtools for grub-mkrescue)
 iso: all
@@ -63,24 +74,37 @@ iso: all
 	rm -rf iso/files && mkdir -p iso/files && cp -r files/. iso/files/
 	grub-mkrescue -d /usr/lib/grub/i386-pc -o willows.iso iso
 run-iso: iso
-	qemu-system-x86_64 $(ACCEL) -m 256 -nic user,model=e1000,hostfwd=tcp::18080-:8080 -cdrom willows.iso -serial stdio
+	qemu-system-x86_64 $(ACCEL) -m $(MEM) -nic user,model=e1000,hostfwd=tcp::18080-:8080 -cdrom willows.iso -serial stdio
 # Test your own program:  make run-exe EXE=path/to/prog.exe   (copies it into user/, builds, boots in QEMU)
 run-exe: all
 	@test -n "$(EXE)" || { echo "usage: make run-exe EXE=path/to/prog.exe"; exit 1; }
 	cp "$(EXE)" user/
 	$(MAKE) img
-	qemu-system-x86_64 $(ACCEL) -m 256 -nic user,model=e1000,hostfwd=tcp::18080-:8080 -drive file=willows.img,format=raw -serial stdio
+	qemu-system-x86_64 $(ACCEL) -m $(MEM) -nic user,model=e1000,hostfwd=tcp::18080-:8080 -drive file=willows.img,format=raw -serial stdio
 # Test a plain C program:  make run-c SRC=mine.c   (compiled against apps/shim, a tiny libc)
 run-c: all
 	@test -n "$(SRC)" || { echo "usage: make run-c SRC=prog.c"; exit 1; }
 	./tools/buildc.sh "$(SRC)"
 	$(MAKE) img
-	qemu-system-x86_64 $(ACCEL) -m 256 -nic user,model=e1000,hostfwd=tcp::18080-:8080 -drive file=willows.img,format=raw -serial stdio
+	qemu-system-x86_64 $(ACCEL) -m $(MEM) -nic user,model=e1000,hostfwd=tcp::18080-:8080 -drive file=willows.img,format=raw -serial stdio
 clean:
 	rm -f kernel64.elf src/*.o $(BROBJ) apps/*.o apps/*.exe kernel.elf willows.iso willows.img; rm -rf build
 
 # wm.c includes the dialog/GDI files
 src/wm.o: $(wildcard src/*.inc)
+
+build/kmath/%.o: apps/qjs/math/%.c
+	@mkdir -p build/kmath
+	$(CC) $(KMFLAGS) -DNDEBUG -Iapps/qjs/math -Iapps/qjs/inc -c $< -o $@
+src/crtfloat.o: src/crtfloat.c
+	$(CC) $(KMFLAGS) -Iapps/qjs/inc -c $< -o $@
+
+# the C runtime formats and parses doubles, so it is built with SSE too
+src/ucrt.o: src/ucrt.c src/kernel.h
+	$(CC) $(filter-out -mgeneral-regs-only,$(CFLAGS)) -msse2 -c $< -o $@
+# DirectWrite rasterises glyphs (stb_truetype) with floating point
+src/dwrite.o: src/dwrite.c src/kernel.h tools/host/stb_truetype.h
+	$(CC) $(filter-out -mgeneral-regs-only,$(CFLAGS)) -msse2 -c $< -o $@
 
 # floating-point CRT: the only kernel file built with SSE
 src/crtmath.o: src/crtmath.c src/kernel.h

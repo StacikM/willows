@@ -7,10 +7,29 @@ static int cx, cy, cols=80, rows=25; static const u8 attr = 0x07;
 char con_buf[CON_ROWS][CON_COLS]; int con_cx, con_cy, con_on, con_quiet;
 void console_desktop(int on){ con_on=on; memset(con_buf,' ',sizeof con_buf); con_cx=con_cy=0; }
 static void con_put(char c){
-  static int esc;                                       /* swallow ANSI escape sequences (colours etc.) instead of printing them */
+  static int esc, par[4], np, have;                     /* ANSI escapes: cursor moves and erase are honoured, colours and the rest are swallowed */
+  static char priv, osc;
   if(esc==0 && c==0x1B){ esc=1; return; }
-  if(esc==1){ esc = (c=='[' || c==']' || c=='(') ? 2 : 0; return; }
-  if(esc==2){ if((c>='@' && c<='~') && c!='[') esc=0; return; }
+  if(esc==1){ esc = (c=='[') ? 2 : (c==']' || c=='(') ? 3 : 0; osc=(c==']'); np=0; have=0; priv=0; par[0]=par[1]=0; return; }
+  if(esc==3){ if(osc? (c==7 || c=='\\') : 1) esc=0; return; }
+  if(esc==2){
+    if(c=='?'){ priv=1; return; }
+    if(c>='0' && c<='9'){ par[np]=par[np]*10+(c-'0'); have=1; return; }
+    if(c==';'){ if(np<3) np++; par[np]=0; return; }
+    esc=0; if(priv) return;
+    int n=par[0]? par[0] : 1;
+    switch(c){
+      case 'H': case 'f': con_cy=(par[0]? par[0]:1)-1; con_cx=(np>=1 && par[1]? par[1]:1)-1; if(con_cy>=CON_ROWS) con_cy=CON_ROWS-1; if(con_cx>=CON_COLS) con_cx=CON_COLS-1; break;
+      case 'A': con_cy-=n; if(con_cy<0) con_cy=0; break;
+      case 'B': con_cy+=n; if(con_cy>=CON_ROWS) con_cy=CON_ROWS-1; break;
+      case 'C': con_cx+=n; if(con_cx>=CON_COLS) con_cx=CON_COLS-1; break;
+      case 'D': con_cx-=n; if(con_cx<0) con_cx=0; break;
+      case 'J': if(par[0]==2 || par[0]==3){ memset(con_buf,' ',sizeof con_buf); } else if(par[0]==0){ memset(con_buf[con_cy]+con_cx,' ',CON_COLS-con_cx); for(int r=con_cy+1;r<CON_ROWS;r++) memset(con_buf[r],' ',CON_COLS); } break;
+      case 'K': if(par[0]==0) memset(con_buf[con_cy]+con_cx,' ',CON_COLS-con_cx); else if(par[0]==1) memset(con_buf[con_cy],' ',con_cx+1); else memset(con_buf[con_cy],' ',CON_COLS); break;
+      default: break;
+    }
+    (void)have; wm_console_dirty(); return;
+  }
   if(c=='\n'){ con_cx=0; con_cy++; } else if(c=='\r') con_cx=0; else if(c=='\b'){ if(con_cx) con_cx--; }
   else if(c=='\t'){ con_cx=(con_cx+8)&~7; } else if((u8)c>=32){ con_buf[con_cy][con_cx]=c; con_cx++; }
   if(con_cx>=CON_COLS){ con_cx=0; con_cy++; }
@@ -101,3 +120,4 @@ static void put_buf(char c, void *cx){ struct sbuf *b=cx; b->total++; if(b->left
 int WINAPI kvsnprintf(char *buf, u32 n, const char *f, margs ap){
   struct sbuf b={buf,n,0}; vfmt(put_buf,&b,f,ap); if(n) *b.p=0; return b.total;
 }
+int WINAPI ksnprintf(char *b, u32 n, const char *f, ...){ margs ap; __builtin_ms_va_start(ap,f); int r=kvsnprintf(b,n,f,ap); __builtin_ms_va_end(ap); return r; }

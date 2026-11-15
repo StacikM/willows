@@ -14,61 +14,133 @@ static int a2w(const char *a, u16 *w, int n){ int i=0; for(;a[i]&&i<n-1;i++) w[i
 #define ERR_INVALID_HANDLE 6
 #define ERR_INVALID_PARAMETER 87
 
-/* ================= pipes ================= */
-#define MAXPIPE 48
+/* ================= pipes =================
+   handle = PIPE_BASE + index*2 + side. Anonymous: side 0 reads ring 0, side 1 writes ring 0.
+   Named (duplex): the server (side 0) reads ring 0 and writes ring 1, the client (side 1) the opposite.
+   Each ring grows as needed, so writes never block. Reads with an OVERLAPPED (IPC in Chromium-based programs and Firefox)
+   are asynchronous: if no data is there they return ERROR_IO_PENDING and complete later (OVERLAPPED status, event,
+   completion port packet) when the other side writes or closes. */
+#define MAXPIPE 96
 #define PIPE_BASE 0x7B00
-#define RING 65536u
-struct pipe { u8 used, named, connected; int refs[2]; char name[64]; u8 *buf[2]; u32 r[2], w[2]; };
+#define RING0 65536u
+#define RINGMAX (256u<<20)
+#define PNAME 128
+struct pipe { u8 used, named, connected; int refs[2], pid[2]; u8 own[2][MAXPROC]; char name[PNAME];   /* own: each process's references to each end (released when it exits) */ u8 *buf[2]; u32 cap[2], r[2], w[2]; };
 static struct pipe P[MAXPIPE];
-/* handle = PIPE_BASE + index*2 + side. Anonymous: side 0 reads ring 0, side 1 writes ring 0.
-   Named (duplex): the server (side 0) reads ring 0 and writes ring 1, the client (side 1) the opposite. */
 int pipe_is_handle(u64 h){ if(h<PIPE_BASE || h>=PIPE_BASE+MAXPIPE*2) return 0; return P[(h-PIPE_BASE)>>1].used; }
 static struct pipe *pp(u64 h){ return &P[(h-PIPE_BASE)>>1]; }
 static int side(u64 h){ return (int)((h-PIPE_BASE)&1); }
 static int rx_ring(struct pipe *p, int s){ return p->named? (s==0? 0 : 1) : (s==0? 0 : -1); }
 static int tx_ring(struct pipe *p, int s){ return p->named? (s==0? 1 : 0) : (s==1? 0 : -1); }
 static struct pipe *pipe_alloc(int named){
-  for(int i=0;i<MAXPIPE;i++) if(!P[i].used){ struct pipe *p=&P[i]; memset(p,0,sizeof *p); p->buf[0]=heap_alloc(RING); p->buf[1]=named? heap_alloc(RING) : 0; if(!p->buf[0] || (named && !p->buf[1])){ heap_free(p->buf[0]); heap_free(p->buf[1]); return 0; } p->used=1; p->named=(u8)named; return p; }
+  for(int i=0;i<MAXPIPE;i++) if(!P[i].used){ struct pipe *p=&P[i]; memset(p,0,sizeof *p); p->buf[0]=heap_alloc(RING0); p->buf[1]=named? heap_alloc(RING0) : 0; if(!p->buf[0] || (named && !p->buf[1])){ heap_free(p->buf[0]); heap_free(p->buf[1]); return 0; } p->cap[0]=p->cap[1]=RING0; p->used=1; p->named=(u8)named; return p; }
   return 0;
 }
-void pipe_addref(u64 h){ if(pipe_is_handle(h)) pp(h)->refs[side(h)]++; }
-void pipe_close(u64 h){
-  if(!pipe_is_handle(h)) return; struct pipe *p=pp(h); int s=side(h); if(p->refs[s]>0) p->refs[s]--;
+static int ring_grow(struct pipe *p, int rg, u32 need){                       /* room for `need` more bytes */
+  u32 have=p->w[rg]-p->r[rg]; if(p->cap[rg]-have>=need) return 1;
+  u32 nc=p->cap[rg]; while(nc-have<need && nc<RINGMAX) nc*=2; if(nc-have<need) return 0;
+  u8 *nb=heap_alloc(nc); if(!nb) return 0;
+  for(u32 i=0;i<have;i++) nb[i]=p->buf[rg][(p->r[rg]+i)%p->cap[rg]];
+  heap_free(p->buf[rg]); p->buf[rg]=nb; p->cap[rg]=nc; p->r[rg]=0; p->w[rg]=have; return 1;
+}
+static u32 ring_take(struct pipe *p, int rg, u8 *d, u32 n){
+  u32 avail=p->w[rg]-p->r[rg]; if(n>avail) n=avail;
+  for(u32 i=0;i<n;i++) d[i]=p->buf[rg][(p->r[rg]+i)%p->cap[rg]];
+  p->r[rg]+=n; return n;
+}
+
+/* ---- asynchronous operations ---- */
+#define STATUS_PENDING 0x103
+#define STATUS_PIPE_BROKEN 0xC000014Bu
+#define STATUS_CANCELLED 0xC0000120u
+#define MAXPEND 192
+static struct pend { u8 used, connect; int pid; u64 h; u8 *buf; u32 n; u8 *ov; } PD[MAXPEND];
+static void pipe_release_all(int pid);
+void pipe_proc_exit(int pid){                                                    /* a process ends: its pending reads (their buffers are gone), then its pipe ends */
+  for(int i=0;i<MAXPEND;i++) if(PD[i].used && PD[i].pid==pid) PD[i].used=0;
+  pipe_release_all(pid);
+}
+int iocp_complete(u64 h, u32 bytes, u64 ov);
+static int pipe_trace(void){ static int t=-1; if(t<0){ struct ramfile *f=fs_find("/System/apitrace.cfg"); t= f && !f->isdir; } return t; }   /* log pipe traffic while tracing */
+static void ov_finish(u64 h, u8 *ov, u32 status, u32 bytes, int post){         /* fill in the OVERLAPPED, set its event, queue the packet */
+  *(u64*)ov=status; *(u64*)(ov+8)=bytes;
+  u64 ev=*(u64*)(ov+24);
+  if(ev&~1ull){ BOOL (WINAPI *se)(HANDLE)=K32("SetEvent"); if(se) se(ev&~1ull); }
+  int queued= post && !(ev&1)? iocp_complete(h,bytes,(u64)ov) : 0;                /* hEvent with the low bit set: no packet */
+  if(pipe_trace()) kdbg("  [pipe] %p: completed (status %x, %u bytes, event %p, %s) in pid %d\n",(void*)h,status,bytes,(void*)ev,queued? "packet queued" : "no port",cur->pid);
+}
+static void pipe_kick(struct pipe *p){                                          /* finish what can be finished */
+  for(int i=0;i<MAXPEND;i++){ struct pend *q=&PD[i]; if(!q->used || !pipe_is_handle(q->h) || pp(q->h)!=p) continue;
+    int s=side(q->h);
+    if(q->connect){ if(p->connected){ q->used=0; ov_finish(q->h,q->ov,0,0,1); } continue; }
+    int rr=rx_ring(p,s);
+    if(p->w[rr]!=p->r[rr]){ u32 got=ring_take(p,rr,q->buf,q->n); q->used=0; ov_finish(q->h,q->ov,0,got,1); }
+    else if(p->refs[1-s]<=0 && (!p->named || p->connected || s==1)){ q->used=0; ov_finish(q->h,q->ov,STATUS_PIPE_BROKEN,0,1); }
+  }
+}
+static int pend_add(u64 h, int connect, u8 *buf, u32 n, u8 *ov){
+  for(int i=0;i<MAXPEND;i++) if(!PD[i].used){ PD[i]=(struct pend){1,(u8)connect,cur->pid,h,buf,n,ov}; *(u64*)ov=STATUS_PENDING; *(u64*)(ov+8)=0; return 1; }
+  return 0;
+}
+static int pipe_cancel(u64 h, u8 *ov){                                          /* CancelIo(Ex), and closing the handle */
+  int n=0; for(int i=0;i<MAXPEND;i++){ struct pend *q=&PD[i]; if(q->used && q->h==h && (!ov || q->ov==ov)){ q->used=0; ov_finish(h,q->ov,STATUS_CANCELLED,0,1); n++; } }
+  return n;
+}
+
+static void ref_add(struct pipe *p, int s, int pid){ p->refs[s]++; if(pid>=0 && pid<MAXPROC && p->own[s][pid]<255) p->own[s][pid]++; }
+void pipe_addref_for(u64 h, int pid){ if(pipe_is_handle(h)) ref_add(pp(h),side(h),pid); }   /* a reference held by another process (inheritance, DuplicateHandle) */
+void pipe_addref(u64 h){ pipe_addref_for(h,cur->pid); }
+void pipe_close_for(u64 h, int pid){
+  if(!pipe_is_handle(h)) return; struct pipe *p=pp(h); int s=side(h);
+  if(pid>=0 && pid<MAXPROC && p->own[s][pid]) p->own[s][pid]--;
+  if(p->refs[s]>0) p->refs[s]--;
+  if(p->refs[s]<=0) pipe_cancel(h,0);
+  pipe_kick(p);                                                                 /* readers on the other side see the end */
   if(p->refs[0]<=0 && p->refs[1]<=0){ heap_free(p->buf[0]); heap_free(p->buf[1]); p->used=0; }
 }
-int pipe_read(u64 h, void *buf, u32 n, u32 *got){
+void pipe_close(u64 h){ pipe_close_for(h,cur->pid); }
+static void pipe_release_all(int pid){                                          /* a process ended: its pipe ends close, so the other side sees a broken pipe */
+  for(int i=0;i<MAXPIPE;i++) for(int s=0;s<2;s++) while(P[i].used && P[i].own[s][pid]) pipe_close_for(PIPE_BASE+(u64)i*2+s,pid);
+}
+int pipe_read_ov(u64 h, void *buf, u32 n, u32 *got, u8 *ov){
   struct pipe *p=pp(h); int s=side(h), rr=rx_ring(p,s); if(got) *got=0;
   if(rr<0){ win32_set_last_error(5); return 0; }                                  /* the write end cannot be read */
+  if(ov){
+    if(p->r[rr]!=p->w[rr]){ u32 k=ring_take(p,rr,buf,n); if(got) *got=k; ov_finish(h,ov,0,k,1); return 1; }
+    if(p->refs[1-s]<=0 && (!p->named || p->connected || s==1)){ win32_set_last_error(ERR_BROKEN_PIPE); return 0; }
+    if(!pend_add(h,0,buf,n,ov)){ win32_set_last_error(8); return 0; }
+    if(pipe_trace()) kdbg("  [pipe] %p: read %u bytes pending (pid %d)\n",(void*)h,n,cur->pid);
+    win32_set_last_error(997); return 0;                                          /* ERROR_IO_PENDING */
+  }
   while(p->r[rr]==p->w[rr]){
     if(p->refs[1-s]<=0){ win32_set_last_error(ERR_BROKEN_PIPE); return 0; }       /* every writer is gone: end of file */
-    idle_wait();
+    thread_note_wait("ReadFile(pipe)",h,(u64)__builtin_return_address(0)); idle_wait();
   }
-  u32 avail=p->w[rr]-p->r[rr]; if(n>avail) n=avail; u8 *d=buf;
-  for(u32 i=0;i<n;i++) d[i]=p->buf[rr][(p->r[rr]+i)%RING];
-  p->r[rr]+=n; if(got) *got=n; return 1;
+  thread_end_wait();
+  u32 k=ring_take(p,rr,buf,n); if(got) *got=k; return 1;
 }
-int pipe_write(u64 h, const void *buf, u32 n, u32 *wrote){
+int pipe_read(u64 h, void *buf, u32 n, u32 *got){ return pipe_read_ov(h,buf,n,got,0); }
+int pipe_write_ov(u64 h, const void *buf, u32 n, u32 *wrote, u8 *ov){
   struct pipe *p=pp(h); int s=side(h), tr=tx_ring(p,s); if(wrote) *wrote=0;
   if(tr<0){ win32_set_last_error(5); return 0; }
-  const u8 *d=buf; u32 done=0;
-  while(done<n){
-    if(p->refs[1-s]<=0){ win32_set_last_error(ERR_NO_DATA); return 0; }          /* nobody left to read */
-    u32 space=RING-(p->w[tr]-p->r[tr]); if(!space){ idle_wait(); continue; }
-    u32 k=n-done; if(k>space) k=space;
-    for(u32 i=0;i<k;i++) p->buf[tr][(p->w[tr]+i)%RING]=d[done+i];
-    p->w[tr]+=k; done+=k;
-  }
-  if(wrote) *wrote=done; return 1;
+  if(p->refs[1-s]<=0 && (!p->named || p->connected || s==1)){ win32_set_last_error(ERR_NO_DATA); return 0; }   /* nobody left to read */
+  if(!ring_grow(p,tr,n)){ win32_set_last_error(8); return 0; }
+  const u8 *d=buf; for(u32 i=0;i<n;i++) p->buf[tr][(p->w[tr]+i)%p->cap[tr]]=d[i];
+  p->w[tr]+=n; if(wrote) *wrote=n;
+  if(pipe_trace()) kdbg("  [pipe] %p: write %u bytes%s (pid %d)\n",(void*)h,n,ov? " overlapped" : "",cur->pid);
+  if(ov) ov_finish(h,ov,0,n,1);
+  pipe_kick(p); return 1;
 }
+int pipe_write(u64 h, const void *buf, u32 n, u32 *wrote){ return pipe_write_ov(h,buf,n,wrote,0); }
 static BOOL WINAPI i_CreatePipe(u64 *rd, u64 *wr, void *sa, DWORD size){
   (void)sa;(void)size; struct pipe *p=pipe_alloc(0); if(!p){ win32_set_last_error(8); return 0; }
-  p->refs[0]=p->refs[1]=1; u64 base=PIPE_BASE+(u64)(p-P)*2; if(rd) *rd=base; if(wr) *wr=base+1; return 1;
+  ref_add(p,0,cur->pid); ref_add(p,1,cur->pid); u64 base=PIPE_BASE+(u64)(p-P)*2; if(rd) *rd=base; if(wr) *wr=base+1; return 1;
 }
 static BOOL WINAPI i_PeekNamedPipe(u64 h, u8 *buf, DWORD n, DWORD *rd, DWORD *avail, DWORD *left){
   if(!pipe_is_handle(h)){ win32_set_last_error(ERR_INVALID_HANDLE); return 0; }
   struct pipe *p=pp(h); int rr=rx_ring(p,side(h)); if(rr<0){ win32_set_last_error(5); return 0; }
   u32 have=p->w[rr]-p->r[rr]; if(have==0 && p->refs[1-side(h)]<=0){ win32_set_last_error(ERR_BROKEN_PIPE); return 0; }
-  u32 k=have<n? have : n; if(buf) for(u32 i=0;i<k;i++) buf[i]=p->buf[rr][(p->r[rr]+i)%RING];
+  u32 k=have<n? have : n; if(buf) for(u32 i=0;i<k;i++) buf[i]=p->buf[rr][(p->r[rr]+i)%p->cap[rr]];
   if(rd) *rd=buf? k : 0; if(avail) *avail=have; if(left) *left=have>k? have-k : 0; return 1;
 }
 /* named pipes: \\.\pipe\name */
@@ -76,72 +148,114 @@ static int pipe_name(const char *path, char *out, int max){
   static const char pre[]="\\\\.\\pipe\\"; int i=0; for(;pre[i];i++) if(path[i]!=pre[i] && !(path[i]=='/' && pre[i]=='\\')) return 0;
   int n=0; for(const char *q=path+i; *q && n<max-1; q++) out[n++]=(char)(*q>='A'&&*q<='Z'? *q+32 : *q); out[n]=0; return n>0;
 }
-int pipe_is_path(const char *name){ char t[64]; return name && pipe_name(name,t,sizeof t); }
+int pipe_is_path(const char *name){ char t[PNAME]; return name && pipe_name(name,t,sizeof t); }
 u64 pipe_open_client(const char *name){
-  char t[64]; if(!pipe_name(name,t,sizeof t)) return 0;
-  for(int i=0;i<MAXPIPE;i++){ struct pipe *p=&P[i]; if(p->used && p->named && !p->connected && p->refs[0]>0 && !stricmp(p->name,t)){ p->connected=1; p->refs[1]=1; return PIPE_BASE+(u64)i*2+1; } }
+  char t[PNAME]; if(!pipe_name(name,t,sizeof t)) return 0;
+  for(int i=0;i<MAXPIPE;i++){ struct pipe *p=&P[i]; if(p->used && p->named && !p->connected && p->refs[0]>0 && !stricmp(p->name,t)){
+    p->connected=1; p->refs[1]=0; memset(p->own[1],0,MAXPROC); ref_add(p,1,cur->pid); p->pid[1]=cur->pid; pipe_kick(p); if(pipe_trace()) kdbg("  [pipe] %s: client connected (pid %d)\n",t,cur->pid); return PIPE_BASE+(u64)i*2+1; } }
+  if(pipe_trace()) kdbg("  [pipe] %s: no server to connect to (pid %d)\n",t,cur->pid);
   return 0;
 }
 static u64 WINAPI i_CreateNamedPipeA(const char *name, DWORD om, DWORD pm, DWORD max, DWORD out, DWORD in, DWORD to, void *sa){
-  (void)om;(void)pm;(void)max;(void)out;(void)in;(void)to;(void)sa; char t[64]; if(!name || !pipe_name(name,t,sizeof t)){ win32_set_last_error(ERR_INVALID_PARAMETER); return (u64)-1; }
+  (void)pm;(void)max;(void)out;(void)in;(void)to;(void)sa; char t[PNAME]; if(!name || !pipe_name(name,t,sizeof t)){ win32_set_last_error(ERR_INVALID_PARAMETER); return (u64)-1; }
+  if(om&0x80000){ for(int i=0;i<MAXPIPE;i++) if(P[i].used && P[i].named && !stricmp(P[i].name,t)){ win32_set_last_error(5); return (u64)-1; } }   /* FILE_FLAG_FIRST_PIPE_INSTANCE */
   struct pipe *p=pipe_alloc(1); if(!p){ win32_set_last_error(8); return (u64)-1; }
-  memcpy(p->name,t,strlen(t)+1); p->refs[0]=1; return PIPE_BASE+(u64)(p-P)*2;
+  memcpy(p->name,t,strlen(t)+1); ref_add(p,0,cur->pid); p->pid[0]=cur->pid;
+  if(pipe_trace()) kdbg("  [pipe] CreateNamedPipe(%s, mode %x) = %p (pid %d)\n",t,om,(void*)(PIPE_BASE+(u64)(p-P)*2),cur->pid);
+  win32_set_last_error(0); return PIPE_BASE+(u64)(p-P)*2;
 }
 static u64 WINAPI i_CreateNamedPipeW(const u16 *name, DWORD om, DWORD pm, DWORD max, DWORD out, DWORD in, DWORD to, void *sa){ char t[200]; w2a(name,t,200); return i_CreateNamedPipeA(t,om,pm,max,out,in,to,sa); }
-static BOOL WINAPI i_ConnectNamedPipe(u64 h, void *ov){
-  (void)ov; if(!pipe_is_handle(h) || !pp(h)->named || side(h)!=0){ win32_set_last_error(ERR_INVALID_HANDLE); return 0; }
+static BOOL WINAPI i_ConnectNamedPipe(u64 h, u8 *ov){
+  if(!pipe_is_handle(h) || !pp(h)->named || side(h)!=0){ win32_set_last_error(ERR_INVALID_HANDLE); return 0; }
   struct pipe *p=pp(h); if(p->connected){ win32_set_last_error(ERR_PIPE_CONNECTED); return 0; }
-  while(!p->connected) idle_wait(); return 1;
+  if(ov){ if(!pend_add(h,1,0,0,ov)){ win32_set_last_error(8); return 0; } win32_set_last_error(997); return 0; }    /* ERROR_IO_PENDING */
+  thread_note_wait("ConnectNamedPipe",h,(u64)__builtin_return_address(0));
+  while(!p->connected) idle_wait();
+  thread_end_wait(); return 1;
 }
 static BOOL WINAPI i_DisconnectNamedPipe(u64 h){
-  if(!pipe_is_handle(h) || !pp(h)->named) return 0; struct pipe *p=pp(h); p->connected=0; p->refs[1]=0; for(int i=0;i<2;i++) p->r[i]=p->w[i]=0; return 1;
+  if(!pipe_is_handle(h) || !pp(h)->named) return 0; struct pipe *p=pp(h); p->connected=0; p->refs[1]=0; memset(p->own[1],0,MAXPROC); for(int i=0;i<2;i++) p->r[i]=p->w[i]=0; return 1;
 }
+/* GetOverlappedResult: the result of an asynchronous operation (any handle: files complete at once, pipes may be pending) */
+static BOOL WINAPI i_GetOverlappedResultEx(u64 h, u8 *ov, DWORD *n, DWORD ms, BOOL al){
+  (void)h;(void)al; if(!ov){ win32_set_last_error(ERR_INVALID_PARAMETER); return 0; }
+  if(*(u32*)ov==STATUS_PENDING){
+    if(!ms){ win32_set_last_error(996); return 0; }                               /* ERROR_IO_INCOMPLETE */
+    u32 t0=ticks; thread_note_wait("GetOverlappedResult",h,(u64)__builtin_return_address(0));
+    while(*(volatile u32*)ov==STATUS_PENDING){ if(ms!=0xFFFFFFFF && (u32)(ticks-t0)>=ms){ thread_end_wait(); win32_set_last_error(258); return 0; } idle_wait(); }
+    thread_end_wait();
+  }
+  if(n) *n=*(u32*)(ov+8);
+  u32 st=*(u32*)ov; if(!st) return 1;
+  win32_set_last_error(st==STATUS_PIPE_BROKEN? ERR_BROKEN_PIPE : st==STATUS_CANCELLED? 995 : st==0xC0000011u? 38 : 31); return 0;
+}
+static BOOL WINAPI i_GetOverlappedResult(u64 h, u8 *ov, DWORD *n, BOOL wait){ return i_GetOverlappedResultEx(h,ov,n,wait? 0xFFFFFFFF : 0,0); }
 static BOOL WINAPI i_WaitNamedPipeA(const char *name, DWORD ms){
-  char t[64]; if(!name || !pipe_name(name,t,sizeof t)) return 0; u32 end=ticks+(ms==0? 5000 : ms);
+  char t[PNAME]; if(!name || !pipe_name(name,t,sizeof t)) return 0; u32 end=ticks+(ms==0? 5000 : ms);
   for(;;){ for(int i=0;i<MAXPIPE;i++){ struct pipe *p=&P[i]; if(p->used && p->named && !p->connected && p->refs[0]>0 && !stricmp(p->name,t)) return 1; } if(ms!=0xFFFFFFFF && (i32)(ticks-end)>=0){ win32_set_last_error(121); return 0; } idle_wait(); }
 }
 static BOOL WINAPI i_WaitNamedPipeW(const u16 *name, DWORD ms){ char t[200]; w2a(name,t,200); return i_WaitNamedPipeA(t,ms); }
 static BOOL WINAPI i_SetNamedPipeHandleState(u64 h, DWORD *mode, DWORD *maxc, DWORD *to){ (void)h;(void)mode;(void)maxc;(void)to; return 1; }
-static BOOL WINAPI i_GetNamedPipeInfo(u64 h, DWORD *fl, DWORD *out, DWORD *in, DWORD *max){ if(!pipe_is_handle(h)) return 0; if(fl) *fl=pp(h)->named? 0 : 0; if(out) *out=RING; if(in) *in=RING; if(max) *max=255; return 1; }
+static BOOL WINAPI i_GetNamedPipeInfo(u64 h, DWORD *fl, DWORD *out, DWORD *in, DWORD *max){ if(!pipe_is_handle(h)){ win32_set_last_error(ERR_INVALID_HANDLE); return 0; } if(fl) *fl=side(h)==0 && pp(h)->named? 1 : 0; if(out) *out=RING0; if(in) *in=RING0; if(max) *max=1; return 1; }   /* PIPE_SERVER_END */
+static BOOL WINAPI i_GetNamedPipeClientProcessId(u64 h, DWORD *pid){ if(!pipe_is_handle(h)){ win32_set_last_error(ERR_INVALID_HANDLE); return 0; } if(pid) *pid=pp(h)->pid[1]; return 1; }
+static BOOL WINAPI i_GetNamedPipeServerProcessId(u64 h, DWORD *pid){ if(!pipe_is_handle(h)){ win32_set_last_error(ERR_INVALID_HANDLE); return 0; } if(pid) *pid=pp(h)->pid[0]; return 1; }
 static BOOL WINAPI i_GetNamedPipeHandleStateA(u64 h, DWORD *st, DWORD *cur_, DWORD *maxc, DWORD *to, char *user, DWORD n){ (void)h;(void)maxc;(void)to;(void)user;(void)n; if(st) *st=0; if(cur_) *cur_=1; return 1; }
 
 /* ================= file mappings ================= */
-#define MAXMAP 48
+#define MAXMAP 224                                        /* handles 0x7A00..0x7ADF (pipes start at 0x7B00) */
+#define MAXVIEW 1024
 #define MAPBASE 0x7A00
-struct fmap { u8 used, write; int refs, views; char name[64]; u8 *base; u64 size; struct ramfile *f; };
+struct fmap { u8 used, write, borrowed; int refs, views;                /* borrowed: base is the file's own data (read-only mapping) */ char name[64]; u8 *base; u64 size; struct ramfile *f; };
 struct view { u8 *p; u64 len; int map; };
-static struct fmap M[MAXMAP]; static struct view V[128];
+static struct fmap M[MAXMAP]; static struct view V[MAXVIEW];
 int map_is_handle(u64 h){ return h>=MAPBASE && h<MAPBASE+MAXMAP && M[h-MAPBASE].used; }
-static void map_release(struct fmap *m){ if(m->refs<=0 && m->views<=0){ heap_free(m->base); m->used=0; } }
-void map_close(u64 h){ if(!map_is_handle(h)) return; struct fmap *m=&M[h-MAPBASE]; m->refs--; map_release(m); }
+void map_addref(u64 h){ if(map_is_handle(h)) M[h-MAPBASE].refs++; }                  /* DuplicateHandle */
+/* NtQuerySection(SectionBasicInformation): {BaseAddress, AllocationAttributes, MaximumSize} */
+static u32 WINAPI i_NtQuerySection(u64 h, u32 cls, u8 *out, u64 len, u64 *ret){
+  if(!map_is_handle(h)) return 0xC0000008; if(cls!=0) return 0xC0000003; if(len<24) return 0xC0000004;    /* INVALID_HANDLE, INVALID_INFO_CLASS, INFO_LENGTH_MISMATCH */
+  memset(out,0,24); *(u32*)(out+8)= M[h-MAPBASE].f? 0x1000000 : 0x8000000; *(u64*)(out+16)=M[h-MAPBASE].size;  /* SEC_IMAGE-less: SEC_FILE or SEC_COMMIT */
+  if(ret) *ret=24; return 0;
+}
+static int map_trace(void);
+static void map_release(struct fmap *m){ if(m->refs<=0 && m->views<=0){ if(map_trace()) kdbg("  [map] %p freed (pid %d)\n",(void*)(MAPBASE+(u64)(m-M)),cur->pid); if(!m->borrowed) heap_free(m->base); m->used=0; } }
+void map_close(u64 h){ if(!map_is_handle(h)) return; struct fmap *m=&M[h-MAPBASE]; m->refs--; if(map_trace()) kdbg("  [map] close %p -> refs %d views %d\n",(void*)h,m->refs,m->views); map_release(m); }
 static u64 map_create(u64 hfile, DWORD prot, DWORD hi, DWORD lo, const char *name){
   u64 size=((u64)hi<<32)|lo; struct ramfile *f=0;
   if(hfile!=(u64)-1){ f=fs_handle_file(hfile); if(!f){ win32_set_last_error(ERR_INVALID_HANDLE); return 0; } if(!size) size=f->size; }
   if(!size){ win32_set_last_error(ERR_INVALID_PARAMETER); return 0; }
   if(name && *name) for(int i=0;i<MAXMAP;i++) if(M[i].used && !stricmp(M[i].name,name)){ M[i].refs++; win32_set_last_error(ERR_ALREADY_EXISTS); return MAPBASE+(u64)i; }
   int idx=-1; for(int i=0;i<MAXMAP;i++) if(!M[i].used){ idx=i; break; } if(idx<0){ win32_set_last_error(8); return 0; }
-  struct fmap *m=&M[idx]; memset(m,0,sizeof *m); u64 cap=(size+0xFFF)&~0xFFFull; m->base=heap_alloc(cap); if(!m->base){ win32_set_last_error(8); return 0; }
+  struct fmap *m=&M[idx]; memset(m,0,sizeof *m);
+  int ro=(prot&0xFF)==0x02 || (prot&0xFF)==0x20;                  /* PAGE_READONLY, PAGE_EXECUTE_READ */
+  if(f && f->data && ro && size<=f->size){ m->base=f->data; m->borrowed=1; }   /* read-only view of a file: its data is in memory already, every process shares it */
+  else { u64 cap=(size+0xFFF)&~0xFFFull; m->base=heap_alloc(cap); if(!m->base){ win32_set_last_error(8); return 0; } }
   m->used=1; m->refs=1; m->size=size; m->f=f; m->write=(prot&(0x04|0x08|0x40|0x80))!=0;
   if(name) for(unsigned k=0;name[k]&&k<63;k++) m->name[k]=name[k];
-  if(f && f->data){ u64 n=f->size<size? f->size : size; memcpy(m->base,f->data,n); }
+  if(f && f->data && !m->borrowed){ u64 n=f->size<size? f->size : size; memcpy(m->base,f->data,n); }
   win32_set_last_error(0); return MAPBASE+(u64)idx;
 }
-static u64 WINAPI i_CreateFileMappingA(u64 hf, void *sa, DWORD prot, DWORD hi, DWORD lo, const char *name){ (void)sa; return map_create(hf,prot,hi,lo,name); }
-static u64 WINAPI i_CreateFileMappingW(u64 hf, void *sa, DWORD prot, DWORD hi, DWORD lo, const u16 *name){ (void)sa; char t[200]; if(name) w2a(name,t,200); return map_create(hf,prot,hi,lo,name? t : 0); }
+static int map_trace(void){ struct ramfile *f=fs_find("/System/apitrace.cfg"); return f && !f->isdir; }    /* log mappings while tracing (debugging) */
+static u64 WINAPI i_CreateFileMappingA(u64 hf, void *sa, DWORD prot, DWORD hi, DWORD lo, const char *name){ (void)sa; u64 r=map_create(hf,prot,hi,lo,name);
+  if(map_trace()) kdbg("  [map] CreateFileMapping(file %p, prot %x, size %x:%x, %s) = %p\n",(void*)hf,prot,hi,lo,name? name : "-",(void*)r); return r; }
+static u64 WINAPI i_CreateFileMappingW(u64 hf, void *sa, DWORD prot, DWORD hi, DWORD lo, const u16 *name){ char t[200]; if(name) w2a(name,t,200); return i_CreateFileMappingA(hf,sa,prot,hi,lo,name? t : 0); }
 static u64 WINAPI i_OpenFileMappingA(DWORD acc, BOOL inh, const char *name){ (void)acc;(void)inh; if(name) for(int i=0;i<MAXMAP;i++) if(M[i].used && !stricmp(M[i].name,name)){ M[i].refs++; return MAPBASE+(u64)i; } win32_set_last_error(ERR_FILE_NOT_FOUND); return 0; }
 static u64 WINAPI i_OpenFileMappingW(DWORD acc, BOOL inh, const u16 *name){ char t[200]; w2a(name,t,200); return i_OpenFileMappingA(acc,inh,t); }
 static void *view_map(u64 h, DWORD hi, DWORD lo, u64 bytes){
   if(!map_is_handle(h)){ win32_set_last_error(ERR_INVALID_HANDLE); return 0; }
   struct fmap *m=&M[h-MAPBASE]; u64 off=((u64)hi<<32)|lo; if(off>=m->size){ win32_set_last_error(ERR_INVALID_PARAMETER); return 0; }
-  int v=-1; for(int i=0;i<128;i++) if(!V[i].p){ v=i; break; } if(v<0){ win32_set_last_error(8); return 0; }
+  int v=-1; for(int i=0;i<MAXVIEW;i++) if(!V[i].p){ v=i; break; } if(v<0){ win32_set_last_error(8); return 0; }
   V[v].p=m->base+off; V[v].len=bytes? bytes : m->size-off; V[v].map=(int)(m-M); m->views++; return V[v].p;
 }
-static void *WINAPI i_MapViewOfFile(u64 h, DWORD acc, DWORD hi, DWORD lo, u64 bytes){ (void)acc; return view_map(h,hi,lo,bytes); }
-static void *WINAPI i_MapViewOfFileEx(u64 h, DWORD acc, DWORD hi, DWORD lo, u64 bytes, void *base){ (void)acc;(void)base; return view_map(h,hi,lo,bytes); }
+static void *WINAPI i_MapViewOfFile(u64 h, DWORD acc, DWORD hi, DWORD lo, u64 bytes){ void *r=view_map(h,hi,lo,bytes);
+  if(map_trace()){ kdbg("  [map] MapViewOfFile(%p, access %x, off %x:%x, %p bytes) = %p pid %d:",(void*)h,acc,hi,lo,(void*)bytes,r,cur->pid);
+    if(r) for(int i=0;i<40;i++){ u8 c=((u8*)r)[i]; kdbg("%c", c>=32&&c<127? c : '.'); } kdbg("\n"); }
+  return r; }
+static void *WINAPI i_MapViewOfFileEx(u64 h, DWORD acc, DWORD hi, DWORD lo, u64 bytes, void *base){ (void)base; return i_MapViewOfFile(h,acc,hi,lo,bytes); }
 static void flush_map(struct fmap *m){ if(m->f && m->write) fs_file_write_at(m->f,0,m->base,m->size<m->f->size? m->f->size : m->size); }   /* file-backed: write the changes back */
-static BOOL WINAPI i_FlushViewOfFile(void *p, u64 n){ (void)n; for(int i=0;i<128;i++) if(V[i].p==(u8*)p){ flush_map(&M[V[i].map]); return 1; } return 0; }
+static BOOL WINAPI i_FlushViewOfFile(void *p, u64 n){ (void)n; for(int i=0;i<MAXVIEW;i++) if(V[i].p==(u8*)p){ flush_map(&M[V[i].map]); return 1; } return 0; }
 static BOOL WINAPI i_UnmapViewOfFile(void *p){
-  for(int i=0;i<128;i++) if(V[i].p==(u8*)p){ struct fmap *m=&M[V[i].map]; V[i].p=0; flush_map(m); m->views--; map_release(m); return 1; }
+  if(map_trace()) kdbg("  [map] UnmapViewOfFile(%p)\n",p);
+  for(int i=0;i<MAXVIEW;i++) if(V[i].p==(u8*)p){ struct fmap *m=&M[V[i].map]; V[i].p=0; flush_map(m); m->views--; map_release(m); return 1; }
   win32_set_last_error(ERR_INVALID_PARAMETER); return 0;
 }
 
@@ -152,8 +266,9 @@ static BOOL WINAPI i_UnlockFileEx(u64 h, DWORD r, DWORD lo, DWORD hi, void *ov){
 static BOOL WINAPI i_DeviceIoControl(u64 h, DWORD code, void *in, DWORD inl, void *out, DWORD outl, DWORD *ret, void *ov){ (void)h;(void)code;(void)in;(void)inl;(void)out;(void)outl;(void)ov; if(ret) *ret=0; win32_set_last_error(1); return 0; }
 static BOOL WINAPI i_SetFileInformationByHandle(u64 h, int cls, void *info, DWORD n){ (void)h;(void)cls;(void)info;(void)n; return 1; }
 static BOOL WINAPI i_GetFileInformationByHandleEx(u64 h, int cls, void *info, DWORD n){ (void)h;(void)cls;(void)info;(void)n; win32_set_last_error(87); return 0; }
-static BOOL WINAPI i_CancelIo(u64 h){ (void)h; return 1; }
-static BOOL WINAPI i_CancelIoEx(u64 h, void *ov){ (void)h;(void)ov; return 1; }
+static BOOL WINAPI i_CancelIo(u64 h){ pipe_cancel(h,0); return 1; }
+static BOOL WINAPI i_CancelIoEx(u64 h, u8 *ov){ if(!pipe_cancel(h,ov)){ win32_set_last_error(1168); return 0; } return 1; }   /* ERROR_NOT_FOUND: nothing was pending */
+static BOOL WINAPI i_CancelSynchronousIo(u64 h){ (void)h; win32_set_last_error(1168); return 0; }
 static BOOL WINAPI i_CreateSymbolicLinkW(const u16 *l, const u16 *t, DWORD f){ (void)l;(void)t;(void)f; win32_set_last_error(1314); return 0; }
 static BOOL WINAPI i_GetDiskFreeSpaceExW(const u16 *p, u64 *avail, u64 *total, u64 *free_){ char t[260]; if(p) w2a(p,t,260); BOOL (WINAPI *f)(const char*,u64*,u64*,u64*)=K32("GetDiskFreeSpaceExA"); return f? f(p? t : 0,avail,total,free_) : 0; }
 static DWORD final_path(u64 h, char *out, DWORD n, int wide){
@@ -167,9 +282,10 @@ static BOOL WINAPI i_ReadFileEx(u64 h, void *b, DWORD n, void *ov, void *cb){ (v
 
 #define I(n) {"kernel32", #n, i_##n}
 const struct export ipc_exports[] = {
-  I(CreatePipe), I(PeekNamedPipe), I(CreateNamedPipeA), I(CreateNamedPipeW), I(ConnectNamedPipe), I(DisconnectNamedPipe), I(WaitNamedPipeA), I(WaitNamedPipeW), I(SetNamedPipeHandleState), I(GetNamedPipeInfo), I(GetNamedPipeHandleStateA),
+  I(CreatePipe), I(PeekNamedPipe), I(CreateNamedPipeA), I(CreateNamedPipeW), I(ConnectNamedPipe), I(DisconnectNamedPipe), I(WaitNamedPipeA), I(WaitNamedPipeW), I(SetNamedPipeHandleState), I(GetNamedPipeInfo), I(GetNamedPipeClientProcessId), I(GetNamedPipeServerProcessId), I(GetNamedPipeHandleStateA),
   I(CreateFileMappingA), I(CreateFileMappingW), I(OpenFileMappingA), I(OpenFileMappingW), I(MapViewOfFile), I(MapViewOfFileEx), I(FlushViewOfFile), I(UnmapViewOfFile),
-  I(LockFile), {"kernel32","UnlockFile",i_LockFile}, I(LockFileEx), I(UnlockFileEx), I(DeviceIoControl), I(SetFileInformationByHandle), I(GetFileInformationByHandleEx), I(CancelIo), I(CancelIoEx), I(CreateSymbolicLinkW),
+  I(LockFile), {"kernel32","UnlockFile",i_LockFile}, I(LockFileEx), I(UnlockFileEx), I(DeviceIoControl), I(SetFileInformationByHandle), I(GetFileInformationByHandleEx), I(CancelIo), I(CancelIoEx), I(CancelSynchronousIo), I(GetOverlappedResult), I(GetOverlappedResultEx), I(CreateSymbolicLinkW),
   I(GetDiskFreeSpaceExW), I(GetFinalPathNameByHandleA), I(GetFinalPathNameByHandleW), I(ReadFileEx),
+  {"ntdll","NtQuerySection",i_NtQuerySection}, {"ntdll","ZwQuerySection",i_NtQuerySection},
 };
 const unsigned ipc_nexports = sizeof ipc_exports / sizeof *ipc_exports;

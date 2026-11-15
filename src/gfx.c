@@ -265,6 +265,18 @@ void gfx_line_aa(int x0,int y0,int x1,int y1,int thick16,u32 c){
   end();
 }
 
+/* like gfx_blit_stride, but the source's top byte is its alpha (premultiplied colour, as Windows' 32-bit DIBs): see-through
+   corners and shadows of popup windows (menus) show what is behind them */
+void gfx_blit_alpha(int x,int y,int w,int h,const u32 *src,int stride){
+  begin(x,y,w,h);
+  for(int j=0;j<h;j++){ int yy=y+j; if(yy<0||yy>=(int)gfx_h) continue; u32 *d=(u32*)(fb+(u64)yy*pitch); const u32 *s=src+(u64)j*stride;
+    for(int i=0;i<w;i++){ int xx=x+i; if(xx<0||xx>=(int)gfx_w) continue; u32 p=s[i], a=p>>24;
+      if(a==255){ d[xx]=p&0xFFFFFF; continue; } if(!a) continue;
+      u32 q=d[xx], ia=255-a;
+      u32 r=((p>>16)&255)+(((q>>16)&255)*ia)/255, g=((p>>8)&255)+(((q>>8)&255)*ia)/255, b=(p&255)+((q&255)*ia)/255;
+      d[xx]=((r>255?255:r)<<16)|((g>255?255:g)<<8)|(b>255?255:b); } }
+  end();
+}
 void gfx_blit_stride(int x,int y,int w,int h,const u32 *src,int stride){
   begin(x,y,w,h);
   for(int j=0;j<h;j++){ int yy=y+j; if(yy<0||yy>=(int)gfx_h) continue;

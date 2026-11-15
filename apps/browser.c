@@ -13,7 +13,7 @@ static void js_page_run(void); static void js_after(void); static int js_dispatc
 #define TOOLBAR 44
 #define STATUS 24
 #define SCROLLW 14
-#define MAXDOC (40 << 20)
+#define MAXDOC (256 << 20)                                  /* largest download; pages and images are capped lower inside http_request */
 #define MAXLINKS 4000
 
 /* ---------- fonts (hooks for the layout engine) ---------- */
@@ -129,7 +129,9 @@ static HANDLE open_request(const char *url, const char *method, const char *hdrs
   if(!r || !sendreq(r, hdrs && hdrs[0] ? hdrs : 0, hdrs ? (DWORD)strlen(hdrs) : 0, (void *)body, (DWORD)blen)){ if(r) API(wininet, InternetCloseHandle)(r); API(wininet, InternetCloseHandle)(c); return 0; }
   *conn = c; return r;
 }
+static char g_cdisp[200];                                  /* Content-Disposition of the last response (a download's real file name) */
 static unsigned char *http_request(const char *url, const char *method, const char *hdrs, const void *body, int blen, int maxbytes, int *outlen, char *ctype, int ctlen, char *final_url, int fulen, DWORD *status, int show_progress){
+  g_cdisp[0] = 0;
   if(!strncmp(url, "file://", 7)){
     HANDLE f = API(kernel32, CreateFileA)(url + 7, 0x80000000u, 1, 0, 3, 0x80, 0); if(f == (HANDLE)(long long)-1 || !f) return 0;
     DWORD sz = API(kernel32, GetFileSize)(f, 0); if(sz > (DWORD)maxbytes) sz = (DWORD)maxbytes;
@@ -143,8 +145,11 @@ static unsigned char *http_request(const char *url, const char *method, const ch
   if(final_url){ DWORD fl = (DWORD)fulen; if(!API(wininet, InternetQueryOptionA)(h, 34, final_url, &fl)) snprintf(final_url, fulen, "%s", url); }
   DWORD st = 0, sl = 4; API(wininet, HttpQueryInfoA)(h, 19 | 0x20000000, &st, &sl, 0); if(status) *status = st;
   if(ctype){ ctype[0] = 0; DWORD cl = (DWORD)ctlen; API(wininet, HttpQueryInfoA)(h, 1, ctype, &cl, 0); }
+  { DWORD cl = sizeof g_cdisp; if(!API(wininet, HttpQueryInfoA)(h, 47, g_cdisp, &cl, 0)) g_cdisp[0] = 0; }
   if(ctype && (!strncmp(ctype, "text/", 5) || !strncmp(ctype, "image/", 6) || strstr(ctype, "json") || strstr(ctype, "xml")) && maxbytes > (6 << 20)) maxbytes = 6 << 20;   /* pages and images stay small; downloads may be big */
-  int cap = 1 << 16, n = 0; unsigned char *buf = malloc(cap); if(!buf){ API(wininet, InternetCloseHandle)(h); if(conn) API(wininet, InternetCloseHandle)(conn); return 0; } DWORD got;
+  int cap = 1 << 16, n = 0;
+  { DWORD clen = 0, cll = 4; if(API(wininet, HttpQueryInfoA)(h, 5 | 0x20000000, &clen, &cll, 0) && clen > (DWORD)cap && clen <= (DWORD)maxbytes) cap = (int)clen + 4096; }   /* known size: one allocation instead of repeated doubling */
+  unsigned char *buf = malloc(cap); if(!buf){ API(wininet, InternetCloseHandle)(h); if(conn) API(wininet, InternetCloseHandle)(conn); return 0; } DWORD got;
   while(API(wininet, InternetReadFile)(h, buf + n, cap - n - 1, &got) && got){
     n += got;
     if(n + 4096 > cap){ if(cap >= maxbytes) break; cap *= 2; unsigned char *nb = realloc(buf, cap); if(!nb) break; buf = nb; }
@@ -326,13 +331,39 @@ static void push_history(const char *u){
   else { memmove(history[0], history[1], 62 * 700); snprintf(history[62], 700, "%s", u); hist_i = 62; hist_n = 63; }
 }
 /* A response that is not a page, text or image is a download: save it under Downloads and offer to run it. */
+/* the file name from a Content-Disposition header: filename*=UTF-8''my%20file.exe or filename="my file.exe" */
+static int disp_name(const char *cd, char *out, int max){
+  if(!cd || !*cd) return 0; const char *v = strstr(cd, "filename*="); int ext = v != 0; if(v) v += 10; else { v = strstr(cd, "filename="); if(!v) return 0; v += 9; }
+  if(ext){ const char *q = strstr(v, "''"); if(q) v = q + 2; }
+  int quoted = *v == '"'; if(quoted) v++; int k = 0;
+  for(; *v && k < max - 1 && (quoted ? *v != '"' : (*v != ';' && *v != ' ')); v++){
+    char c = *v; if(c == '%' && v[1] && v[2]){ int hi = isdigit((unsigned char)v[1]) ? v[1] - '0' : (tolower((unsigned char)v[1]) - 'a' + 10), lo = isdigit((unsigned char)v[2]) ? v[2] - '0' : (tolower((unsigned char)v[2]) - 'a' + 10); c = (char)(hi * 16 + lo); v += 2; }
+    if(c == '/' || c == '\\') { k = 0; continue; }                                  /* never a path */
+    if(isalnum((unsigned char)c) || c == '.' || c == '_' || c == '-' || c == '(' || c == ')') out[k++] = c; else if(c == ' ') out[k++] = '_';
+  }
+  out[k] = 0; return k > 0 && out[0] != '.';
+}
+/* a file name with no extension: guess one from the first bytes (or the content type) so executables stay runnable */
+static const char *sniff_ext(const unsigned char *d, int n, const char *ctype){
+  if(n >= 2 && d[0] == 'M' && d[1] == 'Z') return ".exe";
+  if(n >= 4 && d[0] == 'P' && d[1] == 'K' && d[2] == 3 && d[3] == 4) return ".zip";
+  if(n >= 4 && !memcmp(d, "%PDF", 4)) return ".pdf";
+  if(n >= 6 && !memcmp(d, "7z\xBC\xAF\x27\x1C", 6)) return ".7z";
+  if(n >= 8 && d[0] == 0xD0 && d[1] == 0xCF && d[2] == 0x11 && d[3] == 0xE0) return ".msi";
+  if(n >= 4 && !memcmp(d, "\x89PNG", 4)) return ".png";
+  if(ctype && strstr(ctype, "zip")) return ".zip";
+  return 0;
+}
 static void save_download(const unsigned char *data, int n, const char *final_url, const char *ctype, int gen){
   char name[96]; int k = 0; const char *p = strstr(final_url, "://"); p = p ? p + 3 : final_url; const char *last = p; for(const char *q = p; *q && *q != '?' && *q != '#'; q++) if(*q == '/') last = q + 1;
   for(const char *q = last; *q && *q != '?' && *q != '#' && k < 90; q++){ char c = *q; if(isalnum((unsigned char)c) || c == '.' || c == '_' || c == '-') name[k++] = c; else if(c == '%' && q[1] == '2' && q[2] == '0'){ name[k++] = '_'; q += 2; } else if(c == ' ') name[k++] = '_'; }
   name[k] = 0; if(!k || name[0] == '.'){ strcpy(name, "download.bin"); k = (int)strlen(name); }
+  { char dn[96]; if(disp_name(g_cdisp, dn, sizeof dn)){ strcpy(name, dn); k = (int)strlen(name); } }                  /* the server's own file name wins */
+  if(!strchr(name, '.')){ const char *e = sniff_ext(data, n, ctype); if(e && k + 5 < (int)sizeof name){ strcpy(name + k, e); k += (int)strlen(e); } }
   API(kernel32, CreateDirectoryA)("Downloads", 0);
   char path[160]; snprintf(path, sizeof path, "Downloads\\%s", name);
   HANDLE f = API(kernel32, CreateFileA)(path, 0x40000000u, 0, 0, 2, 0x80, 0); int ok = f != (HANDLE)~0ull && f;
+  if(ok && n > (1 << 20)){ API(kernel32, SetFilePointer)(f, n, 0, 0); ok = API(kernel32, SetEndOfFile)(f) != 0; API(kernel32, SetFilePointer)(f, 0, 0, 0); }   /* big download: reserve the whole file in one allocation */
   int written = 0;
   if(ok){ while(written < n){ DWORD chunk = (DWORD)(n - written > 65536 ? 65536 : n - written), w = 0; if(!API(kernel32, WriteFile)(f, data + written, chunk, &w, 0) || !w) break; written += (int)w; } API(kernel32, CloseHandle)(f); }
   char html[1800]; int is_exe = k > 4 && !strcasecmp_(name + k - 4, ".exe"); int hn;

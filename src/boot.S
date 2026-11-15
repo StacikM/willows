@@ -127,6 +127,15 @@ ctx_switch:
     pop %rbp
     ret
 
+/* first activation of a new thread (thread.c): same as proc_start */
+.global thread_start
+thread_start:
+    sti
+    and $-16, %rsp
+    call thread_main
+1:  hlt
+    jmp 1b
+
 /* first activation of a new process: the initial stack "returns" here */
 .global proc_start
 proc_start:
@@ -247,9 +256,158 @@ isr_common:
     pop %rax
     iretq
 .endm
-IRQ irq0_stub, timer_tick, 0
+/* The timer: as the IRQ stubs above, plus preemption. When it interrupts a program's own code (not the kernel's) after the
+   thread's time slice, timer_preempt switches to another thread (schedule); this thread continues here later. The interrupted
+   code may have anything live, so the whole FPU/SSE state is kept too (fxsave), on this thread's own stack. */
+.global irq0_stub
+irq0_stub:
+    push %rax
+    push %rcx
+    push %rdx
+    push %rsi
+    push %rdi
+    push %r8
+    push %r9
+    push %r10
+    push %r11
+    push %rbp
+    mov %rsp, %rbp
+    and $-16, %rsp
+    sub $512, %rsp
+    fxsave64 (%rsp)
+    cld
+    call timer_tick
+    mov $0x20, %al
+    out %al, $0x20                      /* EOI first: the next thread must get timer interrupts */
+    mov 80(%rbp), %rdi                  /* interrupted rip */
+    mov 88(%rbp), %rsi                  /* interrupted cs */
+    call timer_preempt
+    cli                                 /* resumed (or not switched): finish with interrupts off until iretq */
+    fxrstor64 (%rsp)
+    mov %rbp, %rsp
+    pop %rbp
+    pop %r11
+    pop %r10
+    pop %r9
+    pop %r8
+    pop %rdi
+    pop %rsi
+    pop %rdx
+    pop %rcx
+    pop %rax
+    iretq
 IRQ irq1_stub, keyboard_irq, 0
 IRQ irq12_stub, mouse_irq, 1
+
+/* ---------------------------------------------------------------------------------------------------------------
+   32-bit (WOW64-style) support. A 32-bit Windows program runs in compatibility mode (CS=0x18) on its own stack below 4 GB.
+   Its imports point at small stubs ("push <index>; jmp wow_common32"). wow_common32 jumps into 64-bit code, wow_thunk64 turns the
+   32-bit stdcall arguments into a Win64 call of the real implementation (wow_table[index]), then returns to 32-bit mode and pops the
+   arguments (stdcall). wow_enter starts the program; when its entry function returns, wow_ret32 brings control back.
+   --------------------------------------------------------------------------------------------------------------- */
+.section .text
+.code32
+.global wow_common32
+wow_common32:
+    ljmp $0x08, $wow_thunk64
+.global wow_ret32
+wow_ret32:                          /* the program's entry returned: [esp] = pointer to the saved-rsp slot, eax = exit value */
+    movl (%esp), %ecx
+    ljmp $0x08, $wow_back64
+.code64
+wow_thunk64:                        /* stack: [esp] = table index (4 bytes), then the 32-bit return address, then the arguments */
+    mov %esp, %esp                  /* zero-extend the 32-bit stack pointer */
+    movl (%rsp), %eax
+    add $4, %rsp
+    mov wow_pos(%rip), %ecx         /* remember the last 32 calls in a ring (shown when the program crashes or hangs) */
+    lea wow_ring(%rip), %r10
+    mov %eax, (%r10,%rcx,4)
+    inc %ecx
+    and $31, %ecx
+    mov %ecx, wow_pos(%rip)
+    shl $4, %rax
+    lea wow_table(%rip), %r11
+    add %rax, %r11
+    push %r12
+    push %r13
+    lea 16(%rsp), %r12              /* r12 -> the 32-bit return address, arguments follow */
+    movl 8(%r11), %r13d             /* number of 32-bit argument slots */
+    mov (%r11), %r10                /* the Win64 function */
+    sub $128, %rsp
+    and $-16, %rsp
+    movl 4(%r12), %ecx              /* first four arguments in registers, the rest on the stack (zero-extended) */
+    movl 8(%r12), %edx
+    movl 12(%r12), %r8d
+    movl 16(%r12), %r9d
+    movl 20(%r12), %eax
+    mov %rax, 32(%rsp)
+    movl 24(%r12), %eax
+    mov %rax, 40(%rsp)
+    movl 28(%r12), %eax
+    mov %rax, 48(%rsp)
+    movl 32(%r12), %eax
+    mov %rax, 56(%rsp)
+    movl 36(%r12), %eax
+    mov %rax, 64(%rsp)
+    movl 40(%r12), %eax
+    mov %rax, 72(%rsp)
+    movl 44(%r12), %eax
+    mov %rax, 80(%rsp)
+    movl 48(%r12), %eax
+    mov %rax, 88(%rsp)
+    call *%r10
+    mov %rax, (%rsp)
+    mov %rsi, 96(%rsp)              /* esi/edi belong to the 32-bit program, but win32_set_context (System V) is free to clobber them */
+    mov %rdi, 104(%rsp)
+    mov cur(%rip), %rdi             /* the call may have switched processes: reload this process's GS and FS */
+    call win32_set_context
+    mov 96(%rsp), %rsi
+    mov 104(%rsp), %rdi
+    mov (%rsp), %rax
+    movl (%r12), %ecx               /* 32-bit return address */
+    lea 4(%r12,%r13,4), %rdx        /* esp after the callee pops its arguments (stdcall) */
+    mov -8(%r12), %r10              /* saved r12 */
+    mov -16(%r12), %r11             /* saved r13 */
+    lea -16(%rdx), %rsp             /* free stack below the final esp: build the far-return frame there */
+    mov %rcx, (%rsp)
+    movq $0x18, 8(%rsp)
+    mov %r10, %r12
+    mov %r11, %r13
+    lretq                           /* back to 32-bit mode, eax = result */
+.comm wow_ring, 128, 8
+.comm wow_pos, 4, 4
+.global wow_enter
+wow_enter:                          /* void wow_enter(u64 entry32, u64 esp32, u64 *save_slot): returns the program's eax */
+    push %rbx
+    push %rbp
+    push %r12
+    push %r13
+    push %r14
+    push %r15
+    mov %rsp, (%rdx)
+    mov %esi, %esi
+    lea -8(%rsi), %rsi              /* 32-bit stack: [esp] = wow_ret32, [esp+4] = the save slot */
+    movl $wow_ret32, (%rsi)
+    mov %edx, 4(%rsi)
+    mov $0x20, %ax
+    mov %ax, %fs                    /* FS base = this program's TEB */
+    mov %rsi, %rsp
+    sub $16, %rsp
+    mov %rdi, (%rsp)
+    movq $0x18, 8(%rsp)
+    xor %eax, %eax
+    lretq
+wow_back64:                         /* entered from wow_ret32 in 64-bit mode: rcx = save slot, eax = result */
+    mov %ecx, %ecx
+    mov %eax, %eax
+    mov (%rcx), %rsp
+    pop %r15
+    pop %r14
+    pop %r13
+    pop %r12
+    pop %rbp
+    pop %rbx
+    ret
 
 .section .rodata
 .global isr_table
@@ -261,10 +419,16 @@ isr_table:
 
 .section .data
 .align 8
+.global gdt64
 gdt64:
     .quad 0
     .quad 0x00AF9A000000FFFF           /* 0x08 64-bit code */
     .quad 0x00CF92000000FFFF           /* 0x10 data */
+    .quad 0x00CF9A000000FFFF           /* 0x18 32-bit code (compatibility mode: 32-bit Windows programs) */
+    .quad 0x00CF92000000FFFF           /* 0x20 data whose base is the running 32-bit program's TEB (loaded into FS) */
+.global gdt64_tss
+gdt64_tss:
+    .quad 0, 0                         /* 0x28 the TSS (16-byte system descriptor, filled in by idt.c): page faults run on their own stack */
 gdt64_desc:
     .word gdt64_desc - gdt64 - 1
     .long gdt64

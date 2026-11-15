@@ -253,7 +253,7 @@ static void dib_row(const u8 *bits, const u8 *bmi, int row, int w, u32 *out){   
   for(int x = 0; x < w; x++){ if(bpp == 32) out[x] = ((const u32 *)r)[x] & 0xFFFFFF; else if(bpp == 24) out[x] = ((u32)r[x * 3 + 2] << 16) | ((u32)r[x * 3 + 1] << 8) | r[x * 3]; else if(bpp == 8) out[x] = (u32)r[x] * 0x010101; else out[x] = 0; }
 }
 static i32 WINAPI w_SetDIBitsToDevice(u64 dc, i32 x, i32 y, u32 w, u32 h, i32 xs, i32 ys, u32 start, u32 lines, const void *bits, const u8 *bmi, u32 usage){
-  (void)usage; (void)start; (void)lines; struct wnd *t = dc_target(dc); if(!t || !bits || !bmi) return 0; int bw = *(const i32 *)(bmi + 4); int bpp = *(const u16 *)(bmi + 14); if(bpp != 32 && bpp != 24 && bpp != 8) return 0;
+  (void)usage; (void)start; (void)lines; struct wnd *t = dc_target(dc);  if(!t || !bits || !bmi) return 0; int bw = *(const i32 *)(bmi + 4); int bpp = *(const u16 *)(bmi + 14); if(bpp != 32 && bpp != 24 && bpp != 8) return 0;
   int bh = *(const i32 *)(bmi + 8); int td = bh < 0; if(td) bh = -bh; int cl[4]; int hc = dc_clip(dc, cl); static u32 row[4096]; if(bw > 4096) bw = 4096;
   for(u32 j = 0; j < h; j++){ int srow = ys + (int)j; if(srow < 0 || srow >= bh) continue; int py = y + (int)j; if(py < 0 || py >= t->ph || (hc && (py < cl[1] || py >= cl[3]))) continue; dib_row(bits, bmi, srow, bw, row);
     for(u32 i = 0; i < w; i++){ int sx = xs + (int)i; if(sx < 0 || sx >= bw) continue; int px = x + (int)i; if(px < 0 || px >= t->pw || (hc && (px < cl[0] || px >= cl[2]))) continue; t->pix[(u64)py * t->stride + px] = row[sx]; } }
