@@ -139,4 +139,8 @@ Willows runs 32-bit (PE32) Windows programs in the CPU's compatibility mode (`sr
 - **Security objects** (`src/security.c`): real SIDs, ACLs, security descriptors and token queries (Willows enforces no access checks).
 - **Modules**: DLLs are found in the program's folder first; built-in DLLs (`ntdll`, `kernel32`, ...) have small real PE images with export tables; `GetProcAddress` works on the program itself; `GetModuleHandleEx(FROM_ADDRESS)`; imports by ordinal (Winsock, oleaut32). The Windows App SDK (WinUI 3) needs WinRT and is reported as missing.
 - **Windows**: message queues are per thread (`PeekMessage` honours `PM_NOREMOVE` and filters, `PostThreadMessage`), 64 window classes with long names and atoms, `GetClassInfo`, message-only windows, registered messages, DPI functions, `EnumDisplayDevices`, `SystemParametersInfoW`.
-- Status: LibreWolf 159 starts 15+ threads, loads `xul.dll`, runs its JavaScript engine and creates its windows, then stops at `MOZ_CRASH(Could not initialize gfxPlatformFontList)`: Firefox needs DirectWrite, which Willows does not have yet. See `tools/dev/README.md` for the test and debugging tools.
+- Status: LibreWolf 159 (portable) runs with its usual set of processes in a 6 GB machine: HTTPS sites, YouTube pages, extensions (uBlock Origin), downloads with a save dialog, menus and its own title bar. Video playback is not working yet (the decoder process fails to start). See `tools/dev/README.md` for the test and debugging tools.
+
+## License
+Willows is free software under the GNU General Public License, version 3 (see `LICENSE`): you may use, study, change and share it, and anything you distribute that is built from it must be released under the same license, with its source.
+Third-party parts keep their own licenses: BearSSL (`third_party/bearssl/LICENSE.txt`, MIT), QuickJS (`apps/qjs/LICENSE`, MIT), and the Open Sans and Hack fonts (`files/Windows/Fonts/LICENSE-*.txt`).
