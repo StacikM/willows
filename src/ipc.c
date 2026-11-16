@@ -270,8 +270,44 @@ static BOOL WINAPI i_LockFile(u64 h, DWORD a, DWORD b, DWORD c, DWORD d){ (void)
 static BOOL WINAPI i_LockFileEx(u64 h, DWORD fl, DWORD r, DWORD lo, DWORD hi, void *ov){ (void)h;(void)fl;(void)r;(void)lo;(void)hi;(void)ov; return 1; }
 static BOOL WINAPI i_UnlockFileEx(u64 h, DWORD r, DWORD lo, DWORD hi, void *ov){ (void)h;(void)r;(void)lo;(void)hi;(void)ov; return 1; }
 static BOOL WINAPI i_DeviceIoControl(u64 h, DWORD code, void *in, DWORD inl, void *out, DWORD outl, DWORD *ret, void *ov){ (void)h;(void)code;(void)in;(void)inl;(void)out;(void)outl;(void)ov; if(ret) *ret=0; win32_set_last_error(1); return 0; }
-static BOOL WINAPI i_SetFileInformationByHandle(u64 h, int cls, void *info, DWORD n){ (void)h;(void)cls;(void)info;(void)n; return 1; }
-static BOOL WINAPI i_GetFileInformationByHandleEx(u64 h, int cls, void *info, DWORD n){ (void)h;(void)cls;(void)info;(void)n; win32_set_last_error(87); return 0; }
+/* SetFileInformationByHandle / GetFileInformationByHandleEx on files. Firefox's downloads move the finished ".part" file into place by
+   renaming through the handle, and Rust's std reads sizes and attributes this way; both used to be no-ops / failures. */
+int fs_handle_rename(u64 h, const char *dst, int replace); int fs_handle_setsize(u64 h, u64 size); int fs_handle_delete(u64 h);
+static int file_info_trace(void){ struct ramfile *f=fs_find("/System/apitrace.cfg"); return f && !f->isdir; }
+static BOOL WINAPI i_SetFileInformationByHandle(u64 h, int cls, void *info, DWORD n){
+  if(!fs_handle_file(h) || !info){ if(pipe_is_handle(h)) return 1; win32_set_last_error(ERR_INVALID_HANDLE); return 0; }
+  int e=0; u8 *in=info;
+  switch(cls){
+    case 3: case 22: {                                                                   /* FileRenameInfo(Ex): flags/replace at 0, name length at 16, name at 20 */
+      if(n<20){ e=87; break; }
+      u32 len=*(u32 *)(in+16)/2; char t[260]; u32 i=0; const u16 *w=(const u16 *)(in+20);
+      for(;i<len && i<259;i++) t[i]= w[i]<0x80? (char)w[i] : '_'; t[i]=0;
+      const char *p=t; if(p[0]=='\\' && p[1]=='?' && p[2]=='?' && p[3]=='\\') p+=4; if(p[0]=='\\' && p[1]=='\\' && p[2]=='?' && p[3]=='\\') p+=4;   /* \??\C:\... */
+      int replace= cls==3? in[0]!=0 : (*(u32 *)in&1)!=0;
+      e=fs_handle_rename(h,p,replace);
+      if(file_info_trace()) kdbg("  [file] rename by handle %p -> %s (replace %d) = error %d\n",(void*)h,p,replace,e);
+      break; }
+    case 4: if(n>=1 && in[0]) e=fs_handle_delete(h); break;                               /* FileDispositionInfo */
+    case 21: if(n>=4 && (*(u32 *)in&1)) e=fs_handle_delete(h); break;                     /* FileDispositionInfoEx: FILE_DISPOSITION_FLAG_DELETE */
+    case 6: if(n<8){ e=87; break; } e=fs_handle_setsize(h,*(u64 *)in); break;            /* FileEndOfFileInfo */
+    default: break;                                                                      /* basic info (times), allocation size, priority hints: accepted */
+  }
+  if(e){ win32_set_last_error((u32)e); return 0; } return 1;
+}
+static BOOL WINAPI i_GetFileInformationByHandleEx(u64 h, int cls, void *info, DWORD n){
+  struct ramfile *f=fs_handle_file(h); if(!f || !info){ win32_set_last_error(ERR_INVALID_HANDLE); return 0; }
+  u8 *o=info; u64 t=fs_mtime(f); u32 attr= f->isdir? 0x10 : 0x80;
+  switch(cls){
+    case 0: if(n<40) break; memset(o,0,40); for(int i=0;i<4;i++) *(u64 *)(o+i*8)=t; *(u32 *)(o+32)=attr; return 1;            /* FileBasicInfo */
+    case 1: if(n<24) break; memset(o,0,24); *(u64 *)o=(f->size+4095)&~4095ull; *(u64 *)(o+8)=f->size; *(u32 *)(o+16)=1; o[21]=(u8)f->isdir; return 1;   /* FileStandardInfo */
+    case 2: { if(n<6) break; u32 k=0, max=(n-4)/2; u16 *w=(u16 *)(o+4);                 /* FileNameInfo: the path without the drive */
+      if(k<max) w[k++]='\\'; for(const char *q=f->name; *q && k<max; q++) w[k++]= *q=='/'? '\\' : (u8)*q;
+      *(u32 *)o=k*2; return 1; }
+    case 9: if(n<8) break; *(u32 *)o=attr; *(u32 *)(o+4)=0; return 1;                    /* FileAttributeTagInfo */
+    default: win32_set_last_error(87); return 0;
+  }
+  win32_set_last_error(24); return 0;                                                    /* ERROR_BAD_LENGTH */
+}
 static BOOL WINAPI i_CancelIo(u64 h){ pipe_cancel(h,0); return 1; }
 static BOOL WINAPI i_CancelIoEx(u64 h, u8 *ov){ if(!pipe_cancel(h,ov)){ win32_set_last_error(1168); return 0; } return 1; }   /* ERROR_NOT_FOUND: nothing was pending */
 static BOOL WINAPI i_CancelSynchronousIo(u64 h){ (void)h; win32_set_last_error(1168); return 0; }

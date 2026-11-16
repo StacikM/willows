@@ -586,6 +586,7 @@ static BOOL WINAPI_ t_DuplicateHandle(HANDLE sp, HANDLE sh, HANDLE tp, HANDLE *t
     int tpid= tp>=0x8000 && tp<0x8000+MAXPROC? (int)(tp-0x8000) : cur->pid, spid= sp>=0x8000 && sp<0x8000+MAXPROC? (int)(sp-0x8000) : cur->pid;
     pipe_addref_for(sh,tpid); if(opt&1) pipe_close_for(sh,spid); }
   if(map_is_handle(sh)){ map_addref(sh); if(opt&1) map_close(sh); }              /* file mappings are reference-counted too */
+  if(fs_is_handle(sh)){ extern void fs_haddref(u64); fs_haddref(sh); if(opt&1) fs_hclose(sh); }   /* and files */
   if(th) *th=sh; return 1;                                         /* other handles are global: a duplicate is the same value */
 }
 /* C runtime thread functions */

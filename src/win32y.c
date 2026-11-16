@@ -67,7 +67,7 @@ static void WINAPI y_OleUninitialize(void){ y_CoUninitialize(); }
 static long WINAPI y_CoInitializeSecurity(void *a, i32 b, void *c, void *d, DWORD e, DWORD f, void *g, DWORD h, void *i){ (void)a;(void)b;(void)c;(void)d;(void)e;(void)f;(void)g;(void)h;(void)i; return 0; }
 static long WINAPI y_CoSetProxyBlanket(void *a, DWORD b, DWORD c, void *d, DWORD e, DWORD f, void *g, DWORD h){ (void)a;(void)b;(void)c;(void)d;(void)e;(void)f;(void)g;(void)h; return 0; }
 static long WINAPI y_CoGetClassObject(const void *c, DWORD ctx, void *s, const void *iid, void **out){ (void)c;(void)ctx;(void)s;(void)iid; if(out) *out=0; return (long)0x80040154; }   /* REGDB_E_CLASSNOTREG */
-static long WINAPI y_CoCreateInstanceEx(const void *c, void *o, DWORD ctx, void *s, DWORD n, void *q){ (void)c;(void)o;(void)ctx;(void)s;(void)n;(void)q; return (long)0x80040154; }
+static long WINAPI y_CoCreateInstanceEx(const u8 *c, void *o, DWORD ctx, void *s, DWORD n, u8 *q);   /* (below, with the built-in COM classes) */
 static void WINAPI y_CoFreeUnusedLibraries(void){}
 static long WINAPI y_CoCreateGuid(u8 *g){ random_bytes(g,16); g[7]=(g[7]&0x0F)|0x40; g[8]=(g[8]&0x3F)|0x80; return 0; }
 static const char HEXD[]="0123456789ABCDEF";
@@ -318,6 +318,157 @@ static u32 WINAPI y_timeGetDevCaps(u32 *tc, u32 n){ if(!tc || n<8) return 97; tc
 static u32 WINAPI y_GetShortPathNameW(const u16 *src, u16 *dst, u32 n){ u32 l=0; while(src[l]) l++; if(!dst || n<=l) return l+1; memcpy(dst,src,((u64)l+1)*2); return l; }
 
 #define YP(n) {"psapi", #n, y_##n}
+/* ================= the common file dialogs as COM objects =================
+   Firefox (and most modern programs) ask for a file through CoCreateInstance(CLSID_FileSaveDialog / FileOpenDialog), then
+   IFileDialog::Show and GetResult -> IShellItem::GetDisplayName. These objects run Willows' own dialog (comdlg32 GetSave/OpenFileNameA).
+   Without them a download that asks where to save failed ("The Windows file-dialog could not be opened"). */
+#define S_OK_ 0
+#define E_NOINTERFACE_ ((long)0x80004002)
+#define E_NOTIMPL_ ((long)0x80004001)
+#define E_UNEXPECTED_ ((long)0x8000FFFF)
+#define E_POINTER_ ((long)0x80004003)
+static int guid_is(const u8 *g, u32 d1, u16 d2, u16 d3, const char *d4){   /* d4: 16 hex digits */
+  if(!g || *(const u32 *)g!=d1 || *(const u16 *)(g+4)!=d2 || *(const u16 *)(g+6)!=d3) return 0;
+  for(int i=0;i<8;i++){ int hi=d4[2*i], lo=d4[2*i+1]; hi= hi<='9'? hi-'0' : (hi|32)-'a'+10; lo= lo<='9'? lo-'0' : (lo|32)-'a'+10; if(g[8+i]!=(u8)(hi*16+lo)) return 0; }
+  return 1;
+}
+#define IS_IUNKNOWN(g)     guid_is(g,0x00000000,0x0000,0x0000,"c000000000000046")
+#define IS_ISHELLITEM(g)   guid_is(g,0x43826d1e,0xe718,0x42ee,"bc55a1e261c37bfe")
+#define IS_ISHELLITEMARR(g) guid_is(g,0xb63ea76d,0x1f85,0x456f,"a19c48159efa858b")
+#define IS_IMODALWINDOW(g) guid_is(g,0xb4db1657,0x70d7,0x485e,"8e3e6fcb5a5c1802")
+#define IS_IFILEDIALOG(g)  guid_is(g,0x42f85136,0xdb7e,0x439c,"85f1e4075d135fc8")
+#define IS_IFILESAVE(g)    guid_is(g,0x84bccd23,0x5fde,0x4cdb,"aea4af64b83d78ab")
+#define IS_IFILEOPEN(g)    guid_is(g,0xd57c7288,0xd4ad,0x4768,"be029d969532d960")
+#define IS_CLSID_FILEOPEN(g) guid_is(g,0xdc1c5a9c,0xe88a,0x4dde,"a5a160f82a20aef7")
+#define IS_CLSID_FILESAVE(g) guid_is(g,0xc0b4e2f3,0xba21,0x4773,"8dba335ec946eb8b")
+static u16 *co_wdup(const u16 *s){ int n=wlen(s); u16 *d=y_CoTaskMemAlloc((u64)(n+1)*2); if(d){ memcpy(d,s,(u64)n*2); d[n]=0; } return d; }
+static void wcpy(u16 *d, const u16 *s, int max){ int i=0; for(;s && s[i] && i<max-1;i++) d[i]=s[i]; d[i]=0; }
+
+/* ---- IShellItem: a file or folder by its path ---- */
+struct sitem { void **vt; long refs; u16 path[260]; };
+static void *sitem_vt[8];
+static struct sitem *sitem_new(const u16 *path);
+static long WINAPI si_QueryInterface(struct sitem *s, const u8 *iid, void **out){
+  if(!out) return E_POINTER_; if(IS_IUNKNOWN(iid) || IS_ISHELLITEM(iid)){ s->refs++; *out=s; return S_OK_; } *out=0; return E_NOINTERFACE_; }
+static u32 WINAPI si_AddRef(struct sitem *s){ return (u32)++s->refs; }
+static u32 WINAPI si_Release(struct sitem *s){ long r=--s->refs; if(r<=0){ heap_free(s); return 0; } return (u32)r; }
+static long WINAPI si_BindToHandler(struct sitem *s, void *bc, const u8 *h, const u8 *iid, void **out){ (void)s;(void)bc;(void)h;(void)iid; if(out) *out=0; return E_NOTIMPL_; }
+static long WINAPI si_GetParent(struct sitem *s, void **out){
+  if(!out) return E_POINTER_; u16 p[260]; wcpy(p,s->path,260); int n=wlen(p); while(n>0 && p[n-1]!='\\' && p[n-1]!='/') n--;
+  if(n<=3){ *out=0; return (long)0x80004005; } p[n-1]=0; *out=sitem_new(p); return *out? S_OK_ : (long)0x8007000E; }
+static long WINAPI si_GetDisplayName(struct sitem *s, u32 sigdn, u16 **out){
+  if(!out) return E_POINTER_;
+  if(sigdn==0 || sigdn==0x80018001){ const u16 *b=s->path; for(const u16 *q=s->path;*q;q++) if(*q=='\\' || *q=='/') b=q+1; *out=co_wdup(*b? b : s->path); }   /* NORMALDISPLAY, PARENTRELATIVEPARSING: the leaf */
+  else *out=co_wdup(s->path);                                                                   /* FILESYSPATH, DESKTOPABSOLUTEPARSING, ... */
+  return *out? S_OK_ : (long)0x8007000E;
+}
+static long WINAPI si_GetAttributes(struct sitem *s, u32 mask, u32 *attr){
+  char a[260]; w2a(s->path,a,260); u32 v=0x40000000u | (fs_isdir(a)? 0x20000000u : 0);      /* SFGAO_FILESYSTEM, SFGAO_FOLDER */
+  if(attr) *attr=v&mask; return (v&mask)==mask? S_OK_ : 1; }
+static long WINAPI si_Compare(struct sitem *s, struct sitem *o, u32 hint, int *order){
+  (void)hint; char a[260], b[260]; w2a(s->path,a,260); w2a(o? o->path : (const u16 *)u"",b,260); int r=stricmp(a,b); if(order) *order=r; return r? 1 : S_OK_; }
+static struct sitem *sitem_new(const u16 *path){
+  if(!sitem_vt[0]){ void *v[8]={(void*)si_QueryInterface,(void*)si_AddRef,(void*)si_Release,(void*)si_BindToHandler,(void*)si_GetParent,(void*)si_GetDisplayName,(void*)si_GetAttributes,(void*)si_Compare}; memcpy(sitem_vt,v,sizeof v); }
+  struct sitem *s=heap_alloc_prog(sizeof *s); if(!s) return 0; s->vt=sitem_vt; s->refs=1; wcpy(s->path,path,260); return s;
+}
+static long WINAPI y_SHCreateItemFromParsingName(const u16 *path, void *bc, const u8 *iid, void **out){
+  (void)bc; if(!out) return E_POINTER_; *out=0; if(!path) return (long)0x80070057;
+  char a[260]; w2a(path,a,260); if(!fs_find(a) && !fs_isdir(a)) return (long)0x80070002;     /* HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND) */
+  struct sitem *s=sitem_new(path); if(!s) return (long)0x8007000E;
+  long r=si_QueryInterface(s,iid,out); si_Release(s); return r;
+}
+
+/* ---- IShellItemArray with one item (IFileOpenDialog::GetResults) ---- */
+struct sarr { void **vt; long refs; struct sitem *item; };
+static long WINAPI sa_QueryInterface(struct sarr *a, const u8 *iid, void **out){
+  if(!out) return E_POINTER_; if(IS_IUNKNOWN(iid) || IS_ISHELLITEMARR(iid)){ a->refs++; *out=a; return S_OK_; } *out=0; return E_NOINTERFACE_; }
+static u32 WINAPI sa_AddRef(struct sarr *a){ return (u32)++a->refs; }
+static u32 WINAPI sa_Release(struct sarr *a){ long r=--a->refs; if(r<=0){ si_Release(a->item); heap_free(a); return 0; } return (u32)r; }
+static long WINAPI sa_NotImpl(void){ return E_NOTIMPL_; }
+static long WINAPI sa_GetCount(struct sarr *a, u32 *n){ (void)a; if(n) *n=1; return S_OK_; }
+static long WINAPI sa_GetItemAt(struct sarr *a, u32 i, void **out){ if(!out) return E_POINTER_; if(i){ *out=0; return (long)0x80070057; } a->item->refs++; *out=a->item; return S_OK_; }
+static void *sarr_vt[10];
+
+/* ---- IFileOpenDialog / IFileSaveDialog ---- */
+struct fdlg { void **vt; long refs; int save; u32 options, typeindex; u16 name[260], folder[260], title[128], defext[16], result[260]; int has_result; };
+static void *fdlg_vt[32];
+static long WINAPI fd_QueryInterface(struct fdlg *d, const u8 *iid, void **out){
+  if(!out) return E_POINTER_;
+  if(IS_IUNKNOWN(iid) || IS_IMODALWINDOW(iid) || IS_IFILEDIALOG(iid) || (d->save && IS_IFILESAVE(iid)) || (!d->save && IS_IFILEOPEN(iid))){ d->refs++; *out=d; return S_OK_; }
+  *out=0; return E_NOINTERFACE_;                                                               /* IFileDialogCustomize etc.: optional, callers cope */
+}
+static u32 WINAPI fd_AddRef(struct fdlg *d){ return (u32)++d->refs; }
+static u32 WINAPI fd_Release(struct fdlg *d){ long r=--d->refs; if(r<=0){ heap_free(d); return 0; } return (u32)r; }
+static long WINAPI fd_Show(struct fdlg *d, HANDLE owner){
+  char file[260]="", dir[260]="", title[128]="", ext[16]=""; w2a(d->name,file,260); w2a(d->folder,dir,260); w2a(d->title,title,128); w2a(d->defext,ext,16);
+  if(!dir[0]){ u16 *p=0; static const u8 downloads[16]={0x90,0xe2,0x4d,0x37,0x3f,0x12,0x65,0x45,0x91,0x64,0x39,0xc4,0x92,0x5e,0x46,0x7b};   /* FOLDERID_Downloads */
+    if(d->save && y_SHGetKnownFolderPath(downloads,0,0,&p)==0 && p){ w2a(p,dir,260); y_CoTaskMemFree(p); } }
+  u8 ofn[152]; memset(ofn,0,sizeof ofn); *(u32 *)ofn=152; *(u64 *)(ofn+8)=owner;
+  *(char **)(ofn+48)=file; *(u32 *)(ofn+56)=260; *(char **)(ofn+80)= dir[0]? dir : 0; *(char **)(ofn+88)= title[0]? title : 0; *(char **)(ofn+104)= ext[0]? ext : 0;
+  i32 (WINAPI *f)(u8 *)=win32_resolve("comdlg32", d->save? "GetSaveFileNameA" : "GetOpenFileNameA");
+  if(!f || !f(ofn)) return (long)0x800704C7;                                                    /* HRESULT_FROM_WIN32(ERROR_CANCELLED) */
+  int dot=0; for(const char *q=file;*q;q++){ if(*q=='.') dot=1; if(*q=='\\' || *q=='/') dot=0; }
+  if(d->save && ext[0] && !dot && strlen(file)+strlen(ext)+2<260){ cat_(file,"."); cat_(file,ext); }
+  char full[260]; if(file[1]==':') memcpy(full,file,strlen(file)+1); else { BOOL (WINAPI *gf)(const char*,DWORD,char*,char**)=K32("GetFullPathNameA"); if(!gf || !gf(file,260,full,0)) memcpy(full,file,strlen(file)+1); }
+  a2w(full,d->result,260); d->has_result=1; return S_OK_;
+}
+static long WINAPI fd_SetFileTypes(struct fdlg *d, u32 n, const void *specs){ (void)d;(void)n;(void)specs; return S_OK_; }
+static long WINAPI fd_SetFileTypeIndex(struct fdlg *d, u32 i){ d->typeindex=i; return S_OK_; }
+static long WINAPI fd_GetFileTypeIndex(struct fdlg *d, u32 *i){ if(!i) return E_POINTER_; *i= d->typeindex? d->typeindex : 1; return S_OK_; }
+static long WINAPI fd_Advise(struct fdlg *d, void *sink, u32 *cookie){ (void)d;(void)sink; if(cookie) *cookie=1; return S_OK_; }
+static long WINAPI fd_Unadvise(struct fdlg *d, u32 cookie){ (void)d;(void)cookie; return S_OK_; }
+static long WINAPI fd_SetOptions(struct fdlg *d, u32 o){ d->options=o; return S_OK_; }
+static long WINAPI fd_GetOptions(struct fdlg *d, u32 *o){ if(!o) return E_POINTER_; *o=d->options; return S_OK_; }
+static long WINAPI fd_SetFolder(struct fdlg *d, struct sitem *si){                            /* SetDefaultFolder and SetFolder */
+  if(!si) return E_POINTER_; u16 *p=0; long (WINAPI *gdn)(void*,u32,u16**)=(long (WINAPI *)(void*,u32,u16**))si->vt[5];
+  if(gdn(si,0x80058000u,&p)==0 && p){ wcpy(d->folder,p,260); y_CoTaskMemFree(p); } return S_OK_; }
+static long WINAPI fd_GetFolder(struct fdlg *d, void **out){
+  if(!out) return E_POINTER_; *out=sitem_new(d->folder[0]? d->folder : (const u16 *)u"C:\\Documents"); return *out? S_OK_ : (long)0x8007000E; }
+static long WINAPI fd_GetCurrentSelection(struct fdlg *d, void **out){ (void)d; if(out) *out=0; return E_NOTIMPL_; }
+static long WINAPI fd_SetFileName(struct fdlg *d, const u16 *n){ wcpy(d->name,n,260); return S_OK_; }
+static long WINAPI fd_GetFileName(struct fdlg *d, u16 **out){ if(!out) return E_POINTER_; *out=co_wdup(d->name); return *out? S_OK_ : (long)0x8007000E; }
+static long WINAPI fd_SetTitle(struct fdlg *d, const u16 *t){ wcpy(d->title,t,128); return S_OK_; }
+static long WINAPI fd_SetLabel(struct fdlg *d, const u16 *t){ (void)d;(void)t; return S_OK_; }   /* SetOkButtonLabel, SetFileNameLabel */
+static long WINAPI fd_GetResult(struct fdlg *d, void **out){
+  if(!out) return E_POINTER_; if(!d->has_result){ *out=0; return E_UNEXPECTED_; } *out=sitem_new(d->result); return *out? S_OK_ : (long)0x8007000E; }
+static long WINAPI fd_AddPlace(struct fdlg *d, void *si, u32 where){ (void)d;(void)si;(void)where; return S_OK_; }
+static long WINAPI fd_SetDefaultExtension(struct fdlg *d, const u16 *e){ wcpy(d->defext,e,16); return S_OK_; }
+static long WINAPI fd_Close(struct fdlg *d, long hr){ (void)d;(void)hr; return S_OK_; }
+static long WINAPI fd_SetClientGuid(struct fdlg *d, const u8 *g){ (void)d;(void)g; return S_OK_; }
+static long WINAPI fd_ClearClientData(struct fdlg *d){ (void)d; return S_OK_; }
+static long WINAPI fd_SetFilter(struct fdlg *d, void *f){ (void)d;(void)f; return S_OK_; }
+static long WINAPI fd_Slot27(struct fdlg *d, void **out){                                     /* save: SetSaveAsItem(IShellItem*); open: GetResults(IShellItemArray**) */
+  if(d->save){ struct sitem *si=(struct sitem *)out; if(si){ u16 *p=0; long (WINAPI *gdn)(void*,u32,u16**)=(long (WINAPI *)(void*,u32,u16**))si->vt[5];
+      if(gdn(si,0x80058000u,&p)==0 && p){ const u16 *b=p; for(const u16 *q=p;*q;q++) if(*q=='\\') b=q+1; wcpy(d->name,b,260); y_CoTaskMemFree(p); } } return S_OK_; }
+  if(!out) return E_POINTER_; if(!d->has_result){ *out=0; return E_UNEXPECTED_; }
+  struct sarr *a=heap_alloc_prog(sizeof *a); if(!a) return (long)0x8007000E; a->vt=sarr_vt; a->refs=1; a->item=sitem_new(d->result); if(!a->item){ heap_free(a); return (long)0x8007000E; }
+  *out=a; return S_OK_;
+}
+static long WINAPI fd_Slot28(struct fdlg *d, void *a){ (void)d; if(!d->save && a) *(void **)a=0; return d->save? S_OK_ : E_NOTIMPL_; }   /* SetProperties / GetSelectedItems */
+static long WINAPI fd_Props(struct fdlg *d, void *a, BOOL b){ (void)d;(void)a;(void)b; return S_OK_; }
+static long WINAPI fd_GetProperties(struct fdlg *d, void **out){ (void)d; if(out) *out=0; return E_NOTIMPL_; }
+static long WINAPI fd_ApplyProperties(struct fdlg *d, void *a, void *b, HANDLE c, void *e){ (void)d;(void)a;(void)b;(void)c;(void)e; return S_OK_; }
+/* CoCreateInstance for the classes Willows implements itself; REGDB_E_CLASSNOTREG for the rest */
+long com_create_builtin(const u8 *clsid, const u8 *iid, void **out){
+  if(!out) return E_POINTER_; *out=0;
+  int save=IS_CLSID_FILESAVE(clsid); if(!save && !IS_CLSID_FILEOPEN(clsid)) return (long)0x80040154;
+  if(!fdlg_vt[0]){
+    void *v[32]={(void*)fd_QueryInterface,(void*)fd_AddRef,(void*)fd_Release,(void*)fd_Show,(void*)fd_SetFileTypes,(void*)fd_SetFileTypeIndex,(void*)fd_GetFileTypeIndex,
+      (void*)fd_Advise,(void*)fd_Unadvise,(void*)fd_SetOptions,(void*)fd_GetOptions,(void*)fd_SetFolder,(void*)fd_SetFolder,(void*)fd_GetFolder,(void*)fd_GetCurrentSelection,
+      (void*)fd_SetFileName,(void*)fd_GetFileName,(void*)fd_SetTitle,(void*)fd_SetLabel,(void*)fd_SetLabel,(void*)fd_GetResult,(void*)fd_AddPlace,(void*)fd_SetDefaultExtension,
+      (void*)fd_Close,(void*)fd_SetClientGuid,(void*)fd_ClearClientData,(void*)fd_SetFilter,(void*)fd_Slot27,(void*)fd_Slot28,(void*)fd_Props,(void*)fd_GetProperties,(void*)fd_ApplyProperties};
+    memcpy(fdlg_vt,v,sizeof v);
+    void *a[10]={(void*)sa_QueryInterface,(void*)sa_AddRef,(void*)sa_Release,(void*)sa_NotImpl,(void*)sa_NotImpl,(void*)sa_NotImpl,(void*)sa_NotImpl,(void*)sa_GetCount,(void*)sa_GetItemAt,(void*)sa_NotImpl};
+    memcpy(sarr_vt,a,sizeof a);
+  }
+  struct fdlg *d=heap_alloc_prog(sizeof *d); if(!d) return (long)0x8007000E; memset(d,0,sizeof *d); d->vt=fdlg_vt; d->refs=1; d->save=save;
+  long r=fd_QueryInterface(d,iid,out); fd_Release(d); return r;
+}
+static long WINAPI y_CoCreateInstanceEx(const u8 *c, void *o, DWORD ctx, void *s, DWORD n, u8 *q){   /* MULTI_QI: {const IID*, IUnknown*, HRESULT} */
+  (void)o;(void)ctx;(void)s; long any=(long)0x80040154;
+  for(DWORD i=0;i<n && q;i++){ u8 *m=q+24*i; void *p=0; long r=com_create_builtin(c,*(const u8 **)m,&p); *(void **)(m+8)=p; *(long *)(m+16)=r; if(r==0) any=0; }
+  return any;
+}
 const struct export y_exports[] = {
   YD("combase",WindowsCreateString), YD("combase",WindowsCreateStringReference), YD("combase",WindowsDeleteString), YD("combase",WindowsGetStringRawBuffer),
   YD("combase",WindowsGetStringLen), YD("combase",WindowsIsStringEmpty), YD("combase",WindowsDuplicateString), YD("combase",RoInitialize), YD("combase",RoUninitialize),
@@ -336,7 +487,7 @@ const struct export y_exports[] = {
   YD("ole32",CoInitializeEx), YD("ole32",CoInitialize), YD("ole32",CoUninitialize), YD("ole32",CoGetApartmentType), YD("combase",CoGetApartmentType), YD("combase",CoInitializeEx),YD("ole32",CoTaskMemAlloc), YD("ole32",CoTaskMemFree), YD("ole32",CoTaskMemRealloc), YD("ole32",OleInitialize), YD("ole32",OleUninitialize), YD("ole32",CoInitializeSecurity), YD("ole32",CoSetProxyBlanket),
   YD("ole32",CoGetClassObject), YD("ole32",CoCreateInstanceEx), YD("ole32",CoFreeUnusedLibraries), YD("ole32",CoCreateGuid), YD("ole32",StringFromGUID2), YD("ole32",CLSIDFromString), {"ole32","IIDFromString",y_CLSIDFromString}, YD("ole32",StringFromCLSID), {"ole32","StringFromIID",y_StringFromCLSID},
   YD("oleaut32",SysAllocString), YD("oleaut32",SysAllocStringLen), YD("oleaut32",SysFreeString), YD("oleaut32",SysStringLen), YD("oleaut32",SysStringByteLen), YD("oleaut32",SysReAllocString), YD("oleaut32",VariantInit), YD("oleaut32",VariantClear),
-  YD("shell32",SHGetKnownFolderPath), YD("shell32",SHGetFolderPathW), YD("shell32",SHGetFolderPathA), YD("shell32",SHGetSpecialFolderPathW), YD("shell32",SHGetSpecialFolderPathA), YD("shell32",SHCreateDirectoryExW), YD("shell32",SHCreateDirectoryExA),
+  YD("shell32",SHCreateItemFromParsingName), YD("shell32",SHGetKnownFolderPath), YD("shell32",SHGetFolderPathW), YD("shell32",SHGetFolderPathA), YD("shell32",SHGetSpecialFolderPathW), YD("shell32",SHGetSpecialFolderPathA), YD("shell32",SHCreateDirectoryExW), YD("shell32",SHCreateDirectoryExA),
   YD("shell32",ShellExecuteW), YD("shell32",ShellExecuteExA), YD("shell32",ShellExecuteExW), YD("shell32",CommandLineToArgvW),
   YD("shlwapi",PathFileExistsA), YD("shlwapi",PathFileExistsW), YD("shlwapi",PathIsDirectoryA), YD("shlwapi",PathIsDirectoryW), YD("shlwapi",PathFindFileNameA), YD("shlwapi",PathFindFileNameW), YD("shlwapi",PathFindExtensionA), YD("shlwapi",PathFindExtensionW),
   YD("shlwapi",PathRemoveFileSpecA), YD("shlwapi",PathRemoveFileSpecW), YD("shlwapi",PathIsRelativeA), YD("shlwapi",PathIsRelativeW), YD("shlwapi",PathAppendA), YD("shlwapi",PathAppendW), YD("shlwapi",PathCombineA), YD("shlwapi",PathCombineW),

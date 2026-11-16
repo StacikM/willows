@@ -166,7 +166,7 @@ static BOOL WINAPI k_CloseHandle(HANDLE h){
 static BOOL WINAPI k_TerminateProcess(HANDLE h, DWORD c){
   if(h==(HANDLE)-1 || h==0x8000+(HANDLE)cur->pid) exit_note("TerminateProcess",c,__builtin_return_address(0));
   if(h>=0x8000 && h<0x8000+MAXPROC){ int pid=(int)(h-0x8000); if(pid!=cur->pid){ proc_last_exit[pid]=c; proc_kill(pid); return 1; } }
-  proc_exit(c);
+  proc_terminate((int)c);   /* as on Windows: no DllMain(DETACH), so no C runtime exit callbacks (Firefox's ran off the main thread and crashed) */
 }
 static HANDLE WINAPI k_OpenProcess(DWORD acc, BOOL inh, DWORD pid){ (void)acc;(void)inh; return (pid>0&&pid<MAXPROC&&procs[pid].used)? 0x8000+pid : 0; }
 static BOOL WINAPI k_CreateProcessA(const char *app, char *cmd, void *pa, void *ta, BOOL inh, DWORD fl, void *env, const char *dir, void *si, u32 *pi){

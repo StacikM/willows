@@ -224,11 +224,11 @@ struct ramfile *fs_open_write(const char *name){ return fs_create(name); }
 int fs_append(struct ramfile *f, const void *d, u64 n){ return fs_write(f,f->size,d,n); }
 void fs_commit(struct ramfile *f){ if(f && f->dirty && !is_temp(f)) fs_sync_soon(); }
 
-struct kfile { int used, canwrite, append; struct ramfile *f; u64 pos; };
+struct kfile { int used, canwrite, append; struct ramfile *f; u64 pos; int refs; };   /* refs: DuplicateHandle copies (same number, same position) */
 static struct kfile opens[MAXOPEN];
 int fs_is_file(void *fp){ return (u8*)fp>=(u8*)opens && (u8*)fp<(u8*)(opens+MAXOPEN); }
 static struct kfile *alloc_open_any(struct ramfile *f, int w, int app){                 /* directories too (CreateFile with FILE_FLAG_BACKUP_SEMANTICS) */
-  for(int i=0;i<MAXOPEN;i++) if(!opens[i].used){ opens[i]=(struct kfile){1,w,app,f,app?f->size:0}; return &opens[i]; }
+  for(int i=0;i<MAXOPEN;i++) if(!opens[i].used){ opens[i]=(struct kfile){1,w,app,f,app?f->size:0,1}; return &opens[i]; }
   win32_set_last_error(4); return NULL;                                              /* ERROR_TOO_MANY_OPEN_FILES */
 }
 static struct kfile *alloc_open(struct ramfile *f, int w, int app){ if(f->isdir) return NULL; return alloc_open_any(f,w,app); }
@@ -310,7 +310,14 @@ int fs_is_handle(u64 h){ return h>=H_FILE && h<H_FILE+MAXOPEN && opens[h-H_FILE]
 void fs_hseek(u64 h, u64 pos){ if(fs_is_handle(h)) opens[h-H_FILE].pos=pos; }        /* the position of an OVERLAPPED transfer */
 int fs_hread(u64 h, void *buf, u32 n, u32 *got){ u64 r=c_fread(buf,1,n,&opens[h-H_FILE]); if(got) *got=(u32)r; return 1; }
 int fs_hwrite(u64 h, const void *buf, u32 n, u32 *wr){ u64 r=c_fwrite(buf,1,n,&opens[h-H_FILE]); if(wr) *wr=(u32)r; return r==n; }
-int fs_hclose(u64 h){ close_kfile(&opens[h-H_FILE]); extern void iocp_forget(u64); iocp_forget(h); return 1; }   /* (file handle numbers are reused) */
+int fs_hclose(u64 h){
+  struct kfile *k=&opens[h-H_FILE]; if(--k->refs>0) return 1;                    /* a DuplicateHandle copy is still open */
+  close_kfile(k); extern void iocp_forget(u64); iocp_forget(h); return 1;        /* (file handle numbers are reused) */
+}
+/* DuplicateHandle of a file: Windows makes a second handle to the same file object (shared position). Handle numbers are global here,
+   so the copy is the same number with one more reference. Without it, Firefox duplicated a file, closed the original, and then found
+   the copy invalid when passing it to a child process - and dropped the connection to that process. */
+void fs_haddref(u64 h){ if(fs_is_handle(h)) opens[h-H_FILE].refs++; }
 /* SetEndOfFile: the file ends at the current position. Growing allocates the exact size once (a large download is pre-sized this way instead of grown step by step). */
 int fs_set_eof(u64 h){
   if(!fs_is_handle(h)) return 0; struct kfile *k=&opens[h-H_FILE]; struct ramfile *f=k->f; u64 pos=k->pos;
@@ -319,10 +326,29 @@ int fs_set_eof(u64 h){
   f->size=pos; f->dirty=1; f->persist=1; touch(f); fs_gen++; return 1;
 }
 struct ramfile *fs_handle_file(u64 h){ return fs_is_handle(h)? opens[h-H_FILE].f : NULL; }
+/* SetFileInformationByHandle: rename the file behind a handle (FileRenameInfo), size it (FileEndOfFileInfo).
+   0 = done, else a Windows error code. A file deleted while open (an orphan) has no name to rename. */
+int fs_handle_rename(u64 h, const char *dst, int replace){
+  struct ramfile *f=fs_handle_file(h); if(!f) return 6; if(is_orphan(f)) return 2;
+  char src[130]; src[0]='/'; unsigned k=0; for(;f->name[k] && k<127;k++) src[k+1]=f->name[k]; src[k+1]=0;
+  struct ramfile *b=fs_find(dst); if(b==f) return 0;
+  if(b){ if(!replace) return 183; if(b->isdir) return 5; fs_remove(dst); }
+  return fs_rename(src,dst)? 3 : 0;
+}
+int fs_handle_setsize(u64 h, u64 size){
+  if(!fs_is_handle(h)) return 6; struct kfile *k=&opens[h-H_FILE]; u64 pos=k->pos; k->pos=size; int ok=fs_set_eof(h); k->pos=pos; return ok? 0 : 8;
+}
+int fs_handle_delete(u64 h){                                                  /* FileDispositionInfo: deleted now; the open handles keep the data until closed */
+  struct ramfile *f=fs_handle_file(h); if(!f) return 6; if(is_orphan(f)) return 0;
+  char p[130]; p[0]='/'; unsigned k=0; for(;f->name[k] && k<127;k++) p[k+1]=f->name[k]; p[k+1]=0;
+  return fs_remove(p)? 5 : 0;
+}
 int fs_file_write_at(struct ramfile *f, u64 pos, const void *d, u64 n){ int r=fs_write(f,pos,d,n); if(!r){ f->persist=1; f->dirty=1; fs_gen++; } return r; }
 static u64 WINAPI k_CreateFileA(const char *name, u32 access, u32 share, void *sa, u32 disp, u32 fl, u64 tmpl){
   (void)share;(void)sa;(void)fl;(void)tmpl;
   if(pipe_is_path(name)){ u64 ph=pipe_open_client(name); if(!ph) win32_set_last_error(2); return ph? ph : (u64)-1; }          /* \\\\.\\pipe\\name */
+  { const char *p=name; if(p[0]=='\\' && p[1]=='\\' && (p[2]=='?' || p[2]=='.') && p[3]=='\\') p+=4; if(p[0] && p[1]==':') p+=2;
+    for(;*p;p++) if(*p==':'){ win32_set_last_error(123); return (u64)-1; } }   /* "file:stream" - no alternate data streams here, as on a FAT32 drive (ERROR_INVALID_NAME) */
   struct ramfile *f=fs_find(name); int w=(access&0x40000000)!=0;
   if(f && f->isdir){                                                 /* a directory: only with FILE_FLAG_BACKUP_SEMANTICS (to query it) */
     if(!(fl&0x02000000) || disp==1 || disp==2){ win32_set_last_error(5); return (u64)-1; }
@@ -418,11 +444,14 @@ static int WINAPI k_MoveFileA(const char *src, const char *dst){
   if(!fs_find(src)){ win32_set_last_error(2); return 0; } if(fs_find(dst)){ win32_set_last_error(183); return 0; }
   if(fs_rename(src,dst)){ win32_set_last_error(3); return 0; } return 1;
 }
+static int move_trace(void){ struct ramfile *f=fs_find("/System/apitrace.cfg"); return f && !f->isdir; }
 static int WINAPI k_MoveFileExA(const char *src, const char *dst, u32 fl){                 /* MOVEFILE_REPLACE_EXISTING (1): an existing file at dst is replaced */
   if(!dst){ return fs_remove(src)? (win32_set_last_error(2),0) : 1; }                     /* (a NULL target deletes, as with MOVEFILE_DELAY_UNTIL_REBOOT) */
   struct ramfile *a=fs_find(src), *b=fs_find(dst);
   if(a && b && a!=b && (fl&1)){ if(b->isdir){ win32_set_last_error(5); return 0; } fs_remove(dst); }
-  return k_MoveFileA(src,dst);
+  int r=k_MoveFileA(src,dst);
+  if(move_trace()) kdbg("  [file] MoveFileEx(%s, %s, %x) = %d (error %u)\n",src,dst,fl,r,win32_get_last_error());
+  return r;
 }
 static u32 WINAPI k_GetCurrentDirectoryA(u32 n, char *b){
   char t[140]; int k=0; t[k++]='C'; t[k++]=':'; t[k++]='\\'; for(const char *q=cur->cwd;*q&&k<138;q++) t[k++]=*q=='/'? '\\' : *q; t[k]=0;

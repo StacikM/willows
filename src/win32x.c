@@ -345,6 +345,78 @@ static BOOL WINAPI x_GetFileTime(HANDLE h, u64 *c, u64 *a, u64 *w){ struct ramfi
 static BOOL WINAPI x_MoveFileW(const u16 *a, const u16 *b){ char x[260],y[260]; w2a(a,x,260); w2a(b,y,260); BOOL (WINAPI *f)(const char*,const char*)=K32("MoveFileA"); return f? f(x,y):0; }
 static BOOL WINAPI x_MoveFileExW(const u16 *a, const u16 *b, DWORD fl){ char x[260],y[260]; w2a(a,x,260); if(b) w2a(b,y,260); BOOL (WINAPI *f)(const char*,const char*,DWORD)=K32("MoveFileExA"); return f? f(x,b? y : 0,fl) : 0; }
 static BOOL WINAPI x_ReplaceFileW(const u16 *dst, const u16 *src, const u16 *backup, DWORD fl, void *e, void *r){ (void)backup;(void)fl;(void)e;(void)r; return x_MoveFileExW(src,dst,1); }
+/* NtReadFile / NtWriteFile: Rust's standard library does all synchronous file I/O through these (std::fs::File::read/write), so every
+   Rust component in a program (Firefox's key-value stores, ...) failed to write a file without them. IO_STATUS_BLOCK = {status, bytes}.
+   ByteOffset: NULL or -2 = the current position, -1 = append (FILE_WRITE_TO_END_OF_FILE), else seek there first. */
+static u32 nt_status_of(DWORD e){ return e==38? 0xC0000011u : e==109? 0xC000014Bu : e==6? 0xC0000008u : e==5? 0xC0000022u : e==8? 0xC0000017u : e==87? 0xC000000Du : 0xC0000001u; }
+static int nt_seek(HANDLE h, const i64 *off, int write){
+  if(!off || *off==-2) return 1;
+  BOOL (WINAPI *sp)(HANDLE,i64,i64*,DWORD)=K32("SetFilePointerEx"); if(!sp) return 1;
+  return *off==-1? (write? sp(h,0,0,2) : 1) : sp(h,*off,0,0);
+}
+static u32 WINAPI x_NtReadFile(HANDLE h, HANDLE ev, void *apc, void *actx, u64 *iosb, void *buf, DWORD n, const i64 *off, DWORD *key){
+  (void)apc;(void)actx;(void)key; BOOL (WINAPI *rf)(HANDLE,void*,DWORD,DWORD*,void*)=K32("ReadFile"); if(!rf) return 0xC0000002u;
+  if(!nt_seek(h,off,0)){ u32 st=nt_status_of(last_error); if(iosb){ iosb[0]=st; iosb[1]=0; } return st; }
+  DWORD got=0; BOOL ok=rf(h,buf,n,&got,0); u32 st= ok? (got==0 && n>0? 0xC0000011u : 0) : nt_status_of(last_error);   /* nothing read: STATUS_END_OF_FILE */
+  if(iosb){ iosb[0]=st; iosb[1]=got; }
+  if(ev){ BOOL (WINAPI *se)(HANDLE)=K32("SetEvent"); if(se) se(ev); }
+  return st;
+}
+static u32 WINAPI x_NtWriteFile(HANDLE h, HANDLE ev, void *apc, void *actx, u64 *iosb, const void *buf, DWORD n, const i64 *off, DWORD *key){
+  (void)apc;(void)actx;(void)key; BOOL (WINAPI *wf)(HANDLE,const void*,DWORD,DWORD*,void*)=K32("WriteFile"); if(!wf) return 0xC0000002u;
+  if(!nt_seek(h,off,1)){ u32 st=nt_status_of(last_error); if(iosb){ iosb[0]=st; iosb[1]=0; } return st; }
+  DWORD put=0; BOOL ok=wf(h,buf,n,&put,0); u32 st= ok? 0 : nt_status_of(last_error);
+  if(iosb){ iosb[0]=st; iosb[1]=put; }
+  if(ev){ BOOL (WINAPI *se)(HANDLE)=K32("SetEvent"); if(se) se(ev); }
+  return st;
+}
+/* CopyFileEx / MoveFileWithProgress: the progress callback is not called (copies are one memcpy here). Firefox moves a finished download
+   from C:\Temp into place with CopyFileExW. Flag 1 = COPY_FILE_FAIL_IF_EXISTS. */
+static BOOL WINAPI x_CopyFileExA(const char *a, const char *b, void *prog, void *data, BOOL *cancel, DWORD fl){ (void)prog;(void)data;(void)cancel;
+  BOOL (WINAPI *f)(const char*,const char*,BOOL)=K32("CopyFileA"); return f? f(a,b,(fl&1)!=0) : 0; }
+static BOOL WINAPI x_CopyFileExW(const u16 *a, const u16 *b, void *prog, void *data, BOOL *cancel, DWORD fl){ char x[260],y[260]; w2a(a,x,260); w2a(b,y,260); return x_CopyFileExA(x,y,prog,data,cancel,fl); }
+static BOOL WINAPI x_MoveFileWithProgressA(const char *a, const char *b, void *prog, void *data, DWORD fl){ (void)prog;(void)data;
+  BOOL (WINAPI *f)(const char*,const char*,DWORD)=K32("MoveFileExA"); return f? f(a,b,fl) : 0; }
+static BOOL WINAPI x_MoveFileWithProgressW(const u16 *a, const u16 *b, void *prog, void *data, DWORD fl){ char x[260],y[260]; w2a(a,x,260); if(b) w2a(b,y,260); return x_MoveFileWithProgressA(x,b? y : 0,prog,data,fl); }
+/* GetLongPathName: there are no 8.3 short names, so the long name is the name itself - if the file exists */
+static DWORD WINAPI x_GetLongPathNameA(const char *s, char *o, DWORD n){
+  if(!s){ last_error=87; return 0; } if(!fs_find(s) && !fs_isdir(s)){ last_error=2; return 0; }
+  DWORD l=(DWORD)strlen(s); if(!o || n<=l) return l+1; if(o!=s) memmove(o,s,l+1); return l;
+}
+static DWORD WINAPI x_GetLongPathNameW(const u16 *s, u16 *o, DWORD n){
+  if(!s){ last_error=87; return 0; } char t[260]; w2a(s,t,260); if(!fs_find(t) && !fs_isdir(t)){ last_error=2; return 0; }
+  DWORD l=0; while(s[l]) l++; if(!o || n<=l) return l+1; if(o!=s) memmove(o,s,(l+1)*2); return l;
+}
+/* RegisterWaitForSingleObject: a waiter thread calls back when the object is signaled (or the timeout passes), once with
+   WT_EXECUTEONLYONCE (8), else again and again until UnregisterWait. */
+struct rwait { HANDLE obj; void (WINAPI *cb)(void *, u8); void *ctx; DWORD ms, flags; volatile int cancelled, running; };
+static DWORD WINAPI rwait_thread(void *p){
+  struct rwait *w=p; DWORD (WINAPI *wait)(HANDLE,DWORD)=K32("WaitForSingleObject");
+  while(!w->cancelled){
+    DWORD r=wait? wait(w->obj,w->ms) : 1; if(w->cancelled) break;
+    if(r==0xFFFFFFFF){ break; }                                                     /* WAIT_FAILED: the object is gone */
+    w->running=1; w->cb(w->ctx,(u8)(r==258)); w->running=0;                        /* TimerOrWaitFired: TRUE on timeout */
+    if(w->flags&8) break;
+    if(r==258 && w->ms==0) break;
+  }
+  w->running=0; if(w->cancelled==2) heap_free(w); else w->cancelled=3;             /* 2: unregistered, the thread frees it; 3: finished first */
+  return 0;
+}
+static BOOL WINAPI x_RegisterWaitForSingleObject(HANDLE *out, HANDLE obj, void *cb, void *ctx, DWORD ms, DWORD flags){
+  if(!out || !cb){ last_error=87; return 0; }
+  struct rwait *w=heap_alloc(sizeof *w); if(!w){ last_error=8; return 0; } memset(w,0,sizeof *w);
+  w->obj=obj; w->cb=cb; w->ctx=ctx; w->ms=ms; w->flags=flags;
+  HANDLE (WINAPI *ct)(void*,u64,void*,void*,DWORD,DWORD*)=K32("CreateThread"); HANDLE t= ct? ct(0,0,(void*)rwait_thread,w,0,0) : 0;
+  if(!t){ heap_free(w); return 0; } BOOL (WINAPI *ch)(HANDLE)=K32("CloseHandle"); if(ch) ch(t);
+  *out=(HANDLE)w; return 1;
+}
+static BOOL WINAPI x_UnregisterWaitEx(HANDLE h, HANDLE ev){
+  struct rwait *w=(struct rwait *)h; if(!w){ last_error=87; return 0; }
+  if(w->cancelled==3){ heap_free(w); } else w->cancelled=2;                       /* the waiter frees it when it wakes */
+  if(ev && ev!=(HANDLE)-1){ BOOL (WINAPI *se)(HANDLE)=K32("SetEvent"); if(se) se(ev); }
+  return 1;
+}
+static BOOL WINAPI x_UnregisterWait(HANDLE h){ return x_UnregisterWaitEx(h,0); }
 static BOOL WINAPI x_CopyFileW(const u16 *a, const u16 *b, BOOL fail){ char x[260],y[260]; w2a(a,x,260); w2a(b,y,260); BOOL (WINAPI *f)(const char*,const char*,BOOL)=K32("CopyFileA"); return f? f(x,y,fail):0; }
 /* file times: one stored time per file (its last change, see fs_mtime), reported as creation, access and write time */
 static void fill_times(u8 *p, const struct ramfile *f){ u64 t=fs_mtime(f); memcpy(p,&t,8); memcpy(p+8,&t,8); memcpy(p+16,&t,8); }
@@ -427,7 +499,8 @@ static BOOL WINAPI x_FindNextFileW(HANDLE h, struct fdw *out){ u8 a[320]; BOOL (
 static HANDLE WINAPI x_FindFirstFileExW(const u16 *p, u32 lvl, struct fdw *out, u32 op, void *flt, DWORD fl){ (void)lvl;(void)op;(void)flt;(void)fl; return x_FindFirstFileW(p, out); }
 static int WINAPI x_GetDateFormatW(u32 loc, DWORD fl, const struct systime *st, const u16 *fmt, u16 *out, int n){ (void)loc;(void)fl;(void)fmt; struct systime t; if(st) t = *st; else x_GetLocalTime(&t); char b[32]; int k = kvsnprintf_s(b, sizeof b, t.d); (void)k; char o[40]; int l = 0; { char x[12]; int m = t.d, q = 0; do x[q++] = (char)('0' + m % 10); while((m /= 10)); while(q) o[l++] = x[--q]; o[l++] = '/'; m = t.mo; q = 0; do x[q++] = (char)('0' + m % 10); while((m /= 10)); while(q) o[l++] = x[--q]; o[l++] = '/'; m = t.y; q = 0; do x[q++] = (char)('0' + m % 10); while((m /= 10)); while(q) o[l++] = x[--q]; } o[l] = 0; if(!n) return l + 1; a2w(o, out, n); return l + 1; }
 static int WINAPI x_GetTimeFormatW(u32 loc, DWORD fl, const struct systime *st, const u16 *fmt, u16 *out, int n){ (void)loc;(void)fl;(void)fmt; struct systime t; if(st) t = *st; else x_GetLocalTime(&t); char o[16]; o[0] = (char)('0' + t.h / 10); o[1] = (char)('0' + t.h % 10); o[2] = ':'; o[3] = (char)('0' + t.mi / 10); o[4] = (char)('0' + t.mi % 10); o[5] = ':'; o[6] = (char)('0' + t.s / 10); o[7] = (char)('0' + t.s % 10); o[8] = 0; if(!n) return 9; a2w(o, out, n); return 9; }
-static long WINAPI x_CoCreateInstance(void *a, void *b, DWORD c, void *d, void **e){ (void)a;(void)b;(void)c;(void)d; if(e) *e = 0; return (long)0x80040154; }                       /* REGDB_E_CLASSNOTREG */
+long com_create_builtin(const u8 *clsid, const u8 *iid, void **out);   /* win32y.c: the file dialogs; REGDB_E_CLASSNOTREG for the rest */
+static long WINAPI x_CoCreateInstance(void *a, void *b, DWORD c, void *d, void **e){ (void)b;(void)c; return com_create_builtin(a,d,e); }
 static BOOL WINAPI x_AllocateAndInitializeSid(void *a, u8 n, DWORD s0, DWORD s1, DWORD s2, DWORD s3, DWORD s4, DWORD s5, DWORD s6, DWORD s7, void **sid){ (void)a;(void)n;(void)s0;(void)s1;(void)s2;(void)s3;(void)s4;(void)s5;(void)s6;(void)s7; static u8 fake[16]; if(sid) *sid = fake; return 1; }
 static BOOL WINAPI x_EqualSid(void *a, void *b){ return a == b; }
 static DWORD WINAPI x_GetLengthSid(void *s){ (void)s; return 12; }
@@ -452,7 +525,9 @@ const struct export x_exports[] = {
 
   X(GetSystemDefaultLCID), X(GetSystemDefaultLangID), X(GetUserDefaultUILanguage), X(SetThreadUILanguage), {"kernel32","GetThreadUILanguage",x_GetUserDefaultUILanguage}, X(SetThreadLocale),
   X(EnumSystemLocalesW), X(EnumUILanguagesW), X(LCMapStringEx), X(LCIDToLocaleName), X(MulDiv), X(SetFileAttributesA), X(SetFileAttributesW), X(SetFileTime), X(GetFileTime),
-  X(MoveFileW), X(MoveFileExW), X(ReplaceFileW), X(CopyFileW), X(GetFileAttributesExW), X(GetFileAttributesExA), X(GetFileInformationByHandle), X(GetVolumeInformationW), X(GetLogicalDriveStringsA), X(GetVolumePathNameA), X(GetVolumePathNameW), X(RemoveDirectoryW),X(GetTempFileNameW),
+  X(MoveFileW), X(MoveFileExW), X(ReplaceFileW), X(CopyFileW), X(CopyFileExA), X(CopyFileExW), X(MoveFileWithProgressA), X(MoveFileWithProgressW),
+  X(GetLongPathNameA), X(GetLongPathNameW), X(RegisterWaitForSingleObject), X(UnregisterWait), X(UnregisterWaitEx),
+  {"ntdll","NtReadFile",x_NtReadFile}, {"ntdll","NtWriteFile",x_NtWriteFile}, X(GetFileAttributesExW), X(GetFileAttributesExA), X(GetFileInformationByHandle), X(GetVolumeInformationW), X(GetLogicalDriveStringsA), X(GetVolumePathNameA), X(GetVolumePathNameW), X(RemoveDirectoryW),X(GetTempFileNameW),
     X(SetDefaultDllDirectories), X(SetThreadAffinityMask), X(GetProcessAffinityMask), X(VerifyVersionInfoA), X(GetProductInfo), X(AttachConsole), X(FreeConsole), X(GetConsoleWindow), X(SetStdHandle),
   X(SystemTimeToTzSpecificLocalTime), X(HeapQueryInformation), XD("ntdll",RtlInitUnicodeString), XD("ntdll",RtlNtStatusToDosError),
   XD("user32",GetDesktopWindow), XD("user32",GetSysColor), XD("user32",MessageBeep), XD("user32",CharUpperBuffW), XD("user32",IsWindowVisible), XD("user32",EnableWindow), XD("user32",IsWindowEnabled),

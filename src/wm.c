@@ -1211,7 +1211,9 @@ static i32 file_dialog(u8 *ofn, int saving){
   if(!gfx_ok) return 0;
   char *out=*(char**)(ofn+48); u32 maxn=*(u32*)(ofn+56); const char *title=*(const char**)(ofn+88);
   if(!title) title=saving? "Save As" : "Open";
-  char dir[128]; fs_canon(".",dir,sizeof dir); if(!dir[0]) cpy(dir,"Documents",128);
+  char dir[128]; const char *idir=*(const char**)(ofn+80);                  /* lpstrInitialDir (e.g. Downloads for a download), else the current folder */
+  if(idir && idir[0] && fs_isdir(idir)) fs_canon(idir,dir,sizeof dir); else fs_canon(".",dir,sizeof dir);
+  if(!dir[0] && !(idir && idir[0])) cpy(dir,"Documents",128);
   int x=((int)gfx_w-DW)/2, y=((int)gfx_h-DH)/2;
   for(int j=0;j<DH;j++) for(int i=0;i<DW;i++) dsave[j*DW+i]=gfx_get(x+i,y+j);
   char name[64]; name[0]=0; int nlen=0, sel=-1, result=0, scroll=0; u32 lastclick=0; int lastsel=-2;
@@ -1222,7 +1224,8 @@ static i32 file_dialog(u8 *ofn, int saving){
   int need=1;
   for(;;){
     if(need){                                                            /* (re)read the folder */
-      struct ramfile *raw[200]; int n=fs_list(dir,raw,200); ne=0; up=dir[0]!=0;
+      char adir[130]; adir[0]='/'; cpy(adir+1,dir,129);                   /* dir is canonical: list it from the root, not the program's current folder */
+      struct ramfile *raw[200]; int n=fs_list(adir,raw,200); ne=0; up=dir[0]!=0;
       for(int i=0;i<n;i++){ int j=ne++; ents[j]=raw[i]; while(j>0 && fd_cmp(ents[j-1],ents[j])>0){ struct ramfile *t=ents[j]; ents[j]=ents[j-1]; ents[j-1]=t; j--; } }
       sel=-1; scroll=0; need=0;
     }
