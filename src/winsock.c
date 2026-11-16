@@ -47,7 +47,7 @@ static int WINAPI w_closesocket(SOCKET h){
   if(ws_trace()){ char nm[64]; if(!dll_addr_name((u64)__builtin_return_address(0),nm,sizeof nm)) nm[0]=0; kdbg("  [net] closesocket(%p) from %s\n",(void*)h,nm); }
   struct wsock *s=get(h); if(!s) return fail(WSAENOTSOCK);
   if(s->type==1 && s->t>=0) tcp_close(s->t); if(s->type==2 && s->u>=0) udp_close(s->u);
-  s->used=0; return 0;
+  s->used=0; { extern void iocp_forget(u64); iocp_forget(h); } return 0;   /* socket numbers are reused: drop its completion port association */
 }
 static int WINAPI w_shutdown(SOCKET h, int how){ (void)how; return get(h)? 0 : fail(WSAENOTSOCK); }
 static u32 sa_ip(const u8 *sa){ return hl(*(u32*)(sa+4)); }

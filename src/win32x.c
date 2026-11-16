@@ -219,7 +219,41 @@ static void WINAPI x_RaiseFailFastException(const u32 *rec, void *ctx, DWORD fl)
   u32 code= rec? rec[0] : 0xC0000409; kprintf("\n*** RaiseFailFastException 0x%x from %s: the program ends\n",code,at); kdbg("  [exit] RaiseFailFastException 0x%x from %s\n",code,at);
   proc_terminate((int)code);
 }
+/* ---- vectored exception handlers. CPU faults in program code are offered to them (idt.c veh_redirect), and so is RaiseException.
+   Windows keeps one list: first=1 puts a handler at the head, first=0 at the tail. Firefox needs this for WebAssembly (it catches
+   its own out-of-bounds faults and resumes at a trap stub). ---- */
+#define MAXVEH 64
+struct veh { int pid; u64 fn; u32 seq; u8 used, first, cont; };
+static struct veh vehs[MAXVEH]; static u32 veh_seq;
+static u64 veh_add(u32 first, u64 fn, int cont){
+  if(!fn) return 0;
+  for(int i=0;i<MAXVEH;i++) if(!vehs[i].used){ vehs[i]=(struct veh){cur->pid,fn,++veh_seq,1,(u8)(first!=0),(u8)cont}; return (u64)&vehs[i]; }
+  return 0;
+}
+static u32 veh_remove(u64 h){ struct veh *v=(struct veh *)h; if(v<vehs || v>=vehs+MAXVEH || !v->used || v->pid!=cur->pid) return 0; v->used=0; return 1; }
+static u64 WINAPI x_AddVectoredExceptionHandler(u32 first, u64 fn){ return veh_add(first,fn,0); }
+static u32 WINAPI x_RemoveVectoredExceptionHandler(u64 h){ return veh_remove(h); }
+static u64 WINAPI x_AddVectoredContinueHandler(u32 first, u64 fn){ return veh_add(first,fn,1); }
+static u32 WINAPI x_RemoveVectoredContinueHandler(u64 h){ return veh_remove(h); }
+void veh_proc_exit(int pid){ for(int i=0;i<MAXVEH;i++) if(vehs[i].used && vehs[i].pid==pid) vehs[i].used=0; }
+int veh_count(int pid){ int n=0; for(int i=0;i<MAXVEH;i++) if(vehs[i].used && !vehs[i].cont && vehs[i].pid==pid) n++; return n; }
+/* call this process's exception handlers in list order; 1 = one of them answered EXCEPTION_CONTINUE_EXECUTION */
+int veh_call(void *ptrs){
+  struct veh l[MAXVEH]; int n=0;
+  for(int i=0;i<MAXVEH;i++) if(vehs[i].used && !vehs[i].cont && vehs[i].pid==cur->pid) l[n++]=vehs[i];
+  for(int i=1;i<n;i++){ struct veh k=l[i]; int j=i-1;                     /* heads (newest first), then tails (oldest first) */
+    while(j>=0 && ((k.first && (!l[j].first || l[j].seq<k.seq)) || (!k.first && !l[j].first && l[j].seq>k.seq))){ l[j+1]=l[j]; j--; } l[j+1]=k; }
+  for(int i=0;i<n;i++){ i32 (WINAPI *h)(void *)=(i32 (WINAPI *)(void *))l[i].fn; if(h(ptrs)==-1) return 1; }
+  return 0;
+}
 static void WINAPI x_RaiseException(DWORD code, DWORD fl, DWORD n, const u64 *a){
+  if(veh_count(cur->pid)){                                               /* offer it to the vectored handlers; "continue" returns to the caller */
+    u64 rec[19]; memset(rec,0,sizeof rec); u8 cb[0x4d0+16]; u8 *ctx=(u8 *)(((u64)cb+15)&~15ull); memset(ctx,0,0x4d0);
+    if(n>15) n=15; ((u32 *)rec)[0]=code; ((u32 *)rec)[1]=fl&1; rec[2]=(u64)__builtin_return_address(0); ((u32 *)rec)[6]=n; for(u32 k=0;k<n && a;k++) rec[4+k]=a[k];
+    *(u32 *)(ctx+0x30)=0x10000B; *(u64 *)(ctx+0xf8)=rec[2]; *(u64 *)(ctx+0x98)=(u64)__builtin_frame_address(0)+16; *(u16 *)(ctx+0x38)=0x08; *(u16 *)(ctx+0x42)=0x10;
+    u64 ptrs[2]={(u64)rec,(u64)ctx}; if(veh_call(ptrs)) return;
+  }
+  if(code==0x406D1388) return;                                           /* MSVC "name this thread" for a debugger: harmless without one */
   char at[64]; if(!dll_addr_name((u64)__builtin_return_address(0),at,sizeof at)) ksnprintf(at,sizeof at,"%p",__builtin_return_address(0));
   kprintf("\n*** RaiseException 0x%x (flags %x, %u args%s%p) from %s: no handler support, the program ends\n",code,fl,n,n? ", first " : "",n? (void*)a[0] : 0,at);
   void (WINAPI *f)(DWORD)=K32("ExitProcess"); if(f) f(code); }
@@ -436,6 +470,9 @@ const struct export x_exports[] = {
   X(GlobalLock), X(GlobalUnlock), X(HeapSetInformation), X(HeapValidate), X(IsBadReadPtr), {"kernel32","IsBadWritePtr",x_IsBadReadPtr},
   X(LoadLibraryW), X(LoadLibraryExA), X(LoadLibraryExW), X(FreeLibrary), X(GetModuleHandleExW), X(GetModuleHandleExA), X(DisableThreadLibraryCalls),
   X(OutputDebugStringW), X(DebugBreak), X(SetErrorMode), X(IsWow64Process), X(GetSystemPowerStatus), X(RaiseException), X(RaiseFailFastException),
+  X(AddVectoredExceptionHandler), X(RemoveVectoredExceptionHandler), X(AddVectoredContinueHandler), X(RemoveVectoredContinueHandler),
+  {"ntdll","RtlAddVectoredExceptionHandler",x_AddVectoredExceptionHandler}, {"ntdll","RtlRemoveVectoredExceptionHandler",x_RemoveVectoredExceptionHandler},
+  {"ntdll","RtlAddVectoredContinueHandler",x_AddVectoredContinueHandler}, {"ntdll","RtlRemoveVectoredContinueHandler",x_RemoveVectoredContinueHandler},
   X(GetSystemTimes), X(GetProcessTimes), {"kernel32","GetThreadTimes",x_GetProcessTimes},
   XD("advapi32",GetCurrentProcessToken), XD("advapi32",OpenProcessToken), XD("advapi32",GetTokenInformation),
   X(FormatMessageA), X(FormatMessageW),

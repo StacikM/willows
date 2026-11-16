@@ -159,7 +159,10 @@ static LPVOID WINAPI k_GetProcAddress(HANDLE m, const char *n){
 static HANDLE WINAPI k_GetCurrentProcess(void){ return (HANDLE)-1; }
 static BOOL WINAPI k_CloseHandle(HANDLE h){
   for(int i=0;i<cur->ninh;i++) if(cur->inh[i]==h){ cur->inh[i]=cur->inh[--cur->ninh]; break; }   /* an inherited handle closed by the child itself: not again at exit */
-  if(kobj_close(h)) return 1; if(fs_is_handle(h)) fs_hclose(h); else if(pipe_is_handle(h)) pipe_close(h); else if(map_is_handle(h)) map_close(h); return 1; }
+  if(kobj_close(h)) return 1; if(fs_is_handle(h)) fs_hclose(h);
+  else if(pipe_is_handle(h)) pipe_close(h);
+  else if(map_is_handle(h)) map_close(h);
+  return 1; }
 static BOOL WINAPI k_TerminateProcess(HANDLE h, DWORD c){
   if(h==(HANDLE)-1 || h==0x8000+(HANDLE)cur->pid) exit_note("TerminateProcess",c,__builtin_return_address(0));
   if(h>=0x8000 && h<0x8000+MAXPROC){ int pid=(int)(h-0x8000); if(pid!=cur->pid){ proc_last_exit[pid]=c; proc_kill(pid); return 1; } }

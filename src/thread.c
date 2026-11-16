@@ -296,7 +296,12 @@ static HANDLE WINAPI_ t_CreateIoCompletionPort(HANDLE file, HANDLE port, u64 key
   (void)threads; struct kobj *o= port? ko_get(port) : 0;
   if(port && (!o || o->kind!=KO_IOCP)){ set_err(87); return 0; }
   if(!o){ o=ko_new(KO_IOCP); if(!o) return 0; port=ko_handle(o); }
-  if(file!=(HANDLE)-1){ for(int i=0;i<MAXASSOC;i++) if(!assoc[i].h || assoc[i].h==file){ assoc[i].h=file; assoc[i].port=port; assoc[i].key=key; break; } }
+  if(file!=(HANDLE)-1 && file){
+    int slot=-1; for(int i=0;i<MAXASSOC;i++) if(assoc[i].h==file){ slot=i; break; }                 /* already associated: update it */
+    if(slot<0) for(int i=0;i<MAXASSOC;i++) if(!assoc[i].h){ slot=i; break; }
+    if(slot<0){ kdbg("  [iocp] no room to associate %p (all %d in use)\n",(void*)file,MAXASSOC); set_err(8); return 0; }
+    assoc[slot].h=file; assoc[slot].port=port; assoc[slot].key=key;
+  }
   return port;
 }
 static BOOL WINAPI_ t_PostQueuedCompletionStatus(HANDLE port, DWORD bytes, u64 key, u64 ov){
@@ -329,6 +334,12 @@ int iocp_complete(u64 h, u32 bytes, u64 ov){
   for(int i=0;i<MAXASSOC;i++) if(assoc[i].h==h && h){ struct kobj *o=ko_get(assoc[i].port); if(o && o->kind==KO_IOCP){ iocp_post(o,bytes,assoc[i].key,ov); return 1; } }
   return 0;
 }
+/* A handle was closed for good: its completion port association goes with it, as on Windows. Handle numbers are reused (pipes,
+   sockets), and a stale association sent the new handle's completions, with the old key, to the old owner. */
+void iocp_forget(u64 h){
+  for(int i=0;i<MAXASSOC;i++) if(assoc[i].h==h && h){ assoc[i].h=0; assoc[i].port=0; assoc[i].key=0; }
+}
+u64 iocp_key_of(u64 h){ for(int i=0;i<MAXASSOC;i++) if(assoc[i].h==h && h) return assoc[i].key; return 0; }
 
 /* ================= critical sections (CRITICAL_SECTION: +0x0C RecursionCount, +0x10 OwningThread) ================= */
 struct cs { void *dbg; i32 lock, rec; u64 owner, sem, spin; };

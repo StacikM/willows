@@ -225,6 +225,36 @@ isr_common:
     add $16, %rsp
     iretq
 
+/* ---- ctx_restore(CONTEXT *ctx): resume a thread exactly as a Windows CONTEXT (x64 layout) describes it - all general registers,
+   rflags, rsp, rip and the SSE state. Used when a vectored exception handler answers "continue execution". Never returns. ---- */
+.global ctx_restore
+ctx_restore:
+    fxrstor64 0x100(%rdi)
+    movzwq 0x42(%rdi), %rax
+    push %rax                    /* ss */
+    pushq 0x98(%rdi)             /* rsp */
+    movl 0x44(%rdi), %eax
+    push %rax                    /* rflags */
+    movzwq 0x38(%rdi), %rax
+    push %rax                    /* cs */
+    pushq 0xf8(%rdi)             /* rip */
+    mov 0x78(%rdi), %rax
+    mov 0x80(%rdi), %rcx
+    mov 0x88(%rdi), %rdx
+    mov 0x90(%rdi), %rbx
+    mov 0xa0(%rdi), %rbp
+    mov 0xa8(%rdi), %rsi
+    mov 0xb8(%rdi), %r8
+    mov 0xc0(%rdi), %r9
+    mov 0xc8(%rdi), %r10
+    mov 0xd0(%rdi), %r11
+    mov 0xd8(%rdi), %r12
+    mov 0xe0(%rdi), %r13
+    mov 0xe8(%rdi), %r14
+    mov 0xf0(%rdi), %r15
+    mov 0xb0(%rdi), %rdi
+    iretq
+
 /* ---- IRQs: save caller-saved registers, call C handler, EOI ---- */
 .macro IRQ name, handler, slave
 .global \name

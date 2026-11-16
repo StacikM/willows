@@ -83,6 +83,7 @@ void proc_exit(int code){
   vmem_cleanup(p->pid);
   heap_free_process(p->pid);                          /* its HeapAlloc / malloc memory it never freed */
   kobj_proc_exit(p->pid);                             /* and the events, mutexes, threads ... it still had handles to */
+  { extern void veh_proc_exit(int); veh_proc_exit(p->pid); }   /* its vectored exception handlers */
   pe_unload(p->img.base);
   p->used=0;
   for(;;) schedule();                                 /* never resumed */
@@ -95,7 +96,7 @@ void proc_kill(int pid){                             /* close button on a window
   if(p==cur) proc_exit(0xC000013A);
   release_pipes(p);
   con_quiet++; kprintf("\n< %s closed\n",p->name); con_quiet--;
-  wm_cleanup(pid); p->used=0; thread_kill_all(pid); dll_cleanup(pid); vmem_cleanup(pid); heap_free_process(pid); kobj_proc_exit(pid); pe_unload(p->img.base);
+  wm_cleanup(pid); p->used=0; thread_kill_all(pid); dll_cleanup(pid); vmem_cleanup(pid); heap_free_process(pid); kobj_proc_exit(pid); { extern void veh_proc_exit(int); veh_proc_exit(pid); } pe_unload(p->img.base);
 }
 
 static int name_matches(const char *app, const char *want){             /* "notepad" matches "notepad.exe" */

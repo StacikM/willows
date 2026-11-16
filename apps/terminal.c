@@ -144,12 +144,13 @@ static void c_help(int argc, char **argv, const char *in){
   outp(GRY "Tab completes, Up/Down browse history, PgUp/PgDn scroll, Ctrl+L clears, Ctrl+C cancels the line.\n" RST);
 }
 static void c_echo(int argc, char **argv, const char *in){ (void)in; for(int i = 1; i < argc; i++) outp("%s%s", i > 1 ? " " : "", argv[i]); outp("\n"); }
+static int is_dots(const char *n){ return n[0] == '.' && (!n[1] || (n[1] == '.' && !n[2])); }   /* the "." and ".." entries of a listing */
 static void c_ls(int argc, char **argv, const char *in){
   (void)in; WIN32_FIND_DATAA fd; static char names[256][64]; static DWORD sizes[256], attrs[256]; char *idx[256]; int n = 0;
   const char *pat = "*"; for(int i = 1; i < argc; i++) if(argv[i][0] != '-') pat = argv[i];
   char buf[200]; if(API(kernel32, GetFileAttributesA)(pat) == 0x10){ snprintf(buf, sizeof buf, "%s\\*", pat); pat = buf; }      /* "ls dir" lists the folder */
   HANDLE h = API(kernel32, FindFirstFileA)(pat, &fd);
-  if(h != (HANDLE)~0ull){ do { if(n < 256){ snprintf(names[n], 64, "%s", fd.name); sizes[n] = fd.sizeLow; attrs[n] = fd.attr; idx[n] = names[n]; n++; } } while(API(kernel32, FindNextFileA)(h, &fd)); API(kernel32, FindClose)(h); }
+  if(h != (HANDLE)~0ull){ do { if(n < 256 && !is_dots(fd.name)){ snprintf(names[n], 64, "%s", fd.name); sizes[n] = fd.sizeLow; attrs[n] = fd.attr; idx[n] = names[n]; n++; } } while(API(kernel32, FindNextFileA)(h, &fd)); API(kernel32, FindClose)(h); }
   if(!n){ outp(GRY "(empty)\n" RST); return; }
   qsort_(idx, n);
   for(int pass = 0; pass < 2; pass++) for(int i = 0; i < n; i++){                      /* folders first */
@@ -166,7 +167,7 @@ static void c_cat(int argc, char **argv, const char *in){
 static void rm_tree(const char *dir){
   char pat[300]; snprintf(pat, sizeof pat, "%s\\*", dir); WIN32_FIND_DATAA fd; static char kids[64][64]; static DWORD ka[64]; int n = 0;
   HANDLE h = API(kernel32, FindFirstFileA)(pat, &fd);
-  if(h != (HANDLE)~0ull){ do { if(n < 64){ snprintf(kids[n], 64, "%s", fd.name); ka[n++] = fd.attr; } } while(API(kernel32, FindNextFileA)(h, &fd)); API(kernel32, FindClose)(h); }
+  if(h != (HANDLE)~0ull){ do { if(n < 64 && !is_dots(fd.name)){ snprintf(kids[n], 64, "%s", fd.name); ka[n++] = fd.attr; } } while(API(kernel32, FindNextFileA)(h, &fd)); API(kernel32, FindClose)(h); }
   for(int i = 0; i < n; i++){ char p2[400]; snprintf(p2, sizeof p2, "%s\\%s", dir, kids[i]); if(ka[i] & 0x10) rm_tree(p2); else API(kernel32, DeleteFileA)(p2); }
   API(kernel32, RemoveDirectoryA)(dir);
 }
@@ -483,7 +484,7 @@ static void complete(void){
   static char matches[300][64]; int nm = 0;
   if(first){ for(int i = 0; i < NCMDS && nm < 300; i++) if(!strncasecmp_(cmds[i].name, prefix, pl) && cmds[i].name[0] != '?') snprintf(matches[nm++], 64, "%s", cmds[i].name); }
   else { WIN32_FIND_DATAA fd; HANDLE h = API(kernel32, FindFirstFileA)("*", &fd);
-    if(h != (HANDLE)~0ull){ do { if(!strncasecmp_(fd.name, prefix, pl) && nm < 300) snprintf(matches[nm++], 64, "%s", fd.name); } while(API(kernel32, FindNextFileA)(h, &fd)); API(kernel32, FindClose)(h); } }
+    if(h != (HANDLE)~0ull){ do { if(!is_dots(fd.name) && !strncasecmp_(fd.name, prefix, pl) && nm < 300) snprintf(matches[nm++], 64, "%s", fd.name); } while(API(kernel32, FindNextFileA)(h, &fd)); API(kernel32, FindClose)(h); } }
   if(!nm) return;
   int common = (int)strlen(matches[0]); for(int i = 1; i < nm; i++){ int k = 0; while(k < common && tolower((unsigned char)matches[0][k]) == tolower((unsigned char)matches[i][k])) k++; common = k; }
   if(common > pl){ char add[64]; memcpy(add, matches[0] + pl, common - pl); add[common - pl] = 0; for(char *a = add; *a; a++) insert_char(*a); if(nm == 1) insert_char(' '); }

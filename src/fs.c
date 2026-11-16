@@ -93,18 +93,21 @@ int fs_list(const char *dir, struct ramfile **out, int max){
 }
 static int has_children(const char *c){ int n=(int)strlen(c); for(int i=0;i<MAXFILES;i++) if(files[i].used && !strncmp_ci(files[i].name,c,n) && files[i].name[n]=='/') return 1; return 0; }
 static int is_default_dir(const char *c){ return !stricmp(c,"Desktop")||!stricmp(c,"Documents")||!stricmp(c,"Downloads"); }
+static int orphan_if_open(struct ramfile *f);
+int fmap_borrows(const void *data);
 int fs_remove(const char *path){
   char c[128]; fs_canon(path,c,sizeof c); struct ramfile *f=find_canon(c); if(!f) return -1;
   if(f->isdir && (has_children(c) || is_default_dir(c))) return -1;
   if(f->boot) tomb_add(c);
-  if(f->heapd){ heap_free(f->data); f->data=0; f->heapd=0; }                    /* give the memory back (a deleted 150 MB download) */
+  if(!f->isdir) orphan_if_open(f);                                              /* still open: the handles keep the data (Windows' delete-pending) */
+  if(f->heapd && !fmap_borrows(f->data)){ heap_free(f->data); f->data=0; f->heapd=0; }   /* give the memory back (a deleted 150 MB download) - unless a mapping shows it */
   f->used=0; fs_gen++; if(!is_temp(f)) fs_sync_soon(); return 0;
 }
 int fs_remove_tree(const char *path){
   char c[128]; fs_canon(path,c,sizeof c); struct ramfile *f=find_canon(c); if(!f) return -1;
   if(is_default_dir(c) && f->isdir){ int n=(int)strlen(c); for(int i=0;i<MAXFILES;i++) if(files[i].used && !strncmp_ci(files[i].name,c,n) && files[i].name[n]=='/'){ if(files[i].boot) tomb_add(files[i].name); files[i].used=0; } fs_gen++; fs_sync_soon(); return 0; }
   int n=(int)strlen(c);
-  for(int i=0;i<MAXFILES;i++) if(files[i].used && !strncmp_ci(files[i].name,c,n) && files[i].name[n]=='/'){ if(files[i].boot) tomb_add(files[i].name); files[i].used=0; }
+  for(int i=0;i<MAXFILES;i++) if(files[i].used && !strncmp_ci(files[i].name,c,n) && files[i].name[n]=='/'){ if(files[i].boot) tomb_add(files[i].name); if(!files[i].isdir) orphan_if_open(&files[i]); files[i].used=0; }
   if(f->boot) tomb_add(c); f->used=0; fs_gen++; if(!is_temp(f)) fs_sync_soon(); return 0;
 }
 int fs_rename(const char *from, const char *to){
@@ -229,6 +232,23 @@ static struct kfile *alloc_open_any(struct ramfile *f, int w, int app){         
   win32_set_last_error(4); return NULL;                                              /* ERROR_TOO_MANY_OPEN_FILES */
 }
 static struct kfile *alloc_open(struct ramfile *f, int w, int app){ if(f->isdir) return NULL; return alloc_open_any(f,w,app); }
+/* A file deleted while open (SQLite deletes its journals this way) keeps working through the handles that are open, as on Windows:
+   its data moves to a nameless entry outside the file table, freed when the last handle closes. The table slot is freed right away. */
+static int is_orphan(const struct ramfile *f){ return f<files || f>=files+MAXFILES; }
+static int orphan_if_open(struct ramfile *f){
+  int n=0; for(int i=0;i<MAXOPEN;i++) if(opens[i].used && opens[i].f==f) n++;
+  if(!n) return 0;
+  struct ramfile *o=heap_alloc(sizeof *o); if(!o) return 0;
+  *o=*f; o->persist=0; o->boot=0; o->name[0]=0;
+  for(int i=0;i<MAXOPEN;i++) if(opens[i].used && opens[i].f==f) opens[i].f=o;
+  f->data=0; f->heapd=0; f->size=0; f->cap=0; return 1;
+}
+static void close_kfile(struct kfile *k){
+  struct ramfile *f=k->f; k->used=0;
+  if(is_orphan(f)){ for(int i=0;i<MAXOPEN;i++) if(opens[i].used && opens[i].f==f) return;
+    if(f->heapd && !fmap_borrows(f->data)) heap_free(f->data); heap_free(f); return; }
+  if(f->dirty && !is_temp(f)) fs_sync_soon();
+}
 
 /* ---- C stdio (msvcrt/ucrt) ---- */
 static void *WINAPI c_fopen(const char *path, const char *mode){
@@ -239,7 +259,7 @@ static void *WINAPI c_fopen(const char *path, const char *mode){
   if(!f) return NULL;
   return alloc_open(f,w,mode[0]=='a');
 }
-static int WINAPI c_fclose(void *fp){ if(!fs_is_file(fp)) return -1; struct kfile *k=fp; k->used=0; if(k->f->dirty && !is_temp(k->f)) fs_sync_soon(); return 0; }
+static int WINAPI c_fclose(void *fp){ if(!fs_is_file(fp)) return -1; close_kfile(fp); return 0; }
 static u64 WINAPI c_fread(void *buf, u64 sz, u64 n, void *fp){
   if(!fs_is_file(fp)||!sz) return 0; struct kfile *k=fp;
   u64 want=sz*n, have=k->pos<k->f->size? k->f->size-k->pos : 0; if(want>have) want=have;
@@ -290,7 +310,7 @@ int fs_is_handle(u64 h){ return h>=H_FILE && h<H_FILE+MAXOPEN && opens[h-H_FILE]
 void fs_hseek(u64 h, u64 pos){ if(fs_is_handle(h)) opens[h-H_FILE].pos=pos; }        /* the position of an OVERLAPPED transfer */
 int fs_hread(u64 h, void *buf, u32 n, u32 *got){ u64 r=c_fread(buf,1,n,&opens[h-H_FILE]); if(got) *got=(u32)r; return 1; }
 int fs_hwrite(u64 h, const void *buf, u32 n, u32 *wr){ u64 r=c_fwrite(buf,1,n,&opens[h-H_FILE]); if(wr) *wr=(u32)r; return r==n; }
-int fs_hclose(u64 h){ struct kfile *k=&opens[h-H_FILE]; k->used=0; if(k->f->dirty && !is_temp(k->f)) fs_sync_soon(); return 1; }
+int fs_hclose(u64 h){ close_kfile(&opens[h-H_FILE]); extern void iocp_forget(u64); iocp_forget(h); return 1; }   /* (file handle numbers are reused) */
 /* SetEndOfFile: the file ends at the current position. Growing allocates the exact size once (a large download is pre-sized this way instead of grown step by step). */
 int fs_set_eof(u64 h){
   if(!fs_is_handle(h)) return 0; struct kfile *k=&opens[h-H_FILE]; struct ramfile *f=k->f; u64 pos=k->pos;
@@ -354,29 +374,39 @@ static int glob_ci(const char *p, const char *s){
   if(*p=='*') return glob_ci(p+1,s) || (*s && glob_ci(p,s+1));
   return *s && (*p=='?' || (*p|32)==(*s|32)) && glob_ci(p+1,s+1);
 }
-static struct { u8 used; int n, next; struct ramfile *list[256]; } finds[8];
+/* Directory listings. As on Windows, a folder other than the drive root lists "." and ".." first, so an empty folder is a
+   successful listing, not an error (Firefox's storage code treats a failed listing of its empty storage\temporary as fatal). */
+#define MAXFIND 16
+#define FINDMAX 512
+static struct { u8 used, dots; int n, next; struct ramfile *list[FINDMAX]; } finds[MAXFIND];
 static int find_fill(int h, u8 *fd){
+  memset(fd,0,320);
+  if(finds[h].dots){ int two= finds[h].dots==2; finds[h].dots--; *(u32*)fd=0x10; fd[44]='.'; if(two) fd[45]='.'; return 1; }   /* "." then ".." */
   if(finds[h].next>=finds[h].n) return 0;
   struct ramfile *f=finds[h].list[finds[h].next++];
-  memset(fd,0,320); *(u32*)fd= f->isdir? 0x10 : 0x80; *(u32*)(fd+28)=(u32)(f->size>>32); *(u32*)(fd+32)=(u32)f->size;
+  *(u32*)fd= f->isdir? 0x10 : 0x80; *(u32*)(fd+28)=(u32)(f->size>>32); *(u32*)(fd+32)=(u32)f->size;
   u64 t=fs_mtime(f); memcpy(fd+4,&t,8); memcpy(fd+12,&t,8); memcpy(fd+20,&t,8);       /* creation, access, write time */
   const char *lf=fs_leaf(f); unsigned n=0; while(lf[n] && n<259){ fd[44+n]=lf[n]; n++; } fd[44+n]=0; return 1;
 }
 static u64 WINAPI k_FindFirstFileA(const char *pat, u8 *fd){
-  for(int i=0;i<8;i++) if(!finds[i].used){
-    char dirp[128]; unsigned k=0; int cut=-1; for(;pat[k];k++) if(pat[k]=='/'||pat[k]=='\\') cut=(int)k;
-    if(cut>=0){ memcpy(dirp,pat,cut); dirp[cut]=0; if(cut==0){ dirp[0]='/'; dirp[1]=0; } } else dirp[0]=0;
-    const char *lp= cut>=0? pat+cut+1 : pat; char leaf[64]; unsigned n=0; while(lp[n] && n<63){ leaf[n]=lp[n]; n++; } leaf[n]=0;
+  for(int i=0;i<MAXFIND;i++) if(!finds[i].used){
+    char dirp[260]; unsigned k=0; int cut=-1; for(;pat[k];k++) if(pat[k]=='/'||pat[k]=='\\') cut=(int)k;
+    if(cut>=(int)sizeof dirp){ win32_set_last_error(206); return (u64)-1; }                       /* ERROR_FILENAME_EXCED_RANGE */
+    if(cut>=0){ memcpy(dirp,pat,cut); dirp[cut]=0; if(cut==0){ dirp[0]='/'; dirp[1]=0; } } else { dirp[0]='.'; dirp[1]=0; }
+    if(!fs_isdir(dirp)){ win32_set_last_error(3); return (u64)-1; }                               /* ERROR_PATH_NOT_FOUND */
+    const char *lp= cut>=0? pat+cut+1 : pat; char leaf[260]; unsigned n=0; while(lp[n] && n<259){ leaf[n]=lp[n]; n++; } leaf[n]=0;
     if(!n || !strcmp(leaf,"*.*")){ leaf[0]='*'; leaf[1]=0; }
-    struct ramfile *all[256]; int cnt=fs_list(dirp[0]? dirp : ".", all, 256);
-    finds[i].used=1; finds[i].n=0; finds[i].next=0;
-    for(int j=0;j<cnt;j++) if(glob_ci(leaf,fs_leaf(all[j]))) finds[i].list[finds[i].n++]=all[j];
-    if(find_fill(i,fd)) return 0x5100+i; finds[i].used=0; win32_set_last_error(2); return (u64)-1;
+    char canon[128]; fs_canon(dirp,canon,sizeof canon);
+    finds[i].used=1; finds[i].n=0; finds[i].next=0; finds[i].dots= (canon[0] && glob_ci(leaf,"."))? 2 : 0;   /* the root has no "." and ".." */
+    int cnt=fs_list(dirp, finds[i].list, FINDMAX), m=0;
+    for(int j=0;j<cnt;j++) if(glob_ci(leaf,fs_leaf(finds[i].list[j]))) finds[i].list[m++]=finds[i].list[j];
+    finds[i].n=m;
+    if(find_fill(i,fd)) return 0x5100+i; finds[i].used=0; win32_set_last_error(2); return (u64)-1;  /* nothing matches: ERROR_FILE_NOT_FOUND */
   }
   win32_set_last_error(4); return (u64)-1;
 }
-static int WINAPI k_FindNextFileA(u64 h, u8 *fd){ if(h<0x5100||h>=0x5108||!finds[h-0x5100].used) return 0; if(find_fill((int)(h-0x5100),fd)) return 1; win32_set_last_error(18); return 0; }
-static int WINAPI k_FindClose(u64 h){ if(h>=0x5100&&h<0x5108) finds[h-0x5100].used=0; return 1; }
+static int WINAPI k_FindNextFileA(u64 h, u8 *fd){ if(h<0x5100||h>=0x5100+MAXFIND||!finds[h-0x5100].used) return 0; if(find_fill((int)(h-0x5100),fd)) return 1; win32_set_last_error(18); return 0; }
+static int WINAPI k_FindClose(u64 h){ if(h>=0x5100&&h<0x5100+MAXFIND) finds[h-0x5100].used=0; return 1; }
 static int WINAPI k_CopyFileA(const char *src, const char *dst, int failIfExists){
   struct ramfile *a=fs_find(src); if(!a||a->isdir){ win32_set_last_error(2); return 0; }
   struct ramfile *ex=fs_find(dst); if(ex && (failIfExists||ex->isdir)){ win32_set_last_error(80); return 0; }

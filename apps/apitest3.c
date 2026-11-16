@@ -116,6 +116,35 @@ static void showcase(HANDLE dc){
   RECT big = {320, 295, 620, 360}; API(user32, DrawTextW)(dc, W("Clipped to a rectangle: only the middle of this long line is visible"), -1, &big, 0x20 | 0x100); API(gdi32, RestoreDC)(dc, -1);
   API(user32, DrawTextW)(dc, W("Centered"), -1, &(RECT){320, 365, 620, 420}, 1 | 4 | 0x20);
 }
+/* vectored exception handlers: a NULL read is caught, the handler skips the instruction and sets rax; RaiseException is offered too */
+IMP(kernel32, void*, AddVectoredExceptionHandler, (U32, void*))
+IMP(kernel32, U32, RemoveVectoredExceptionHandler, (void*))
+IMP(kernel32, void, RaiseException, (U32, U32, U32, const U64*))
+static int veh_hits, raised; static U64 veh_addr; static U32 veh_code;
+static long WINAPI on_exception(void **ptrs){
+  unsigned char *rec = ptrs[0], *ctx = ptrs[1]; U32 code = *(U32*)rec;
+  if(code == 0xE0001234){ raised++; return -1; }
+  if(code != 0xC0000005) return 0;
+  veh_code = code; veh_addr = ((U64*)(rec + 0x20))[1]; veh_hits++;
+  *(U64*)(ctx + 0xf8) += 3;      /* Rip: skip "mov rax, [rcx]" (48 8b 01) */
+  *(U64*)(ctx + 0x78) = 42;      /* Rax */
+  return -1;                     /* EXCEPTION_CONTINUE_EXECUTION */
+}
+static void exception_checks(void){
+  void *h = API(kernel32, AddVectoredExceptionHandler)(1, (void*)on_exception); check("AddVectoredExceptionHandler", h != 0);
+  U64 rax_out, xmm_out, in = 0x1122334455667788ull;
+  __asm__ volatile("movq %[in], %%xmm6\n\t"
+                   "xor %%ecx, %%ecx\n\t"
+                   "xor %%eax, %%eax\n\t"
+                   ".byte 0x48, 0x8b, 0x01\n\t"          /* mov rax, [rcx]: reads address 0 */
+                   "movq %%xmm6, %[x]\n\t"
+                   : "=a"(rax_out), [x]"=r"(xmm_out) : [in]"r"(in) : "rcx", "xmm6", "memory");
+  check("fault handled, execution resumes with the handler's registers", rax_out == 42 && veh_hits == 1);
+  check("exception record: access violation reading address 0", veh_code == 0xC0000005 && veh_addr == 0);
+  check("SSE registers survive the exception", xmm_out == in);
+  API(kernel32, RaiseException)(0xE0001234, 0, 0, 0); check("RaiseException reaches the handler and continues", raised == 1);
+  check("RemoveVectoredExceptionHandler", API(kernel32, RemoveVectoredExceptionHandler)(h) != 0);
+}
 static LRESULT WINAPI wndproc(HANDLE h, UINT m, WPARAM wp, LPARAM lp){
   if(m == WM_PAINT){ PAINTSTRUCT ps; HANDLE dc = API(user32, BeginPaint)(h, &ps); if(dc) showcase(dc); API(user32, EndPaint)(h, &ps); return 0; }
   if(m == WM_DESTROY){ API(user32, PostQuitMessage)(0); return 0; }
@@ -127,5 +156,5 @@ int main(int argc, char **argv){
     wnd = API(user32, CreateWindowExA)(0, "WGDITEST", "GDI showcase", WS_OVERLAPPEDWINDOW | WS_VISIBLE, CW_USEDEFAULT, CW_USEDEFAULT, 660, 470, 0, 0, hi, 0);
     MSG msg; while(API(user32, GetMessageA)(&msg, 0, 0, 0)){ API(user32, TranslateMessage)(&msg); API(user32, DispatchMessageA)(&msg); } return 0;
   }
-  verbose = argc > 1; run_checks(); printf("\n%s: %d of %d checks passed\n", fails ? "SOME TESTS FAILED" : "ALL TESTS PASSED", total - fails, total); return fails;
+  verbose = argc > 1; run_checks(); exception_checks(); printf("\n%s: %d of %d checks passed\n", fails ? "SOME TESTS FAILED" : "ALL TESTS PASSED", total - fails, total); return fails;
 }

@@ -67,6 +67,8 @@ static void ov_finish(u64 h, u8 *ov, u32 status, u32 bytes, int post){         /
   u64 ev=*(u64*)(ov+24);
   if(ev&~1ull){ BOOL (WINAPI *se)(HANDLE)=K32("SetEvent"); if(se) se(ev&~1ull); }
   int queued= post && !(ev&1)? iocp_complete(h,bytes,(u64)ov) : 0;                /* hEvent with the low bit set: no packet */
+  if(status && pipe_is_handle(h) && pipe_trace()){ extern u64 iocp_key_of(u64); kdbg("  [pipe!] %p: completion status %x, key %p, ov %p, %s (pid %d)\n",(void*)h,status,(void*)iocp_key_of(h),(void*)ov,queued? "packet queued" : "no packet",cur->pid); }
+  if(status==STATUS_PIPE_BROKEN){ struct pipe *p=pp(h); kdbg("  [pipe!] %p (%s) side %d: broken (refs %d/%d, connected %d) in pid %d\n",(void*)h,p->named? p->name : "anon",side(h),p->refs[0],p->refs[1],p->connected,cur->pid); }
   if(pipe_trace()) kdbg("  [pipe] %p: completed (status %x, %u bytes, event %p, %s) in pid %d\n",(void*)h,status,bytes,(void*)ev,queued? "packet queued" : "no port",cur->pid);
 }
 static void pipe_kick(struct pipe *p){                                          /* finish what can be finished */
@@ -80,6 +82,7 @@ static void pipe_kick(struct pipe *p){                                          
 }
 static int pend_add(u64 h, int connect, u8 *buf, u32 n, u8 *ov){
   for(int i=0;i<MAXPEND;i++) if(!PD[i].used){ PD[i]=(struct pend){1,(u8)connect,cur->pid,h,buf,n,ov}; *(u64*)ov=STATUS_PENDING; *(u64*)(ov+8)=0; return 1; }
+  kdbg("  [pipe!] %p: no room for another pending operation (%d in use) in pid %d\n",(void*)h,MAXPEND,cur->pid);
   return 0;
 }
 static int pipe_cancel(u64 h, u8 *ov){                                          /* CancelIo(Ex), and closing the handle */
@@ -94,7 +97,8 @@ void pipe_close_for(u64 h, int pid){
   if(!pipe_is_handle(h)) return; struct pipe *p=pp(h); int s=side(h);
   if(pid>=0 && pid<MAXPROC && p->own[s][pid]) p->own[s][pid]--;
   if(p->refs[s]>0) p->refs[s]--;
-  if(p->refs[s]<=0) pipe_cancel(h,0);
+  if(pipe_trace()) kdbg("  [pipe] %p (%s) side %d: closed by pid %d (refs now %d/%d)\n",(void*)h,p->named? p->name : "anon",s,pid,p->refs[0],p->refs[1]);
+  if(p->refs[s]<=0){ pipe_cancel(h,0); extern void iocp_forget(u64); iocp_forget(h); }   /* that end is gone: its pending I/O is cancelled (the packets still go to its port), then the association */
   pipe_kick(p);                                                                 /* readers on the other side see the end */
   if(p->refs[0]<=0 && p->refs[1]<=0){ heap_free(p->buf[0]); heap_free(p->buf[1]); p->used=0; }
 }
@@ -107,7 +111,7 @@ int pipe_read_ov(u64 h, void *buf, u32 n, u32 *got, u8 *ov){
   if(rr<0){ win32_set_last_error(5); return 0; }                                  /* the write end cannot be read */
   if(ov){
     if(p->r[rr]!=p->w[rr]){ u32 k=ring_take(p,rr,buf,n); if(got) *got=k; ov_finish(h,ov,0,k,1); return 1; }
-    if(p->refs[1-s]<=0 && (!p->named || p->connected || s==1)){ win32_set_last_error(ERR_BROKEN_PIPE); return 0; }
+    if(p->refs[1-s]<=0 && (!p->named || p->connected || s==1)){ kdbg("  [pipe!] %p (%s) side %d: read, other end closed (refs %d/%d) in pid %d\n",(void*)h,p->named? p->name : "anon",s,p->refs[0],p->refs[1],cur->pid); win32_set_last_error(ERR_BROKEN_PIPE); return 0; }
     if(!pend_add(h,0,buf,n,ov)){ win32_set_last_error(8); return 0; }
     if(pipe_trace()) kdbg("  [pipe] %p: read %u bytes pending (pid %d)\n",(void*)h,n,cur->pid);
     win32_set_last_error(997); return 0;                                          /* ERROR_IO_PENDING */
@@ -123,8 +127,8 @@ int pipe_read(u64 h, void *buf, u32 n, u32 *got){ return pipe_read_ov(h,buf,n,go
 int pipe_write_ov(u64 h, const void *buf, u32 n, u32 *wrote, u8 *ov){
   struct pipe *p=pp(h); int s=side(h), tr=tx_ring(p,s); if(wrote) *wrote=0;
   if(tr<0){ win32_set_last_error(5); return 0; }
-  if(p->refs[1-s]<=0 && (!p->named || p->connected || s==1)){ win32_set_last_error(ERR_NO_DATA); return 0; }   /* nobody left to read */
-  if(!ring_grow(p,tr,n)){ win32_set_last_error(8); return 0; }
+  if(p->refs[1-s]<=0 && (!p->named || p->connected || s==1)){ kdbg("  [pipe!] %p (%s) side %d: write %u bytes, other end closed (refs %d/%d) in pid %d\n",(void*)h,p->named? p->name : "anon",s,n,p->refs[0],p->refs[1],cur->pid); win32_set_last_error(ERR_NO_DATA); return 0; }   /* nobody left to read */
+  if(!ring_grow(p,tr,n)){ kdbg("  [pipe!] %p: write %u bytes, out of memory in pid %d\n",(void*)h,n,cur->pid); win32_set_last_error(8); return 0; }
   const u8 *d=buf; for(u32 i=0;i<n;i++) p->buf[tr][(p->w[tr]+i)%p->cap[tr]]=d[i];
   p->w[tr]+=n; if(wrote) *wrote=n;
   if(pipe_trace()) kdbg("  [pipe] %p: write %u bytes%s (pid %d)\n",(void*)h,n,ov? " overlapped" : "",cur->pid);
@@ -153,13 +157,13 @@ u64 pipe_open_client(const char *name){
   char t[PNAME]; if(!pipe_name(name,t,sizeof t)) return 0;
   for(int i=0;i<MAXPIPE;i++){ struct pipe *p=&P[i]; if(p->used && p->named && !p->connected && p->refs[0]>0 && !stricmp(p->name,t)){
     p->connected=1; p->refs[1]=0; memset(p->own[1],0,MAXPROC); ref_add(p,1,cur->pid); p->pid[1]=cur->pid; pipe_kick(p); if(pipe_trace()) kdbg("  [pipe] %s: client connected (pid %d)\n",t,cur->pid); return PIPE_BASE+(u64)i*2+1; } }
-  if(pipe_trace()) kdbg("  [pipe] %s: no server to connect to (pid %d)\n",t,cur->pid);
+  kdbg("  [pipe!] %s: no server to connect to (pid %d)\n",t,cur->pid);
   return 0;
 }
 static u64 WINAPI i_CreateNamedPipeA(const char *name, DWORD om, DWORD pm, DWORD max, DWORD out, DWORD in, DWORD to, void *sa){
   (void)pm;(void)max;(void)out;(void)in;(void)to;(void)sa; char t[PNAME]; if(!name || !pipe_name(name,t,sizeof t)){ win32_set_last_error(ERR_INVALID_PARAMETER); return (u64)-1; }
   if(om&0x80000){ for(int i=0;i<MAXPIPE;i++) if(P[i].used && P[i].named && !stricmp(P[i].name,t)){ win32_set_last_error(5); return (u64)-1; } }   /* FILE_FLAG_FIRST_PIPE_INSTANCE */
-  struct pipe *p=pipe_alloc(1); if(!p){ win32_set_last_error(8); return (u64)-1; }
+  struct pipe *p=pipe_alloc(1); if(!p){ kdbg("  [pipe!] CreateNamedPipe(%s): all %d pipes in use (pid %d)\n",t,MAXPIPE,cur->pid); win32_set_last_error(8); return (u64)-1; }
   memcpy(p->name,t,strlen(t)+1); ref_add(p,0,cur->pid); p->pid[0]=cur->pid;
   if(pipe_trace()) kdbg("  [pipe] CreateNamedPipe(%s, mode %x) = %p (pid %d)\n",t,om,(void*)(PIPE_BASE+(u64)(p-P)*2),cur->pid);
   win32_set_last_error(0); return PIPE_BASE+(u64)(p-P)*2;
@@ -209,6 +213,8 @@ struct fmap { u8 used, write, borrowed; int refs, views;                /* borro
 struct view { u8 *p; u64 len; int map; };
 static struct fmap M[MAXMAP]; static struct view V[MAXVIEW];
 int map_is_handle(u64 h){ return h>=MAPBASE && h<MAPBASE+MAXMAP && M[h-MAPBASE].used; }
+/* fs.c asks before freeing a deleted file's data: a read-only mapping may be showing that very memory */
+int fmap_borrows(const void *data){ if(!data) return 0; for(int i=0;i<MAXMAP;i++) if(M[i].used && M[i].borrowed && M[i].base==data) return 1; return 0; }
 void map_addref(u64 h){ if(map_is_handle(h)) M[h-MAPBASE].refs++; }                  /* DuplicateHandle */
 /* NtQuerySection(SectionBasicInformation): {BaseAddress, AllocationAttributes, MaximumSize} */
 static u32 WINAPI i_NtQuerySection(u64 h, u32 cls, u8 *out, u64 len, u64 *ret){
