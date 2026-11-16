@@ -109,7 +109,11 @@ static DWORD WINAPI x_GetSystemDirectoryW(u16 *b, DWORD n){ if(n<19) return 19; 
 static DWORD WINAPI x_GetLogicalDrives(void){ return 1<<2; }
 static u32 WINAPI x_GetDriveTypeA(const char *p){ (void)p; return 3; }
 static u32 WINAPI x_GetDriveTypeW(const u16 *p){ (void)p; return 3; }
-static BOOL WINAPI x_GetDiskFreeSpaceExA(const char *p, u64 *a, u64 *t, u64 *f){ (void)p; if(a) *a=48ull<<20; if(t) *t=64ull<<20; if(f) *f=48ull<<20; return 1; }
+void fs_disk_usage(u64 *used, u64 *total);
+static BOOL WINAPI x_GetDiskFreeSpaceExA(const char *p, u64 *a, u64 *t, u64 *f){   /* C: = the saved-data area of the boot disk */
+  (void)p; u64 used, total; fs_disk_usage(&used,&total); u64 fr= used<total? total-used : 0;
+  if(a) *a=fr; if(t) *t=total; if(f) *f=fr; return 1;
+}
 static BOOL WINAPI x_GetVolumeInformationA(const char *r, char *vn, DWORD vl, DWORD *sn, DWORD *mc, DWORD *fl, char *fs, DWORD fl2){
   (void)r; if(vn&&vl>7) strcpy_(vn,"Willows"); if(sn) *sn=0x57494C4C; if(mc) *mc=255; if(fl) *fl=0x3; if(fs&&fl2>4) strcpy_(fs,"WFS"); return 1;
 }

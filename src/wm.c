@@ -556,6 +556,11 @@ static void app_icon(int x,int y,int sz,const char *name,int selected){
     gfx_round_rect(x+S(24),y+S(30),S(30),S(22),S(4),0xE2E8F0); gfx_round_rect(x+S(27),y+S(33),S(24),S(15),S(2),0x0F172A); L16(30,37,36,41,24,0x4ADE80); return; }
   if(!strcmp(k,"fastfetch")){
     gfx_round_rect(x,y,sz,sz,sz/4,0x7C3AED); for(int i=0;i<4;i++){ gfx_round_rect(x+S(14),y+S(16+i*9),S(6),S(5),S(2),0xC4B5FD); gfx_round_rect(x+S(24),y+S(16+i*9),S(i&1? 18 : 26),S(5),S(2),0xFFFFFF); } return; }
+  if(!strcmp(k,"getlibrewolf")){                                     /* download arrow: "Get LibreWolf" */
+    gfx_round_rect(x,y,sz,sz,sz/2,0x16A34A); L16(32,16,32,44,48,0xFFFFFF); L16(20,32,32,44,48,0xFFFFFF); L16(44,32,32,44,48,0xFFFFFF); L16(18,50,46,50,40,0xBBF7D0); return; }
+  if(!strcmp(k,"librewolf")){
+    gfx_round_rect(x,y,sz,sz,sz/2,0x1D74D8); gfx_round_rect(x+S(6),y+S(6),sz-S(12),sz-S(12),(sz-S(12))/2,0x2E8FF0);
+    const struct font *f=ui(FS_BOLD,sz*9/16); ui_text(f,x+(sz-ui_width(f,"L",1))/2,y+(sz-ui_lineh(f))/2,"L",1,0xFFFFFF); return; }
   #undef S
   gfx_round_rect(x,y,sz,sz,sz/4,name_color(k));
   char l[2]={*k>='a'&&*k<='z'? *k-32 : *k? *k : '?',0}; const struct font *f=ui(FS_BOLD,sz*5/9);
@@ -691,9 +696,44 @@ static int tb_y(void){ return (int)gfx_h-TB_H; }
 /* Start menu: real programs on the main panel; demos/tests live behind "Demos & tests" in a side panel.
    Item codes: 0.. main program, 100 demos toggle, 101 restart, 102 shut down, 200.. demo program. */
 static int main_idx[40], nmain, demo_idx[40], ndemo, demo_open;
+/* Installed programs: C:\System\shortcuts.cfg, one "Name|C:\path\program.exe" per line (written by installers such as the terminal's
+   getlibrewolf). In main_idx they are 1000 + their index; SC_GET_LW is the "Get LibreWolf" entry shown while none is installed. */
+#define MAXSC 16
+#define SC_BASE 1000
+#define SC_GET_LW 1999
+static struct { char name[32], path[160]; } sc[MAXSC]; static int nsc;
+static void shortcuts_load(void){
+  nsc=0; struct ramfile *f=fs_find("/System/shortcuts.cfg"); if(!f || f->isdir || !f->data) return;
+  const char *p=(const char *)f->data, *end=p+f->size;
+  while(p<end && nsc<MAXSC){
+    const char *e=p; while(e<end && *e!='\n') e++;
+    const char *bar=p; while(bar<e && *bar!='|') bar++;
+    if(bar<e && bar>p){ int n=0; for(const char *q=p;q<bar && n<31;q++) sc[nsc].name[n++]=*q; sc[nsc].name[n]=0;
+      n=0; for(const char *q=bar+1;q<e && *q!='\r' && n<159;q++) sc[nsc].path[n++]=*q; sc[nsc].path[n]=0; if(sc[nsc].path[0]) nsc++; }
+    p=e+1;
+  }
+}
+static int has_librewolf(void){ for(int i=0;i<nsc;i++){ int l=strlen(sc[i].path); if(l>=13 && !stricmp(sc[i].path+l-13,"librewolf.exe")) return 1; } return 0; }
 static void menu_build(void){
-  nmain=ndemo=0;
+  nmain=ndemo=0; shortcuts_load();
   for(int i=0;i<app_count();i++){ if(app_is_demo(i)){ if(ndemo<40) demo_idx[ndemo++]=i; } else if(nmain<40) main_idx[nmain++]=i; }
+  for(int i=0;i<nsc && nmain<40;i++) main_idx[nmain++]=SC_BASE+i;
+  if(!has_librewolf() && nmain<40) main_idx[nmain++]=SC_GET_LW;
+}
+/* a Start menu entry: the key that picks its icon, and the name shown */
+static const char *item_key(int idx){ return idx==SC_GET_LW? "getlibrewolf" : idx>=SC_BASE? sc[idx-SC_BASE].path : app_name(idx); }
+static void app_display(const char *n, char *out, int max);
+static void item_display(int idx, char *out, int max){
+  if(idx==SC_GET_LW){ cpy(out,"Get LibreWolf",max); return; }
+  if(idx>=SC_BASE){ cpy(out,sc[idx-SC_BASE].name,max); return; }
+  app_display(app_name(idx),out,max);
+}
+static void shortcut_launch(int i){
+  char cmd[200], dir[160]; int l=0; cmd[l++]='"'; for(const char *q=sc[i].path;*q && l<196;q++) cmd[l++]=*q; cmd[l++]='"'; cmd[l]=0;
+  cpy(dir,sc[i].path,160); int n=strlen(dir); while(n>0 && dir[n-1]!='\\' && dir[n-1]!='/') n--; if(n>0) n--; dir[n]=0;
+  int (WINAPI *cp)(const char*,char*,void*,void*,int,u32,void*,const char*,void*,u8*)=win32_resolve("kernel32","CreateProcessA");
+  u8 si[104]; memset(si,0,sizeof si); *(u32 *)si=104; u8 pi[24];
+  if(!cp || !cp(0,cmd,0,0,0,0,0,dir[0]? dir : 0,si,pi)) kprintf("\nStart menu: cannot start %s\n",sc[i].path);
 }
 static int menu_rows(void){ int r=nmain+(ndemo? 1 : 0); return r? r : 1; }
 static int ih(void){                                              /* item height: shrink so the menu always fits on screen */
@@ -802,7 +842,7 @@ static void draw_start_menu(void){
   for(int i=0;i<rows;i++){
     int iy=y0+MPAD+MHEAD+i*ih();
     if(i<nmain){
-      int hov=(start_hover==i); const char *an=app_name(main_idx[i]); char nm[48]; app_display(an,nm,sizeof nm); int l=strlen(nm);
+      int hov=(start_hover==i); const char *an=item_key(main_idx[i]); char nm[48]; item_display(main_idx[i],nm,sizeof nm); int l=strlen(nm);
       if(hov) gfx_round_rect(x0+MPAD,iy,MW-2*MPAD,ih()-2,6,PANEL_HOVER);
       app_icon(x0+MPAD+8,iy+(ih()-2-26)/2,26,an,hov); ui_text(nf,x0+MPAD+44,iy+(ih()-2-ui_lineh(nf))/2,nm,l,0xF3F4F6);
     } else if(ndemo){                                                 /* "Demos & tests" row with a chevron */
@@ -1030,7 +1070,12 @@ static void start_action(int code){
   if(code==101) power_restart();
   else if(code==102) power_off();
   else if(code>=200){ if(code-200<ndemo) proc_spawn(app_name(demo_idx[code-200])); }
-  else if(code<nmain) proc_spawn(app_name(main_idx[code]));
+  else if(code<nmain){
+    int idx=main_idx[code];
+    if(idx==SC_GET_LW) proc_spawn_cmd("terminal","terminal -c getlibrewolf");      /* the terminal downloads and installs it */
+    else if(idx>=SC_BASE) shortcut_launch(idx-SC_BASE);
+    else proc_spawn(app_name(idx));
+  }
 }
 static void pump_input(void){
   int vk, ch;

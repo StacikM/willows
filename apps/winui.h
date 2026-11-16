@@ -114,6 +114,7 @@ IMP(comdlg32, BOOL,   GetSaveFileNameA, (void*))
 #define ES_MULTILINE 4
 #define WS_CHILD 0x40000000u
 #define WS_BORDER 0x00800000u
+IMP(kernel32, BOOL, GetDiskFreeSpaceExA, (const char*, unsigned long long*, unsigned long long*, unsigned long long*))
 IMP(gdi32, HANDLE, CreateCompatibleDC, (HANDLE))
 IMP(gdi32, BOOL,   DeleteDC,           (HANDLE))
 IMP(gdi32, HANDLE, CreateDIBSection,   (HANDLE, const void*, UINT, void**, HANDLE, DWORD))

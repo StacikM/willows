@@ -148,6 +148,12 @@ int fs_persistence(void){ return disk_ok; }
 static u32 data_sectors(u64 size){ return (size+511)/512; }
 /* a file bigger than half of the saved-data area stays in RAM only (it would otherwise make every save fail and so lose all the other saved files and settings) */
 static int is_temp(const struct ramfile *f){ const char *n=f->name; return (n[0]|32)=='t' && (n[1]|32)=='e' && (n[2]|32)=='m' && (n[3]|32)=='p' && (n[4]=='/' || n[4]==0); }   /* C:\Temp is never saved */
+static int fits_on_disk(const struct ramfile *f);
+/* the saved-data area: how much the files that are saved take (one header sector each + their data), and its size (GetDiskFreeSpaceEx) */
+void fs_disk_usage(u64 *used, u64 *total){
+  u64 s=1+ntomb; for(int i=0;i<MAXFILES;i++) if(files[i].used && files[i].persist && fits_on_disk(&files[i])) s+=1+data_sectors(files[i].isdir? 0 : files[i].size);
+  if(used) *used=s*512; if(total) *total=(u64)DATA_SECTORS*512;
+}
 static int fits_on_disk(const struct ramfile *f){ return !is_temp(f) && (f->isdir || f->size <= (u64)256<<20); }   /* saving is synchronous and every saved file is loaded into RAM at boot, so a file over 256 MB stays in RAM only */
 static int fs_batch, fs_batch_pending;                      /* while > 0, saving is postponed (extracting an archive writes hundreds of files) */
 /* The data area is a sequence of records. `lay` remembers the records of the last save (or of the boot-time load), in order:

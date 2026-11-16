@@ -59,7 +59,7 @@ static void csi(char f, int *p, int np){               /* cursor movement and er
 }
 static void apply_sgr(int code){
   if(code == 0){ ocolor = 0; obg = 0; }
-  else if(code >= 30 && code <= 37) ocolor = code - 29;
+  else if(code >= 30 && code <= 37) ocolor = code == 30 ? 8 : code - 30;      /* 31 red .. 37 white (palette 1..7); black shows as gray */
   else if(code == 39) ocolor = 0;
   else if(code >= 90 && code <= 97) ocolor = code == 90 ? 8 : code - 90;
   else if(code == 40) obg = 9; else if(code >= 41 && code <= 47) obg = code - 40;
@@ -136,7 +136,7 @@ static void c_help(int argc, char **argv, const char *in){
   outp("  " GRN "echo" RST " text         print (use > or >>)  " GRN "grep" RST "/" GRN "head" RST "/" GRN "tail" RST "/" GRN "wc" RST "/" GRN "sort" RST "  filters, e.g. ls | grep txt\n");
   outp("  " GRN "ping" RST " <host>       ICMP echo           " GRN "curl" RST " [-I] <url>   fetch a page (http/https)\n");
   outp("  " GRN "wget" RST " <url> [file] download to a file  " GRN "nslookup" RST " <name>   resolve a name\n");
-  outp("  " GRN "unzip" RST " <zip> [dir] extract a .zip file\n");
+  outp("  " GRN "unzip" RST " <zip> [dir] extract a .zip file   " GRN "getlibrewolf" RST " [-f]  install/update LibreWolf\n");
   outp("  " GRN "ipconfig" RST "          network address     " GRN "ps" RST ", " GRN "kill" RST " <pid>    processes\n");
   outp("  " GRN "run" RST " <app> [args]  start a program     " GRN "date" RST ", " GRN "uptime" RST ", " GRN "free" RST "   system info\n");
   outp("  " GRN "calc" RST " 2+3*(4-1)    calculator          " GRN "neofetch" RST "          about this system\n");
@@ -164,12 +164,13 @@ static void c_cat(int argc, char **argv, const char *in){
   if(argc < 2){ if(in) outp("%s", in); else outp("usage: cat <file>\n"); return; }
   for(int i = 1; i < argc; i++){ int n; char *b = read_file(argv[i], &n); if(!b){ outp(RED "cat: %s: no such file\n" RST, argv[i]); continue; } print_sanitized(b, n); if(n && b[n - 1] != '\n') outp("\n"); free(b); }
 }
-static void rm_tree(const char *dir){
-  char pat[300]; snprintf(pat, sizeof pat, "%s\\*", dir); WIN32_FIND_DATAA fd; static char kids[64][64]; static DWORD ka[64]; int n = 0;
+static void rm_tree(const char *dir){                      /* each level has its own list (a static one was overwritten by the recursion) */
+  enum { MAXK = 1024 }; char pat[300]; snprintf(pat, sizeof pat, "%s\\*", dir); WIN32_FIND_DATAA fd; int n = 0;
+  char (*kids)[128] = malloc(MAXK * 128); DWORD *ka = malloc(MAXK * sizeof *ka); if(!kids || !ka){ free(kids); free(ka); return; }
   HANDLE h = API(kernel32, FindFirstFileA)(pat, &fd);
-  if(h != (HANDLE)~0ull){ do { if(n < 64 && !is_dots(fd.name)){ snprintf(kids[n], 64, "%s", fd.name); ka[n++] = fd.attr; } } while(API(kernel32, FindNextFileA)(h, &fd)); API(kernel32, FindClose)(h); }
+  if(h != (HANDLE)~0ull){ do { if(n < MAXK && !is_dots(fd.name)){ snprintf(kids[n], 128, "%s", fd.name); ka[n++] = fd.attr; } } while(API(kernel32, FindNextFileA)(h, &fd)); API(kernel32, FindClose)(h); }
   for(int i = 0; i < n; i++){ char p2[400]; snprintf(p2, sizeof p2, "%s\\%s", dir, kids[i]); if(ka[i] & 0x10) rm_tree(p2); else API(kernel32, DeleteFileA)(p2); }
-  API(kernel32, RemoveDirectoryA)(dir);
+  free(kids); free(ka); API(kernel32, RemoveDirectoryA)(dir);
 }
 static void c_rm(int argc, char **argv, const char *in){
   (void)in; int rec = 0; for(int i = 1; i < argc; i++) if(!strcmp(argv[i], "-r") || !strcmp(argv[i], "-rf")) rec = 1;
@@ -301,6 +302,128 @@ static void c_wget(int argc, char **argv, const char *in){
   else { const char *s = strrchr(argv[1], '/'); s = (s && s[1]) ? s + 1 : "index.html"; int k = 0; while(s[k] && s[k] != '?' && k < 60){ name[k] = s[k]; k++; } name[k] = 0; if(!k || strstr(name, "://")) snprintf(name, sizeof name, "index.html"); }
   fetch(argv[1], 0, name);
 }
+/* ---------------------------------------------------------------- getlibrewolf: install LibreWolf from its official releases
+   Finds the newest release (Codeberg API), downloads the official x86-64 portable zip from dl.librewolf.net into C:\Temp (never saved
+   to disk), checks its published SHA-256, unpacks it to C:\Programs\LibreWolf and adds a Start menu entry (C:\System\shortcuts.cfg).
+   Willows ships no LibreWolf itself: every install comes from LibreWolf's own servers, current and under their license. */
+static void live(void){                                      /* show what was printed so far, now (long-running command) */
+  if(cap && caplen && !job_capture){ term_write(cap); caplen = 0; cap[0] = 0; }
+  repaint(); API(user32, UpdateWindow)(hwnd);
+}
+struct sha256 { unsigned h[8]; unsigned char buf[64]; unsigned long long len; int n; };
+static const unsigned K256[64] = {
+  0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,
+  0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,
+  0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,
+  0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2 };
+#define ROR32(x, n) (((x) >> (n)) | ((x) << (32 - (n))))
+static void sha256_block(struct sha256 *s, const unsigned char *p){
+  unsigned w[64], a, b, c, d, e, f, g, h;
+  for(int i = 0; i < 16; i++) w[i] = (unsigned)p[4*i] << 24 | (unsigned)p[4*i+1] << 16 | (unsigned)p[4*i+2] << 8 | p[4*i+3];
+  for(int i = 16; i < 64; i++){ unsigned s0 = ROR32(w[i-15], 7) ^ ROR32(w[i-15], 18) ^ (w[i-15] >> 3), s1 = ROR32(w[i-2], 17) ^ ROR32(w[i-2], 19) ^ (w[i-2] >> 10); w[i] = w[i-16] + s0 + w[i-7] + s1; }
+  a = s->h[0]; b = s->h[1]; c = s->h[2]; d = s->h[3]; e = s->h[4]; f = s->h[5]; g = s->h[6]; h = s->h[7];
+  for(int i = 0; i < 64; i++){
+    unsigned t1 = h + (ROR32(e, 6) ^ ROR32(e, 11) ^ ROR32(e, 25)) + ((e & f) ^ (~e & g)) + K256[i] + w[i];
+    unsigned t2 = (ROR32(a, 2) ^ ROR32(a, 13) ^ ROR32(a, 22)) + ((a & b) ^ (a & c) ^ (b & c));
+    h = g; g = f; f = e; e = d + t1; d = c; c = b; b = a; a = t1 + t2;
+  }
+  s->h[0] += a; s->h[1] += b; s->h[2] += c; s->h[3] += d; s->h[4] += e; s->h[5] += f; s->h[6] += g; s->h[7] += h;
+}
+static void sha256_init(struct sha256 *s){ static const unsigned iv[8] = {0x6a09e667,0xbb67ae85,0x3c6ef372,0xa54ff53a,0x510e527f,0x9b05688c,0x1f83d9ab,0x5be0cd19}; memcpy(s->h, iv, sizeof iv); s->len = 0; s->n = 0; }
+static void sha256_add(struct sha256 *s, const unsigned char *p, unsigned long n){
+  s->len += n;
+  while(n){ if(!s->n && n >= 64){ sha256_block(s, p); p += 64; n -= 64; continue; } int k = 64 - s->n; if((unsigned long)k > n) k = (int)n; memcpy(s->buf + s->n, p, k); s->n += k; p += k; n -= k; if(s->n == 64){ sha256_block(s, s->buf); s->n = 0; } }
+}
+static void sha256_hex(struct sha256 *s, char out[65]){
+  unsigned long long bits = s->len * 8; unsigned char pad = 0x80; sha256_add(s, &pad, 1); pad = 0; while(s->n != 56) sha256_add(s, &pad, 1);
+  unsigned char lb[8]; for(int i = 0; i < 8; i++) lb[i] = (unsigned char)(bits >> (56 - 8 * i)); sha256_add(s, lb, 8);
+  for(int i = 0; i < 8; i++) snprintf(out + 8 * i, 9, "%08x", s->h[i]);
+}
+static int http_get_text(const char *url, char *out, int max){      /* a small text resource (release info, checksum); -1 on failure */
+  if(!hnet) hnet = API(wininet, InternetOpenA)("WillowsTerminal/1.0", 0, 0, 0, 0);
+  HANDLE h = API(wininet, InternetOpenUrlA)(hnet, url, 0, 0, 0, 0); if(!h) return -1;
+  DWORD status = 0, sl = 4; API(wininet, HttpQueryInfoA)(h, 19 | 0x20000000, &status, &sl, 0);
+  int n = 0; DWORD got; while(n < max - 1 && API(wininet, InternetReadFile)(h, out + n, max - 1 - n, &got) && got) n += got;
+  out[n] = 0; API(wininet, InternetCloseHandle)(h); return status == 200 ? n : -1;
+}
+/* stream a download into a file, with progress and its SHA-256; 0 = done */
+static int download_to(const char *url, const char *path, char hash[65]){
+  if(!hnet) hnet = API(wininet, InternetOpenA)("WillowsTerminal/1.0", 0, 0, 0, 0);
+  HANDLE h = API(wininet, InternetOpenUrlA)(hnet, url, 0, 0, 0, 0); if(!h){ outp(RED "cannot connect to %s\n" RST, url); return -1; }
+  DWORD status = 0, sl = 4, total = 0, tl = 4; API(wininet, HttpQueryInfoA)(h, 19 | 0x20000000, &status, &sl, 0); API(wininet, HttpQueryInfoA)(h, 5 | 0x20000000, &total, &tl, 0);
+  if(status != 200){ outp(RED "the server answered HTTP %u\n" RST, status); API(wininet, InternetCloseHandle)(h); return -1; }
+  HANDLE f = API(kernel32, CreateFileA)(path, 0x40000000u, 0, 0, 2, 0x80, 0); if(f == (HANDLE)~0ull){ outp(RED "cannot create %s\n" RST, path); API(wininet, InternetCloseHandle)(h); return -1; }
+  enum { CHUNK = 256 << 10 }; unsigned char *buf = malloc(CHUNK); struct sha256 s; sha256_init(&s);
+  unsigned long long done = 0; int last = -1, ok = buf != 0; DWORD got;
+  while(ok && API(wininet, InternetReadFile)(h, buf, CHUNK, &got) && got){
+    DWORD w = 0; if(!API(kernel32, WriteFile)(f, buf, got, &w, 0) || w != got){ outp(RED "\nwriting the file failed (out of memory?)\n" RST); ok = 0; break; }
+    sha256_add(&s, buf, got); done += got;
+    int pct = total ? (int)(done * 100 / total) : -1;
+    if(total ? pct / 5 != last / 5 : (int)(done >> 23) != last){ last = total ? pct : (int)(done >> 23);
+      if(total) outp("\r  downloading: %3d%%  (%llu / %u MB)", pct, done >> 20, total >> 20); else outp("\r  downloading: %llu MB", done >> 20); live(); }
+  }
+  outp("\n"); free(buf); API(kernel32, CloseHandle)(f); API(wininet, InternetCloseHandle)(h);
+  if(ok && total && done != total){ outp(RED "the download stopped early (%llu of %u bytes)\n" RST, done, total); ok = 0; }
+  if(!ok){ API(kernel32, DeleteFileA)(path); return -1; }
+  sha256_hex(&s, hash); return 0;
+}
+static void c_getlibrewolf(int argc, char **argv, const char *in){
+  (void)in; int force = argc > 1 && !strcmp(argv[1], "-f");
+  const char *home = "C:\\Programs\\LibreWolf", *exe = "C:\\Programs\\LibreWolf\\LibreWolf\\librewolf.exe", *zip = "C:\\Temp\\librewolf-portable.zip";
+  outp(CYN "LibreWolf" RST " - a privacy-focused Firefox, downloaded from librewolf.net\n"); live();
+  /* 1. which release is newest? */
+  char *info = malloc(200000), ver[40] = ""; int n = -1, waited = 0;
+  for(int tries = 0; info && tries < 8; tries++){                  /* right after boot the network may still be coming up */
+    n = http_get_text("https://codeberg.org/api/v1/repos/librewolf/bsys6/releases?limit=1", info, 200000); if(n > 0) break;
+    if(!tries){ outp("  waiting for the network..."); live(); waited = 1; } API(kernel32, Sleep)(2500);
+  }
+  if(waited) outp("\n");                                             /* end the "waiting for the network..." line */
+  if(n > 0){ char *t = strstr(info, "\"tag_name\":\""); if(t){ t += 12; int k = 0; while(t[k] && t[k] != '"' && k < 38 && (isdigit((unsigned char)t[k]) || t[k] == '.' || t[k] == '-')){ ver[k] = t[k]; k++; } ver[k] = 0; if(t[k] != '"') ver[0] = 0; } }
+  free(info);
+  if(!ver[0]){ snprintf(ver, sizeof ver, "160.0-1"); outp(YEL "  could not ask for the newest version; using %s\n" RST, ver); }
+  /* 2. already there? */
+  char have[40] = ""; { int len = 0; char *v = read_file("C:\\Programs\\LibreWolf\\willows-version.txt", &len); if(v){ snprintf(have, sizeof have, "%s", v); free(v); for(char *e = have; *e; e++) if(*e == '\r' || *e == '\n'){ *e = 0; break; } } }
+  if(API(kernel32, GetFileAttributesA)(exe) != 0xFFFFFFFF && !force){
+    if(!strcmp(have, ver)){ outp(GRN "LibreWolf %s is already installed and up to date." RST " Find it in the Start menu.\n", ver); return; }
+    outp("  installed: %s, newest: %s - updating\n", have[0] ? have : "unknown", ver);
+  }
+  /* 3. room on the disk (the zip goes to C:\Temp, which is not saved; the unpacked browser is ~510 MB) and RAM */
+  unsigned long long avail = 0, totalb = 0, freeb = 0; API(kernel32, GetDiskFreeSpaceExA)("C:\\", &avail, &totalb, &freeb);
+  int reinstall = API(kernel32, GetFileAttributesA)(home) != 0xFFFFFFFF;
+  if(!reinstall && avail < (560ull << 20)){
+    outp(RED "Not enough room: LibreWolf needs about 560 MB of saved space, %llu MB are free (of %llu MB).\n" RST, avail >> 20, totalb >> 20);
+    if(API(kernel32, GetFileAttributesA)("C:\\Downloads\\librewolf") != 0xFFFFFFFF) outp("An older copy is in C:\\Downloads\\librewolf: remove it with " GRN "rm -r /Downloads/librewolf" RST " and try again.\n");
+    return;
+  }
+  MEMORYSTATUSEX m; memset(&m, 0, sizeof m); m.len = sizeof m; API(kernel32, GlobalMemoryStatusEx)(&m);
+  if(m.total < (5500ull << 20)) outp(YEL "  note: LibreWolf needs about 6 GB of RAM to run well; this machine has %llu MB.\n" RST, m.total >> 20);
+  /* 4. download and check it against the published SHA-256 */
+  char url[300], sumurl[320], want[200], got[65];
+  snprintf(url, sizeof url, "https://dl.librewolf.net/librewolf/%s/librewolf-%s-windows-x86_64-portable.zip", ver, ver);
+  snprintf(sumurl, sizeof sumurl, "%s.sha256sum", url);
+  if(http_get_text(sumurl, want, sizeof want) < 64){ outp(RED "could not get the checksum for LibreWolf %s (%s)\n" RST, ver, sumurl); return; }
+  API(kernel32, CreateDirectoryA)("C:\\Temp", 0);
+  outp("  from %s\n", url); live();
+  if(download_to(url, zip, got)) return;
+  for(int i = 0; i < 64; i++) want[i] = (char)tolower((unsigned char)want[i]);
+  if(strncmp(got, want, 64)){ outp(RED "The download does not match LibreWolf's published checksum - not installing it.\n" RST); API(kernel32, DeleteFileA)(zip); return; }
+  outp(GRN "  checksum OK" RST " (SHA-256 %.16s...)\n", got); live();
+  /* 5. unpack into C:\Programs, then put it in place */
+  if(reinstall){ outp("  removing the previous version...\n"); live(); rm_tree(home); }
+  API(kernel32, CreateDirectoryA)("C:\\Programs", 0);
+  outp("  unpacking (510 MB, this takes a while)...\n"); live();
+  int files = unzip_file(zip, "C:\\Programs", outp, fs_batch_call); API(kernel32, DeleteFileA)(zip);
+  char unpacked[80]; snprintf(unpacked, sizeof unpacked, "C:\\Programs\\librewolf-%s", ver);
+  if(files <= 0 || !API(kernel32, MoveFileA)(unpacked, home) || API(kernel32, GetFileAttributesA)(exe) == 0xFFFFFFFF){ outp(RED "Unpacking failed.\n" RST); rm_tree(unpacked); return; }
+  write_file("C:\\Programs\\LibreWolf\\willows-version.txt", ver, (int)strlen(ver));
+  /* 6. the Start menu entry */
+  { int len = 0; char *old = read_file("C:\\System\\shortcuts.cfg", &len); char *nw = malloc(len + 200); int k = 0;
+    if(old){ for(char *l = old; *l;){ char *e = strchr(l, '\n'); int ll = e ? (int)(e - l) + 1 : (int)strlen(l); int is_lw = 0; for(int j = 0; j + 13 <= ll; j++) if(!strncasecmp_(l + j, "librewolf.exe", 13)) is_lw = 1;
+        if(!is_lw){ memcpy(nw + k, l, ll); k += ll; if(!e){ nw[k++] = '\n'; } } l += ll; }
+      free(old); }
+    k += snprintf(nw + k, 200, "LibreWolf|%s\n", exe); write_file("C:\\System\\shortcuts.cfg", nw, k); free(nw); }
+  outp(GRN "LibreWolf %s is installed (%d files)." RST " Open it from the Start menu.\n", ver, files);
+}
 /* integer calculator: + - * / % and parentheses */
 static const char *cp; static int calc_err;
 static long long expr(void);
@@ -362,7 +485,7 @@ static const struct { const char *name; cmdfn fn; } cmds[] = {
   {"help",c_help},{"?",c_help},{"echo",c_echo},{"ls",c_ls},{"dir",c_ls},{"cat",c_cat},{"type",c_cat},{"rm",c_rm},{"del",c_rm},{"cp",c_cp},{"copy",c_cp},
   {"mv",c_mv},{"ren",c_mv},{"touch",c_touch},{"pwd",c_pwd},{"cd",c_cd},{"mkdir",c_mkdir},{"md",c_mkdir},{"rmdir",c_rmdir},{"open",c_open},{"whoami",c_whoami},{"hostname",c_hostname},{"uname",c_uname},{"ver",c_uname},{"date",c_date},
   {"set",c_set},{"export",c_set},{"uptime",c_uptime},{"free",c_free},{"mem",c_free},{"ps",c_ps},{"kill",c_kill},{"run",c_run},{"start",c_run},{"ping",c_ping},{"nslookup",c_nslookup},{"host",c_nslookup},
-  {"ipconfig",c_ipconfig},{"ifconfig",c_ipconfig},{"curl",c_curl},{"wget",c_wget},{"unzip",c_unzip},{"calc",c_calc},{"neofetch",c_neofetch},{"about",c_neofetch},{"reboot",c_reboot},
+  {"ipconfig",c_ipconfig},{"ifconfig",c_ipconfig},{"curl",c_curl},{"wget",c_wget},{"unzip",c_unzip},{"getlibrewolf",c_getlibrewolf},{"calc",c_calc},{"neofetch",c_neofetch},{"about",c_neofetch},{"reboot",c_reboot},
   {"shutdown",c_shutdown},{"poweroff",c_shutdown},{"exit",c_exit},{"sleep",c_sleep},{"clear",c_clear},{"cls",c_clear},{"history",c_history},
   {"grep",c_grep},{"wc",c_wc},{"head",c_head},{"tail",c_tail},{"sort",c_sort},
 };
