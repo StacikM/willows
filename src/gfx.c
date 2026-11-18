@@ -127,6 +127,8 @@ void gfx_scroll_up(int px,u32 bg){
 
 /* Draw a whole frame off-screen, then copy it to the display in one go (no flicker). */
 static void cur_hide_x(void){ cur_hide(); }
+/* a kernel panic draws straight onto the visible screen: leave any half-drawn off-screen frame and stop drawing the mouse cursor */
+void gfx_panic_mode(void){ if(bb && fb==bb && real_fb) fb=real_fb; cur_en=0; busy=0; }
 int gfx_offscreen_begin(void){
   if(!bb) bb=kmalloc((u64)pitch*gfx_h,4096);
   if(!bb) return 0;

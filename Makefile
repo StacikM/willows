@@ -2,6 +2,11 @@ CC      = gcc
 CFLAGS  = -m64 -ffreestanding -fno-pie -fno-pic -mcmodel=small -mno-red-zone -fno-stack-protector -mgeneral-regs-only -O2 -Wall -Wextra -nostdinc -fno-builtin
 APPFLAGS= -m64 -mabi=ms -ffreestanding -fPIE -fvisibility=hidden -fno-stack-protector -fno-asynchronous-unwind-tables -mno-red-zone -O1 -Wall
 SRC     = $(wildcard src/*.c)
+# Kernel C++ (src/*.cpp, include src/cxx.h): freestanding, no exceptions/RTTI/standard library, no SSE - see src/cxxrt.cpp
+CXX     = g++
+CXXSRC  = $(wildcard src/*.cpp)
+CXXFLAGS= -m64 -ffreestanding -fno-pie -fno-pic -mcmodel=small -mno-red-zone -fno-stack-protector -mgeneral-regs-only -O2 -Wall -Wextra \
+          -nostdinc -nostdinc++ -fno-builtin -fno-exceptions -fno-rtti -fno-threadsafe-statics -fno-asynchronous-unwind-tables -std=gnu++20
 BRSRC   = $(shell find third_party/bearssl/src -name '*.c')
 BROBJ   = $(BRSRC:.c=.o)
 BRFLAGS = -m64 -ffreestanding -fno-pie -fno-pic -mcmodel=small -mno-red-zone -fno-stack-protector -mgeneral-regs-only -O2 -nostdinc \
@@ -12,19 +17,41 @@ KMSRC   = $(wildcard apps/qjs/math/*.c)
 KMOBJ   = $(patsubst apps/qjs/math/%.c,build/kmath/%.o,$(KMSRC))
 KMFLAGS = -m64 -mabi=ms -ffreestanding -fno-pie -fno-pic -mcmodel=small -mno-red-zone -fno-stack-protector -O2 -nostdinc \
           -isystem $(shell gcc -print-file-name=include) -fno-math-errno -msse2 -w
-OBJ     = $(SRC:.c=.o) src/boot.o $(BROBJ) $(KMOBJ)
+# Kernel Rust (src/rust, a no_std static library): built when cargo and the x86_64-unknown-none target are installed
+# (rustup target add x86_64-unknown-none); otherwise src/rust/none.c stands in and the kernel has no Rust code.
+RUST_OK := $(shell cargo --version >/dev/null 2>&1 && rustup target list --installed 2>/dev/null | grep -qx x86_64-unknown-none && echo 1)
+RUSTSRC = $(wildcard src/rust/src/*.rs src/rust/src/*/*.rs) src/rust/Cargo.toml
+ifeq ($(RUST_OK),1)
+RUSTLIB = build/rust/x86_64-unknown-none/release/libwillows_rs.a
+else
+RUSTLIB = src/rust/none.o
+endif
+OBJ     = $(SRC:.c=.o) $(CXXSRC:.cpp=.o) src/boot.o $(BROBJ) $(KMOBJ) $(RUSTLIB)
 # Guest RAM in MB for every run target (the kernel uses up to 3 GB):  make run-img MEM=2048
 MEM     ?= 3072
 # Use hardware virtualisation (KVM) when the host allows it: far faster than QEMU's software CPU emulation.
 ACCEL   := $(shell test -w /dev/kvm && echo "-enable-kvm -cpu host" || echo "-cpu max")
 DLLS    = apps/wdep.dll apps/wlib.dll apps/wdyn.dll
 APPS    = apps/hello32.exe apps/apitest.exe apps/apitest2.exe apps/apitest3.exe apps/dlltest.exe $(DLLS) apps/dlgtest.exe apps/hello.exe apps/exit42.exe apps/echo.exe apps/gfx.exe apps/crt.exe apps/paint.exe apps/ping.exe apps/nettest.exe apps/httpd.exe apps/fetch.exe apps/browser.exe apps/terminal.exe apps/notes.exe apps/files.exe apps/settings.exe apps/jstest.exe
+# cxxtest: C++ exceptions through Windows SEH, built with MinGW-w64 when it is installed (a real compiler-built Windows program)
+ifneq ($(shell command -v x86_64-w64-mingw32-g++ 2>/dev/null),)
+APPS   += apps/cxxtest.exe
+endif
 
-all: kernel.elf $(APPS)
+all: kernel.elf files/System/kernel.sym $(APPS)
 kernel.elf: $(OBJ) linker.ld
 	ld -m elf_x86_64 -z max-page-size=4096 -T linker.ld -o kernel64.elf $(OBJ)
 	objcopy -O elf32-i386 kernel64.elf $@   # GRUB's Multiboot 1 loader wants a 32-bit ELF
+# the kernel's function names, sorted by address ("address name" per line): C:\System\kernel.sym, read by the panic screen
+files/System/kernel.sym: kernel.elf
+	mkdir -p files/System && nm -n -C --defined-only kernel64.elf | awk '$$2 ~ /^[tT]$$/ { a=$$1; sub(/^[^ ]+ [^ ]+ /, ""); print a, $$0 }' > $@   # (-C: readable C++ and Rust names, which may contain spaces)
 src/%.o: src/%.c src/kernel.h
+	$(CC) $(CFLAGS) -c $< -o $@
+src/%.o: src/%.cpp src/kernel.h src/cxx.h
+	$(CXX) $(CXXFLAGS) -c $< -o $@
+build/rust/x86_64-unknown-none/release/libwillows_rs.a: $(RUSTSRC)
+	cd src/rust && CARGO_TARGET_DIR=../../build/rust RUSTFLAGS="-C code-model=small -C relocation-model=static" cargo build -q --release --target x86_64-unknown-none
+src/rust/none.o: src/rust/none.c
 	$(CC) $(CFLAGS) -c $< -o $@
 # BearSSL (third_party/): freestanding build without CPU-specific intrinsics
 $(BROBJ): %.o: %.c
@@ -45,6 +72,9 @@ apps/terminal.exe apps/notes.exe apps/files.exe apps/settings.exe apps/dlgtest.e
 # programs that embed the QuickJS engine (the browser also embeds apps/web/prelude.js, its DOM layer)
 apps/jstest.exe apps/browser.exe: apps/%.exe: apps/%.c apps/winui.h apps/web/prelude.js $(wildcard apps/web/*.h) $(wildcard apps/qjs/*.[ch] apps/qjs/*/*.[ch]) tools/buildjs.sh tools/mkpe.py
 	./tools/buildjs.sh apps/$*.c $@
+
+apps/cxxtest.exe: apps/cxxtest.cpp
+	x86_64-w64-mingw32-g++ -O2 -static -s -o $@ $<
 
 # 32-bit (PE32) programs, run by Willows in compatibility mode
 apps/hello32.exe: apps/hello32.c tools/build32.sh tools/mkpe32.py

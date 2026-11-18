@@ -20,13 +20,15 @@ desktop (taskbar, Start menu, file manager, terminal, text editor, settings) and
 | **Desktop** | Taskbar with program icons, Start menu, desktop icons, file manager with search and list/grid views, terminal with pipes and redirection, Notes, Settings (US and French AZERTY keyboards, wallpaper themes). |
 | **Files** | `C:\` file system saved to the boot disk (1 GB), with the Windows behaviour programs rely on. |
 | **Network** | Intel e1000, IPv4 (DHCP, DNS, TCP, UDP, ICMP), Winsock 2, TLS 1.2 with verified certificates, WinINet. |
-| **Not yet** | Video playback in LibreWolf, structured exception handling (`__try`), 32-bit programs beyond simple ones, Wi-Fi and other network cards, USB/NVMe storage, sound, UEFI. |
+| **Exceptions** | Windows structured exception handling: C++ `throw`/`catch` (tested with MinGW-built programs), vectored handlers, unwinding; `__try`/`__except` and MSVC's C++ handler are implemented but not yet tested with real programs. |
+| **Not yet** | Video playback in LibreWolf, 32-bit programs beyond simple ones, Wi-Fi and other network cards, USB/NVMe storage, sound, UEFI. |
 
 How each part works is described in [docs/INTERNALS.md](docs/INTERNALS.md).
 
 ## Quick start
-You need a Linux machine with `gcc`, `binutils`, `python3`, the GRUB 2 tools (`grub-mkimage`, `grub-bios-setup`, `grub-mkrescue`),
-`sfdisk`, `xorriso` and `qemu-system-x86_64`.
+You need a Linux machine with `gcc`/`g++`, `binutils`, `python3`, the GRUB 2 tools (`grub-mkimage`, `grub-bios-setup`,
+`grub-mkrescue`), `sfdisk`, `xorriso` and `qemu-system-x86_64`. Optional: Rust with the `x86_64-unknown-none` target (for the
+kernel's Rust code; `rustup target add x86_64-unknown-none`) and MinGW-w64 (`x86_64-w64-mingw32-g++`, for the C++ exception test).
 
     make img                  # build willows.img (kernel, apps and a boot disk with a saved-data area)
     make run-img              # boot it in QEMU (3 GB of RAM by default)
@@ -48,7 +50,7 @@ distributed by its own project under its own license.
 ## Repository layout
 | Path | What it is |
 |---|---|
-| `src/` | The kernel: boot, memory, scheduler, file system, drivers, network stack, window manager, and the Win32 layer (`win32*.c`, `thread.c`, `ipc.c`, `ucrt.c`, `gdi*.inc`, ...). |
+| `src/` | The kernel: boot, memory, scheduler, file system, drivers, network stack, window manager, and the Win32 layer (`win32*.c`, `thread.c`, `ipc.c`, `seh.c`, `ucrt.c`, `gdi*.inc`, ...). Mostly C, with C++ (`*.cpp`) and Rust (`src/rust`) support. |
 | `apps/` | Built-in programs (all ordinary Windows programs): file manager, terminal, notes, settings, browser and its engine (`apps/web`), QuickJS (`apps/qjs`), tests. |
 | `files/` | Files copied onto the disk at boot (`C:\Documents`, fonts in `C:\Windows\Fonts`). |
 | `tools/` | Build scripts (disk image, PE writer, C/DLL builders) and `tools/dev/`, the test and debugging tools. |

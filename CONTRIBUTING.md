@@ -30,7 +30,7 @@ You need Linux with `gcc`, `binutils`, `python3`, the GRUB 2 tools, `sfdisk`, `x
 Before sending a change, run the API test suites on the private test disk (it never touches your own `willows.img`):
 
     tools/dev/mktest.sh "sleep 8" "apitest > /Documents/t1.txt" "apitest2 > /Documents/t2.txt" \
-        "apitest3 > /Documents/t3.txt" "nettest > /Documents/t4.txt"
+        "apitest3 > /Documents/t3.txt" "nettest > /Documents/t4.txt" "cxxtest > /Documents/t5.txt"
     tools/dev/drive.py --reuse wait60
     python3 tools/dev/datafs.py build/dev/test.img extract build/dev/out
     tail -1 build/dev/out/Documents/t*.txt

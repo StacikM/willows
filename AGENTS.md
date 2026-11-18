@@ -22,8 +22,12 @@ layer. Background: [README.md](README.md), [docs/INTERNALS.md](docs/INTERNALS.md
 ## Building
     make -s all          # kernel (kernel.elf / kernel64.elf) and every app in apps/; this does not touch willows.img
 
-The kernel is C (`gcc -m64 -ffreestanding -mgeneral-regs-only -O2`): **no floating point or SSE in kernel code**. Apps are
-built as Windows PE files by `tools/buildc.sh` (`-mabi=ms`, a small libc in `apps/shim`, imports declared in `apps/winui.h`).
+The kernel is C (`gcc -m64 -ffreestanding -mgeneral-regs-only -O2`): **no floating point or SSE in kernel code**. It can also
+have C++ (`src/*.cpp`, include `src/cxx.h`: no exceptions, RTTI or standard library) and Rust (`src/rust`, `no_std`, target
+`x86_64-unknown-none`); see [docs/INTERNALS.md](docs/INTERNALS.md#languages-in-the-kernel). Prefer C for small changes to C files;
+use C++ or Rust for new self-contained parts where they make the code simpler or safer (Rust for parsing untrusted data).
+Apps are built as Windows PE files by `tools/buildc.sh` (`-mabi=ms`, a small libc in `apps/shim`, imports declared in
+`apps/winui.h`); `apps/cxxtest.exe` is built with MinGW-w64.
 
 ## Testing
 `tools/dev/mktest.sh` builds `build/dev/test.img` from the current build plus `build/dev/testdata/` (a folder that mirrors `C:\`),
@@ -33,10 +37,14 @@ saves screenshots to `build/dev/*.png`; the serial log goes to `build/dev/serial
 The API test suites (run them before calling a change done):
 
     tools/dev/mktest.sh "sleep 8" "apitest > /Documents/t1.txt" "apitest2 > /Documents/t2.txt" \
-        "apitest3 > /Documents/t3.txt" "nettest > /Documents/t4.txt"
+        "apitest3 > /Documents/t3.txt" "nettest > /Documents/t4.txt" "cxxtest > /Documents/t5.txt"
     tools/dev/drive.py --reuse wait60
     python3 tools/dev/datafs.py build/dev/test.img extract build/dev/out
-    tail -1 build/dev/out/Documents/t*.txt     # 43/43, 33/33, 35/35 checks pass; nettest receives a page
+    tail -1 build/dev/out/Documents/t*.txt     # 43/43, 33/33, 35/35, 8/8 checks pass; nettest receives a page
+
+The serial log's boot lines include `Languages: C++ ok, Rust ok` (the kernel's C++ and Rust self-tests). To check a behaviour
+against real Windows semantics, build a small program with `x86_64-w64-mingw32-g++ -static` and run it both under Wine on the
+host and in Willows.
 
 (`sleep 8` gives DHCP time to finish before `nettest`.)
 
@@ -52,6 +60,9 @@ Each `drive.py` call boots a fresh VM from the image, so put all the steps of on
 - `TRACE=1 tools/dev/mktest.sh ...` logs file, pipe, socket, message and completion-port activity and keeps the last API calls
   for crash reports. Tracing changes timing; a race may disappear under it.
 - `ctrl-f12` (a `drive.py` step) dumps every process and thread with what it waits for.
+- A **kernel panic** (`*** PANIC:` in the serial log) names kernel functions from `C:\System\kernel.sym`. In kernel code, stop on
+  an impossible state with `kernel_panic("...", ...)` rather than halting by hand. `panic c|rust|fault` in the Terminal tests the
+  panic path.
 - Stripped DLLs: `tools/dev/pefunc.py` (which function contains an address), `tools/dev/strnear.py` (the strings a function
   uses, e.g. assertion texts, which usually name it), `tools/dev/missing.py` (Windows functions a program needs that Willows lacks).
 - gdb (start QEMU with `QEMU_EXTRA=-s`): `tools/dev/gdbhits.py` (log every call of a function, cheap enough for races),

@@ -38,11 +38,23 @@ debugging tools, see [tools/dev/README.md](../tools/dev/README.md).
   DLLs or SEH yet. Build a test with `tools/build32.sh prog.c out.exe`.
 
 ## Exceptions
-- Vectored exception handlers (`AddVectoredExceptionHandler`, `src/win32x.c`): a CPU fault in a program's own code becomes an
-  `EXCEPTION_RECORD` and `CONTEXT` on the thread's stack, and the handlers run (`veh_redirect` in `src/idt.c`). "Continue execution"
-  resumes from the possibly changed `CONTEXT` (`ctx_restore` in `src/boot.S`, SSE state included). Unhandled faults end the program
-  with a crash report. `RaiseException` goes to the handlers too. Firefox needs this for WebAssembly.
-- No structured exception handling (`__try`/unwinding) yet: a C++ exception that is not caught by a vectored handler ends the program.
+Windows x64 structured exception handling, in `src/seh.c` (entry points in `src/boot.S`):
+- A CPU fault in a program's own code becomes an `EXCEPTION_RECORD` and `CONTEXT` on the thread's stack (`veh_redirect` in
+  `src/idt.c`); `RaiseException` captures its caller's registers. Both go to the vectored handlers (`AddVectoredExceptionHandler`)
+  first, then up the program's frames to each frame's language handler, then to the `SetUnhandledExceptionFilter` filter.
+  "Continue execution" resumes from the possibly changed `CONTEXT` (`ctx_restore`, SSE state included); an unhandled fault ends
+  the program with a crash report.
+- `RtlLookupFunctionEntry` searches the module's `.pdata` and the tables added at run time (`RtlAddFunctionTable`,
+  `RtlAddGrowableFunctionTable` for JITs); `RtlVirtualUnwind` runs the unwind codes (prolog, epilog, chained entries; the logic
+  follows Wine). `RtlUnwindEx` calls the unwind handlers up to the target frame and resumes there; `RtlRestoreContext` handles
+  `STATUS_UNWIND_CONSOLIDATE` (MSVC runs catch blocks this way) and `longjmp`. `__C_specific_handler` implements
+  `__try`/`__except`/`__finally`.
+- So C++ `throw`/`catch` works for MinGW-built programs (tested by `cxxtest`) and should for MSVC-built ones (their
+  `vcruntime140.dll` brings `__CxxFrameHandler`; not tested with a real MSVC program yet).
+- Handlers are program code called from Willows' C code, which has no unwind tables. Each thread keeps a list of boundary records
+  (in `TEB->NtTib.ExceptionList`, unused on x64): a stack walk that reaches Willows code continues from the context its record
+  names, as Windows does with its dispatcher frames. Limit: exceptions do not cross Windows API callbacks (a C++ exception thrown in
+  a window procedure does not reach a `catch` around the message loop).
 
 ## Windows, GDI and dialogs
 - `src/wm.c` is the window manager: message queues per thread, window classes and atoms, `SetWindowPos` with the
@@ -108,5 +120,29 @@ ES modules, Web Workers, canvas, media, iframes.
 
 ## Test programs
 `apitest`, `apitest2`, `apitest3` (Start → Demos & tests; `-v` lists every check) cover batches of the Win32 layer: 43, 33 and 35
-checks. `nettest` checks HTTP, `dlltest` the DLL loader, `jstest "1+2"` QuickJS. `tools/dev/mktest.sh` runs them headless (see
+checks. `cxxtest` (built with MinGW-w64 when it is installed) checks C++ exceptions: 8 checks. `nettest` checks HTTP, `dlltest`
+the DLL loader, `jstest "1+2"` QuickJS.
+
+## Languages in the kernel
+The kernel is mostly C, and can also have C++ and Rust code:
+- **C++**: `.cpp` files in `src/` that include `src/cxx.h`. Freestanding (no exceptions, RTTI or standard library); classes,
+  templates, virtual functions, lambdas and `new`/`delete` on the kernel heap work, and global constructors run at boot
+  (`src/cxxrt.cpp`, the `.init_array` section in `linker.ld`). `kern::vec` and `kern::unique` stand in for `std::vector` and
+  `std::unique_ptr`.
+- **Rust**: the `no_std` crate in `src/rust` is built for `x86_64-unknown-none` and linked in as a static library. `Box`, `Vec`
+  and `String` use the kernel heap; a panic stops the kernel with its message. Export functions with
+  `#[no_mangle] pub extern "C" fn`, declare them in `src/kernel.h`. Without the Rust toolchain, `src/rust/none.c` stands in.
+- Both follow the kernel's rules: no floating point or SSE, never block except through the kernel's wait helpers. The boot log
+  (serial) checks both with a self-test: `Languages: C++ ok, Rust ok`.
+
+## Kernel panics
+`kernel_panic(fmt, ...)` (printf-style, `src/panic.c`) stops the kernel. The panic path itself is Rust (`src/rust/src/panic.rs`):
+it disables interrupts, writes a report to the serial log and draws a panic screen (or prints the report on the text console
+when there is no framebuffer), then halts. The report names the reason, the program that was running, the fault and registers
+for a CPU fault, and the code addresses found on the stack: program addresses as `xul.dll+1234`, kernel addresses with their
+function name from `C:\System\kernel.sym` (written by the Makefile from the kernel's symbols, `src/rust/src/symbols.rs`).
+It is reached from C, from a CPU fault in the kernel's own context (a fault in a program, even inside a Windows API call, ends
+only that program), from a fatal C++ error (`cxx_fatal`) and from Rust's `panic!`. It uses no heap, and a panic while panicking
+halts at once. Rust code prints with `kprint!`, `kprintln!` and `kdbg!` (`src/rust/src/log.rs`).
+Test it with `panic c`, `panic rust` or `panic fault` in the Terminal (this really halts the machine). `tools/dev/mktest.sh` runs them headless (see
 [AGENTS.md](../AGENTS.md#testing)).

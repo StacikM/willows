@@ -1,0 +1,21 @@
+# Kernel Rust for Willows: a no_std static library linked into the kernel (see src/rust/src/lib.rs and the Makefile).
+# Build target: x86_64-unknown-none (rustup target add x86_64-unknown-none); without it the kernel links src/rust/none.c instead.
+[package]
+name = "willows_rs"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-only"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+crate-type = ["staticlib"]
+
+[profile.release]
+panic = "abort"
+opt-level = 2
+debug = false
+codegen-units = 1
+
+[profile.dev]
+panic = "abort"

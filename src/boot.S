@@ -255,6 +255,86 @@ ctx_restore:
     mov 0xb0(%rdi), %rdi
     iretq
 
+/* ---- Windows exception entry points (src/seh.c). Each one records its CALLER's registers in a CONTEXT, exactly as they are at
+   the call (rip = the return address, rsp = the stack pointer after returning), and passes it to the C side, which resumes the
+   program through ctx_restore when it is done; they never return. Arguments arrive in the Win64 registers rcx rdx r8 r9. ---- */
+.macro SEH_CAPTURE ctx, framesz                 /* \ctx: register holding the CONTEXT; the caller's return address is at \framesz(%rsp) */
+    mov %rbx, 0x90(\ctx)
+    mov %rbp, 0xa0(\ctx)
+    mov %rsi, 0xa8(\ctx)
+    mov %rdi, 0xb0(\ctx)
+    mov %rcx, 0x80(\ctx)
+    mov %rdx, 0x88(\ctx)
+    mov %r8,  0xb8(\ctx)
+    mov %r9,  0xc0(\ctx)
+    mov %r10, 0xc8(\ctx)
+    mov %r11, 0xd0(\ctx)
+    mov %r12, 0xd8(\ctx)
+    mov %r13, 0xe0(\ctx)
+    mov %r14, 0xe8(\ctx)
+    mov %r15, 0xf0(\ctx)
+    movq $0, 0x78(\ctx)
+    lea \framesz+8(%rsp), %r10
+    mov %r10, 0x98(\ctx)                       /* Rsp */
+    mov \framesz(%rsp), %r10
+    mov %r10, 0xf8(\ctx)                       /* Rip */
+    pushfq
+    pop %r10
+    mov %r10d, 0x44(\ctx)                      /* EFlags */
+    mov %cs, %r10w
+    mov %r10w, 0x38(\ctx)
+    mov %ss, %r10w
+    mov %r10w, 0x42(\ctx)
+    movl $0x10001f, 0x30(\ctx)                 /* CONTEXT_FULL | segments | floating point | debug */
+    fxsave64 0x100(\ctx)
+    stmxcsr 0x34(\ctx)
+.endm
+.global seh_RtlCaptureContext                  /* RtlCaptureContext(CONTEXT *rcx) - returns */
+seh_RtlCaptureContext:
+    mov %rax, 0x78(%rcx)
+    SEH_CAPTURE %rcx, 0
+    mov 0x78(%rcx), %rax
+    mov 0xc8(%rcx), %r10
+    ret
+/* each entry: 0x508 bytes of frame keep rsp 16-byte aligned; the CONTEXT sits at rsp+0x30 */
+.global seh_RaiseException                     /* RaiseException(code, flags, nargs, args) */
+seh_RaiseException:
+    sub $0x508, %rsp
+    lea 0x30(%rsp), %rax
+    SEH_CAPTURE %rax, 0x508
+    mov %rax, %r10
+    mov %rcx, %rdi
+    mov %rdx, %rsi
+    mov %r8, %rdx
+    mov %r9, %rcx
+    mov %r10, %r8
+    call seh_raise_c                           /* (code, flags, nargs, args, ctx) - does not return */
+    ud2
+.global seh_RtlRaiseException                  /* RtlRaiseException(EXCEPTION_RECORD *) */
+seh_RtlRaiseException:
+    sub $0x508, %rsp
+    lea 0x30(%rsp), %rax
+    SEH_CAPTURE %rax, 0x508
+    mov %rcx, %rdi
+    mov %rax, %rsi
+    call seh_raise_rec_c
+    ud2
+.global seh_RtlUnwindEx                        /* RtlUnwindEx(frame, ip, record, retval, context, history) */
+.global seh_RtlUnwind                          /* RtlUnwind(frame, ip, record, retval) */
+seh_RtlUnwindEx:
+seh_RtlUnwind:
+    sub $0x508, %rsp
+    lea 0x30(%rsp), %rax
+    SEH_CAPTURE %rax, 0x508
+    mov %rax, %r10
+    mov %rcx, %rdi
+    mov %rdx, %rsi
+    mov %r8, %rdx
+    mov %r9, %rcx
+    mov %r10, %r8
+    call seh_unwind_c                          /* (frame, ip, record, retval, ctx) - does not return */
+    ud2
+
 /* ---- IRQs: save caller-saved registers, call C handler, EOI ---- */
 .macro IRQ name, handler, slave
 .global \name

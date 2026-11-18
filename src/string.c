@@ -1,5 +1,5 @@
 #include "kernel.h"
-void *memcpy(void *d, const void *s, unsigned long n){ __asm__ volatile("rep movsb":"+D"(d),"+S"(s),"+c"(n)::"memory"); return d; }
+void *memcpy(void *d, const void *s, unsigned long n){ void *r=d; __asm__ volatile("rep movsb":"+D"(d),"+S"(s),"+c"(n)::"memory"); return r; }   /* returns the destination (rep movsb moves d to its end) */
 void *memmove(void *d, const void *s, unsigned long n){ u8 *a=d; const u8 *b=s;
   if(a<b) while(n--) *a++=*b++; else { a+=n; b+=n; while(n--) *--a=*--b; } return d; }
 void *memset(void *d, int c, unsigned long n){ void *r=d; __asm__ volatile("rep stosb":"+D"(d),"+c"(n):"a"(c):"memory"); return r; }

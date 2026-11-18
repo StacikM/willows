@@ -424,6 +424,15 @@ static void c_getlibrewolf(int argc, char **argv, const char *in){
     k += snprintf(nw + k, 200, "LibreWolf|%s\n", exe); write_file("C:\\System\\shortcuts.cfg", nw, k); free(nw); }
   outp(GRN "LibreWolf %s is installed (%d files)." RST " Open it from the Start menu.\n", ver, files);
 }
+/* panic c|rust|fault: stop the kernel on purpose, to test the panic screen (Willows only; it really halts the computer) */
+static void c_panic(int argc, char **argv, const char *in){
+  (void)in; int kind = argc < 2 ? -1 : !strcmp(argv[1], "c") ? 0 : !strcmp(argv[1], "rust") ? 1 : !strcmp(argv[1], "fault") ? 2 : -1;
+  if(kind < 0){ outp("usage: panic c|rust|fault   " RED "halts the computer" RST " to test the kernel's panic screen:\n"
+                     "  c      kernel_panic() from C\n  rust   a Rust panic!\n  fault  a NULL pointer access in the kernel\n"); return; }
+  int (WINAPI *f)(int) = API(kernel32, GetProcAddress)(API(kernel32, GetModuleHandleA)("kernel32.dll"), "WillowsTestPanic");
+  if(!f){ outp(RED "this system has no WillowsTestPanic\n" RST); return; }
+  outp("stopping the kernel (%s)...\n", argv[1]); live(); f(kind);
+}
 /* integer calculator: + - * / % and parentheses */
 static const char *cp; static int calc_err;
 static long long expr(void);
@@ -485,7 +494,7 @@ static const struct { const char *name; cmdfn fn; } cmds[] = {
   {"help",c_help},{"?",c_help},{"echo",c_echo},{"ls",c_ls},{"dir",c_ls},{"cat",c_cat},{"type",c_cat},{"rm",c_rm},{"del",c_rm},{"cp",c_cp},{"copy",c_cp},
   {"mv",c_mv},{"ren",c_mv},{"touch",c_touch},{"pwd",c_pwd},{"cd",c_cd},{"mkdir",c_mkdir},{"md",c_mkdir},{"rmdir",c_rmdir},{"open",c_open},{"whoami",c_whoami},{"hostname",c_hostname},{"uname",c_uname},{"ver",c_uname},{"date",c_date},
   {"set",c_set},{"export",c_set},{"uptime",c_uptime},{"free",c_free},{"mem",c_free},{"ps",c_ps},{"kill",c_kill},{"run",c_run},{"start",c_run},{"ping",c_ping},{"nslookup",c_nslookup},{"host",c_nslookup},
-  {"ipconfig",c_ipconfig},{"ifconfig",c_ipconfig},{"curl",c_curl},{"wget",c_wget},{"unzip",c_unzip},{"getlibrewolf",c_getlibrewolf},{"calc",c_calc},{"neofetch",c_neofetch},{"about",c_neofetch},{"reboot",c_reboot},
+  {"ipconfig",c_ipconfig},{"ifconfig",c_ipconfig},{"curl",c_curl},{"wget",c_wget},{"unzip",c_unzip},{"getlibrewolf",c_getlibrewolf},{"panic",c_panic},{"calc",c_calc},{"neofetch",c_neofetch},{"about",c_neofetch},{"reboot",c_reboot},
   {"shutdown",c_shutdown},{"poweroff",c_shutdown},{"exit",c_exit},{"sleep",c_sleep},{"clear",c_clear},{"cls",c_clear},{"history",c_history},
   {"grep",c_grep},{"wc",c_wc},{"head",c_head},{"tail",c_tail},{"sort",c_sort},
 };

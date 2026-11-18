@@ -1,8 +1,20 @@
 #pragma once
+/* The kernel's shared header, for C and for C++ (the .cpp files in src/, see src/cxxrt.cpp). In C++ everything here has C linkage, and the
+   tag "export" (a C++ keyword) is renamed: the C files keep their export tables unchanged. */
+#ifdef __cplusplus
+#define export export_t_
+extern "C" {
+#endif
 typedef unsigned char u8; typedef unsigned short u16; typedef unsigned int u32; typedef unsigned long long u64;
 struct font;
 typedef signed int i32; typedef signed long long i64; typedef u64 uptr;
+#ifndef NULL                                   /* (files that include the compiler's stddef.h first already have it) */
+#ifdef __cplusplus
+#define NULL nullptr
+#else
 #define NULL ((void*)0)
+#endif
+#endif
 #define WINAPI __attribute__((ms_abi))       /* Win64 calling convention: rcx rdx r8 r9 + shadow space */
 typedef __builtin_ms_va_list margs;
 
@@ -176,6 +188,13 @@ int dns_resolve(const char *name, u32 *ip); int net_ping(u32 ip, u32 timeout_ms)
 void *pe_make_stub(const char *dll, const char *name); extern const struct export crt2_exports[], math_exports[], nt2_exports[], hw_exports[]; extern const unsigned crt2_nexports, math_nexports, nt2_nexports, hw_nexports; const char *hw_gpu_name(void); extern const struct export settings_exports[], reg_exports[], y_exports[], ipc_exports[], nt_exports[], con_exports[]; extern const unsigned settings_nexports, reg_nexports, y_nexports, ipc_nexports, nt_nexports, con_nexports; void settings_load(void); void settings_set(const char *k,const char *v); const char *settings_get(const char *k); void wm_post_msg(u64 hwnd,u32 msg,u64 wp,i64 lp); void ws_async_poll(void); void *pe_make_soft_stub(const char *name);
 extern const struct export x_exports[]; extern const unsigned x_nexports;
 extern const struct export thread_exports[], vmem_exports[], math2_exports[], ucrt_exports[], sec_exports[], dwrite_exports[]; extern const unsigned thread_nexports, vmem_nexports, math2_nexports, ucrt_nexports, sec_nexports, dwrite_nexports;
+extern const struct export seh_exports[]; extern const unsigned seh_nexports;   /* seh.c: exceptions and unwinding */
+/* panic.c + src/rust/src/panic.rs: stop the kernel with a report on the serial log and a panic screen. kernel_panic is printf-style. */
+struct panic_regs { u64 rip, rsp, rbp; u64 gp[16]; u64 cr2, err, vec; u32 has_gp, has_fault; };   /* gp: rax rcx rdx rbx rsp rbp rsi rdi r8-r15 */
+void WINAPI kernel_panic(const char *fmt, ...) __attribute__((noreturn));
+void kernel_panic_regs(const char *reason, const struct panic_regs *r) __attribute__((noreturn));
+void gfx_panic_mode(void); extern const struct export panic_exports[]; extern const unsigned panic_nexports;
+void seh_proc_exit(int pid);
 void ucrt_proc_reset(int pid); void thread_proc_reset(int pid); void com_proc_reset(int pid);   /* per-process tables, cleared when a slot gets a new process */
 extern const struct export net_exports[]; extern const unsigned net_nexports;
 
@@ -193,3 +212,7 @@ void desktop_draw(void); void desktop_ctx_draw(void); int desktop_ctx_click(int 
 void desktop_hover(int mx,int my); void desktop_click(int mx,int my); void desktop_rclick(int mx,int my);
 void desktop_defocus(void); int desktop_has_focus(void); int desktop_key(int vk,int ch);
 void fs_flush(void); void fs_service(void);   /* fs_service: deferred save, called by the main loop */
+#ifdef __cplusplus
+}
+#undef export
+#endif

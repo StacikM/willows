@@ -230,8 +230,6 @@ static u64 WINAPI sh_ShellExecuteA(u64 hwnd, const char *verb, const char *file,
   int pid=proc_spawn_cwd(file,cmd,dir&&*dir? dir : cur->cwd); if(pid<0 && shell_open(file)>=0) return 33; return pid>=0? 33 : 2;
 }
 static BOOL WINAPI u_ExitWindowsEx(DWORD flags, DWORD reason){ (void)reason; if(flags&2) power_restart(); power_off(); }
-static LPVOID WINAPI k_SetUnhandledExceptionFilter(LPVOID f){ (void)f; return 0; }
-static i32 WINAPI k_UnhandledExceptionFilter(LPVOID e){ (void)e; return 0; }
 static void WINAPI k_GetStartupInfoA(u32 *si){ memset(si,0,104); si[0]=104; }
 static void WINAPI k_GetStartupInfoW(u32 *si){ memset(si,0,104); si[0]=104; }
 static BOOL WINAPI k_QueryPerformanceCounter(u64 *v){ *v=(u64)ticks*1000; return 1; }   /* microseconds */
@@ -297,9 +295,6 @@ static int WINAPI k_WideCharToMultiByte(u32 cp, DWORD fl, const u16 *w, int n, c
 static u32 WINAPI k_lstrcmpA(const char *a, const char *b){ return strcmp(a,b); }
 static char *WINAPI k_lstrcpyA(char *d, const char *s){ char *r=d; while((*d++=*s++)); return r; }
 /* SEH-related Rtl* functions: no unwinding support yet, report "nothing found" */
-static void WINAPI k_RtlCaptureContext(LPVOID ctx){ memset(ctx,0,1232); }
-static LPVOID WINAPI k_RtlLookupFunctionEntry(u64 pc, u64 *base, LPVOID hist){ (void)pc;(void)hist; if(base) *base=0; return 0; }
-static LPVOID WINAPI k_RtlVirtualUnwind(DWORD t, u64 b, u64 pc, LPVOID fe, LPVOID ctx, LPVOID h, u64 *f, LPVOID ctxp){ (void)t;(void)b;(void)pc;(void)fe;(void)ctx;(void)h;(void)f;(void)ctxp; return 0; }
 
 /* ---- user32 / gdi32 (draws straight onto the framebuffer; no window manager yet) ---- */
 typedef struct { i32 left, top, right, bottom; } RECT;
@@ -512,7 +507,6 @@ static int WINAPI c_tolower(int c){ return (c>='A'&&c<='Z')? c+32:c; }
 static int WINAPI c_isdigit(int c){ return c>='0'&&c<='9'; }
 static int WINAPI c_isalpha(int c){ return (c|32)>='a'&&(c|32)<='z'; }
 static int WINAPI c_isspace(int c){ return c==' '||(c>=9&&c<=13); }
-static int WINAPI c___C_specific_handler(LPVOID a, LPVOID b, LPVOID c, LPVOID d){ (void)a;(void)b;(void)c;(void)d; return 1; }
 
 #define K(n) {"kernel32", #n, k_##n}
 #define U(n) {"user32", #n, u_##n}
@@ -528,14 +522,13 @@ static const struct export exports[] = {
   K(Process32First), K(Process32Next), K(GlobalMemoryStatusEx), K(GetComputerNameA),
   {"ntdll","NtClose",n_NtClose},
   {"advapi32","GetUserNameA",k_GetUserNameA}, {"shell32","ShellExecuteA",sh_ShellExecuteA}, {"user32","ExitWindowsEx",u_ExitWindowsEx},
-  K(SetUnhandledExceptionFilter), K(UnhandledExceptionFilter), K(GetStartupInfoA), K(GetStartupInfoW),
+  K(GetStartupInfoA), K(GetStartupInfoW),
   K(QueryPerformanceCounter), K(QueryPerformanceFrequency), K(GetSystemTimeAsFileTime), K(GetSystemTime),
   {"kernel32","GetLocalTime",k_GetSystemTime},
   K(InterlockedIncrement), K(InterlockedDecrement), K(InterlockedExchange), K(InterlockedExchangeAdd), K(InterlockedCompareExchange),
   K(InitializeSListHead), K(IsProcessorFeaturePresent), K(IsDebuggerPresent), K(GetVersion), K(OutputDebugStringA),
   K(GetModuleFileNameA), K(SetConsoleCtrlHandler), K(GetConsoleMode), K(SetConsoleMode), K(GetConsoleOutputCP), K(GetACP),
   K(GetFileType), K(GetSystemInfo), K(EncodePointer), K(MultiByteToWideChar), K(WideCharToMultiByte), K(lstrcmpA), K(lstrcpyA),
-  K(RtlCaptureContext), K(RtlLookupFunctionEntry), K(RtlVirtualUnwind),
   {"kernel32","GetNativeSystemInfo",k_GetSystemInfo}, {"kernel32","DecodePointer",k_EncodePointer},
   U(MessageBoxA), U(GetDC), U(ReleaseDC), U(GetSystemMetrics), U(FillRect), U(GetAsyncKeyState), U(GetKeyState),
   U(GetCursorPos), U(ShowCursor),
@@ -557,7 +550,7 @@ static const struct export exports[] = {
   CX("__lconv_init",zero), CX("_set_fmode",zero), CX("_set_new_mode",zero), CX("_seh_filter_exe",zero),
   CX("_set_invalid_parameter_handler",zero), CX("_configthreadlocale",zero), CX("_set_abort_behavior",zero),
   CX("__stdio_common_vfprintf",__stdio_common_vfprintf), CX("__stdio_common_vsprintf",__stdio_common_vsprintf),
-  CX("__C_specific_handler",__C_specific_handler), CX("_isatty",one),
+  CX("_isatty",one),
   {"msvcrt","_fmode",&fmode_}, {"msvcrt","_commode",&commode_},             /* data imports: the slot receives the variable's address */
 };
 
@@ -573,7 +566,9 @@ static const struct export *tab(int t, unsigned *n){
     case 18: *n=math2_nexports; return math2_exports;
     case 19: *n=ucrt_nexports; return ucrt_exports;                     /* the C runtime (ucrt.c) before the older versions */
     case 20: *n=sec_nexports; return sec_exports;                       /* SIDs, ACLs, tokens (security.c) before the stubs in win32x.c */
-    case 21: *n=dwrite_nexports; return dwrite_exports;                 /* DirectWrite (dwrite.c) */                   /* musl math (crtfloat.c) before the simple versions in crtmath.c */
+    case 21: *n=dwrite_nexports; return dwrite_exports;                 /* DirectWrite (dwrite.c) */
+    case 22: *n=seh_nexports; return seh_exports;                       /* exceptions and unwinding (seh.c) */
+    case 23: *n=panic_nexports; return panic_exports;                   /* WillowsTestPanic (panic.c) */                   /* musl math (crtfloat.c) before the simple versions in crtmath.c */
     case 1: *n=sizeof exports/sizeof *exports; return exports;
     case 2: *n=fs_nexports; return fs_exports;
     case 3: *n=net_nexports; return net_exports;
@@ -591,8 +586,8 @@ static const struct export *tab(int t, unsigned *n){
     default: *n=inet_nexports; return inet_exports;
   }
 }
-static const signed char tab_order[22]={0,16,17,19,20,18,21,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15};   /* lookup order: first match wins */
-#define FOR_ALL(e) for(int _o=0,_t;_o<22 && (_t=tab_order[_o],1);_o++) for(unsigned _n, _i=(tab(_t,&_n),0); _i<_n; _i++) for(const struct export *e=tab(_t,&_n)+_i; e; e=0)
+static const signed char tab_order[24]={0,22,16,17,19,20,18,21,23,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15};   /* lookup order: first match wins */
+#define FOR_ALL(e) for(int _o=0,_t;_o<24 && (_t=tab_order[_o],1);_o++) for(unsigned _n, _i=(tab(_t,&_n),0); _i<_n; _i++) for(const struct export *e=tab(_t,&_n)+_i; e; e=0)
 static void *resolve_exact(const char *dll, const char *name){
   FOR_ALL(e) if(dll_eq(dll,e->dll) && strcmp(name,e->name)==0) return e->fn;
   return NULL;

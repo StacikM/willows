@@ -86,24 +86,25 @@ static void report_objects(struct regs *r){                                /* re
     if(f) xprintf("\n");
   }
 }
-/* ---- Windows exception dispatch to vectored handlers (AddVectoredExceptionHandler, win32x.c) ----
-   A fault in a program's own code, in a process that registered handlers, is turned into an EXCEPTION_RECORD + CONTEXT written on the
-   faulting thread's stack, and the thread resumes in veh_dispatch, which calls the handlers. "Continue execution" resumes from the
+/* ---- Windows exception dispatch (seh.c: vectored handlers, then the frames' handlers) ----
+   A fault in a program's own code is turned into an EXCEPTION_RECORD + CONTEXT written on the faulting thread's stack, and the
+   thread resumes in veh_dispatch, which dispatches it. "Continue execution" resumes from the
    (possibly changed) CONTEXT. If no handler takes it, the instruction runs again with dispatch off for that one fault, so the program
    ends with the usual crash report. The kernel is built with -mgeneral-regs-only, so the program's SSE registers are still intact here. */
 extern int veh_count(int pid); extern int veh_call(void *ptrs); extern void ctx_restore(void *ctx) __attribute__((noreturn)); extern char kernel_text_end[];
 static u64 *veh_skip[8];                                                  /* threads (by TEB) whose next fault skips dispatch */
 static int veh_skip_take(void){ for(int i=0;i<8;i++) if(veh_skip[i] && veh_skip[i]==cur_teb){ veh_skip[i]=0; return 1; } return 0; }
 static void veh_skip_set(void){ for(int i=0;i<8;i++) if(!veh_skip[i]){ veh_skip[i]=cur_teb; return; } veh_skip[0]=cur_teb; }
+extern int seh_dispatch_fault(u64 *ptrs);
 __attribute__((ms_abi, noreturn)) static void veh_dispatch(u64 *ptrs){
-  if(!veh_call(ptrs)) veh_skip_set();                                     /* unhandled: fault again, this time for the crash report */
+  if(!seh_dispatch_fault(ptrs)) veh_skip_set();                          /* vectored handlers, then the frames' handlers (seh.c); unhandled: fault again, this time for the crash report */
   ctx_restore((void *)ptrs[1]);
 }
 static int veh_redirect(struct regs *r, u64 cr2){
   static const u8 ok[32]={[0]=1,[3]=1,[4]=1,[5]=1,[6]=1,[13]=1,[14]=1,[16]=1,[17]=1,[19]=1};
   if(r->vec>=32 || !ok[r->vec] || cur==&procs[0] || cur->img.is32 || !cur_teb) return 0;
   if(r->rip<(u64)kernel_text_end) return 0;                               /* inside the kernel (a Windows API): not the program's fault to handle */
-  if(veh_skip_take() || !veh_count(cur->pid)) return 0;
+  if(veh_skip_take()) return 0;                                           /* (every program fault goes to dispatch: its frames may handle it) */
   u64 base=(r->rsp-128-(0x4d0+0x98+16+0x80))&~0xFull;                    /* CONTEXT, EXCEPTION_RECORD, EXCEPTION_POINTERS, call frame */
   for(u64 p=base&~0xFFFull; p<r->rsp; p+=4096){ vmem_grow_stack(p); if(!readable(p)) return 0; }
   u8 *ctx=(u8 *)base; memset(ctx,0,0x4d0+0x98+16);
@@ -165,5 +166,10 @@ void exception_handler(struct regs *r){
     }
   }
   if(cur!=&procs[0]){ xprintf("    Application terminated.\n"); proc_terminate(r->vec==3? 0x80000003 : 0xC0000005); }
-  kputs("    Kernel fault, halting.\n"); for(;;) __asm__ volatile("cli;hlt");
+  /* the kernel's own context (the window manager, drivers ...): stop with the panic screen (src/rust/src/panic.rs) */
+  static struct panic_regs pr; static char why[96];
+  pr.rip=r->rip; pr.rsp=r->rsp; pr.rbp=r->rbp; pr.cr2=cr2; pr.err=r->err; pr.vec=r->vec; pr.has_gp=1; pr.has_fault=1;
+  u64 gp[16]={r->rax,r->rcx,r->rdx,r->rbx,r->rsp,r->rbp,r->rsi,r->rdi,r->r8,r->r9,r->r10,r->r11,r->r12,r->r13,r->r14,r->r15}; memcpy(pr.gp,gp,sizeof gp);
+  ksnprintf(why,sizeof why,"%s in the kernel", r->vec<15? names[r->vec] : "CPU exception");
+  kernel_panic_regs(why,&pr);
 }

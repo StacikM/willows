@@ -1,0 +1,6 @@
+# src/*.inc are C source fragments included into src/wm.c, not Pascal or PHP (language detectors guess from the extension).
+# For cloc, pass --force-lang=C,inc.
+*.inc linguist-language=C
+# Generated tables: hidden from the language statistics and collapsed in diffs.
+src/fontdata.c linguist-generated=true
+src/trust_anchors.h linguist-generated=true

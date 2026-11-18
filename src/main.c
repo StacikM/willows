@@ -53,6 +53,9 @@ void kmain(u32 magic, u32 mbi_addr){
   if(gfx_ok) kprintf("Video: %ux%u framebuffer\n",gfx_w,gfx_h);
   kprintf("Mouse: %s\n",mouse? (mouse_has_wheel()? "PS/2 detected (with scroll wheel)" : "PS/2 detected") : "none");
   kprintf("Memory: %u KB upper, %u MB above 4 GB, heap at %p, %u module(s)\n",mbi->mem_upper,(u32)(mm_high_total()>>20),heap,nmods);
+  { extern void cxx_init(void); extern int cxx_selftest(void); extern int rust_selftest(void);     /* the heap exists: C++ globals, then the language self-tests */
+    cxx_init(); int c=cxx_selftest(), r=rust_selftest();
+    kdbg("Languages: C++ %s, Rust %s\n", c? "ok" : "FAILED", r==1? "ok" : r==0? "FAILED" : "not built in"); }
 
   fs_init();
   /* modules: .exe files become programs in the Start menu, everything else goes to the RAM filesystem */
@@ -92,6 +95,7 @@ void kmain(u32 magic, u32 mbi_addr){
     }
     if(debug_dump_request){ debug_dump_request=0; debug_dump(); }   /* Ctrl+F12 */
     fs_service();                                                   /* deferred saving of changed files (at most every 2 s) */
+    { extern void panic_service(void); panic_service(); }           /* a test panic asked for by WillowsTestPanic */
     wm_service();
     idle_wait();
   }

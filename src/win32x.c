@@ -250,17 +250,7 @@ int veh_call(void *ptrs){
   for(int i=0;i<n;i++){ i32 (WINAPI *h)(void *)=(i32 (WINAPI *)(void *))l[i].fn; if(h(ptrs)==-1) return 1; }
   return 0;
 }
-static void WINAPI x_RaiseException(DWORD code, DWORD fl, DWORD n, const u64 *a){
-  if(veh_count(cur->pid)){                                               /* offer it to the vectored handlers; "continue" returns to the caller */
-    u64 rec[19]; memset(rec,0,sizeof rec); u8 cb[0x4d0+16]; u8 *ctx=(u8 *)(((u64)cb+15)&~15ull); memset(ctx,0,0x4d0);
-    if(n>15) n=15; ((u32 *)rec)[0]=code; ((u32 *)rec)[1]=fl&1; rec[2]=(u64)__builtin_return_address(0); ((u32 *)rec)[6]=n; for(u32 k=0;k<n && a;k++) rec[4+k]=a[k];
-    *(u32 *)(ctx+0x30)=0x10000B; *(u64 *)(ctx+0xf8)=rec[2]; *(u64 *)(ctx+0x98)=(u64)__builtin_frame_address(0)+16; *(u16 *)(ctx+0x38)=0x08; *(u16 *)(ctx+0x42)=0x10;
-    u64 ptrs[2]={(u64)rec,(u64)ctx}; if(veh_call(ptrs)) return;
-  }
-  if(code==0x406D1388) return;                                           /* MSVC "name this thread" for a debugger: harmless without one */
-  char at[64]; if(!dll_addr_name((u64)__builtin_return_address(0),at,sizeof at)) ksnprintf(at,sizeof at,"%p",__builtin_return_address(0));
-  kprintf("\n*** RaiseException 0x%x (flags %x, %u args%s%p) from %s: no handler support, the program ends\n",code,fl,n,n? ", first " : "",n? (void*)a[0] : 0,at);
-  void (WINAPI *f)(DWORD)=K32("ExitProcess"); if(f) f(code); }
+/* (RaiseException itself is in seh.c: vectored handlers, then the frames' handlers) */
 static BOOL WINAPI x_GetSystemTimes(u64 *i, u64 *k, u64 *u){ u64 t=(u64)ticks*10000; if(i) *i=t; if(k) *k=t/10; if(u) *u=t/10; return 1; }
 static BOOL WINAPI x_GetProcessTimes(HANDLE h, u64 *c, u64 *e, u64 *k, u64 *u){ (void)h; if(c) *c=0; if(e) *e=0; if(k) *k=(u64)ticks*10000; if(u) *u=(u64)ticks*10000; return 1; }
 static u64 WINAPI x_GetCurrentProcessToken(void){ return (u64)-4; }
@@ -491,9 +481,6 @@ static BOOL WINAPI x_IsDBCSLeadByteEx(u32 cp, u8 c){ (void)cp;(void)c; return 0;
 static BOOL WINAPI x_LocalFileTimeToFileTime(const u64 *l, u64 *f){ *f = *l; return 1; }
 static void WINAPI x_GlobalMemoryStatus(u32 *m){ m[0] = 32; m[1] = 20; m[2] = 256u << 20; m[3] = 120u << 20; m[4] = 512u << 20; m[5] = 300u << 20; m[6] = 0x7FFF0000; m[7] = 0x7F000000; }
 static BOOL WINAPI x_ReadConsoleW(HANDLE h, u16 *b, DWORD n, DWORD *got, void *c){ (void)h;(void)b;(void)n;(void)c; if(got) *got = 0; return 0; }
-static void WINAPI x_RtlUnwind(void *a, void *b, void *c, void *d){ (void)a;(void)b;(void)c;(void)d; }
-static void WINAPI x_RtlUnwindEx(void *a, void *b, void *c, void *d, void *e, void *f){ (void)a;(void)b;(void)c;(void)d;(void)e;(void)f; }
-static void *WINAPI x_RtlPcToFileHeader(void *pc, void **base){ void *b = (void *)cur->imagebase; if(base) *base = b; (void)pc; return b; }
 static BOOL WINAPI x_fail0(void){ last_error = 5; return 0; }
 static HANDLE WINAPI x_failh(void){ last_error = 5; return 0; }
 struct fdw { DWORD attr; u64 ct, at, wt; DWORD hi, lo, r0, r1; u16 name[260]; u16 alt[14]; };
@@ -519,8 +506,7 @@ static BOOL WINAPI x_GetFileNameW(void *c){ (void)c; return 0; }
 static HANDLE WINAPI x_imm0(void){ return 0; }
 
 const struct export x_exports[] = {
-  XD("secur32",GetUserNameExW), XD("secur32",LsaGetUserName), XD("advapi32",LsaGetUserName), XD("advapi32",LsaFreeMemory), XD("secur32",LsaFreeMemory), X(GetComputerNameExW), X(AreFileApisANSI), X(WillowsReadOutput), X(WillowsProcessRunning), X(Beep), X(SetHandleInformation), X(IsDBCSLeadByteEx), X(LocalFileTimeToFileTime), X(GlobalMemoryStatus), X(ReadConsoleW), X(RtlUnwind), X(RtlUnwindEx), X(RtlPcToFileHeader),
-  X(FindFirstFileW), X(FindNextFileW), X(FindFirstFileExW), X(GetDateFormatW), X(GetTimeFormatW),
+  XD("secur32",GetUserNameExW), XD("secur32",LsaGetUserName), XD("advapi32",LsaGetUserName), XD("advapi32",LsaFreeMemory), XD("secur32",LsaFreeMemory), X(GetComputerNameExW), X(AreFileApisANSI), X(WillowsReadOutput), X(WillowsProcessRunning), X(Beep), X(SetHandleInformation), X(IsDBCSLeadByteEx), X(LocalFileTimeToFileTime), X(GlobalMemoryStatus), X(ReadConsoleW),  X(FindFirstFileW), X(FindNextFileW), X(FindFirstFileExW), X(GetDateFormatW), X(GetTimeFormatW),
   {"kernel32","GetCommState",x_fail0}, {"kernel32","SetCommState",x_fail0}, {"kernel32","SetCommBreak",x_fail0}, {"kernel32","ClearCommBreak",x_fail0}, {"kernel32","SetCommTimeouts",x_fail0},
 {"ole32","CoCreateInstance",x_CoCreateInstance},
   XD("advapi32",AllocateAndInitializeSid), XD("advapi32",EqualSid), XD("advapi32",GetLengthSid), XD("advapi32",CopySid), XD("advapi32",InitializeSecurityDescriptor), XD("advapi32",SetSecurityDescriptorDacl), XD("advapi32",SetSecurityDescriptorOwner),
@@ -548,7 +534,7 @@ const struct export x_exports[] = {
       X(LocalAlloc), X(LocalFree), X(LocalReAlloc), {"kernel32","GlobalAlloc",x_LocalAlloc}, {"kernel32","GlobalFree",x_LocalFree}, {"kernel32","GlobalReAlloc",x_LocalReAlloc},
   X(GlobalLock), X(GlobalUnlock), X(HeapSetInformation), X(HeapValidate), X(IsBadReadPtr), {"kernel32","IsBadWritePtr",x_IsBadReadPtr},
   X(LoadLibraryW), X(LoadLibraryExA), X(LoadLibraryExW), X(FreeLibrary), X(GetModuleHandleExW), X(GetModuleHandleExA), X(DisableThreadLibraryCalls),
-  X(OutputDebugStringW), X(DebugBreak), X(SetErrorMode), X(IsWow64Process), X(GetSystemPowerStatus), X(RaiseException), X(RaiseFailFastException),
+  X(OutputDebugStringW), X(DebugBreak), X(SetErrorMode), X(IsWow64Process), X(GetSystemPowerStatus), X(RaiseFailFastException),
   X(AddVectoredExceptionHandler), X(RemoveVectoredExceptionHandler), X(AddVectoredContinueHandler), X(RemoveVectoredContinueHandler),
   {"ntdll","RtlAddVectoredExceptionHandler",x_AddVectoredExceptionHandler}, {"ntdll","RtlRemoveVectoredExceptionHandler",x_RemoveVectoredExceptionHandler},
   {"ntdll","RtlAddVectoredContinueHandler",x_AddVectoredContinueHandler}, {"ntdll","RtlRemoveVectoredContinueHandler",x_RemoveVectoredContinueHandler},
