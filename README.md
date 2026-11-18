@@ -1,147 +1,71 @@
 # Willows
 
-A tiny x86-64 OS (GRUB + Multiboot) that loads and runs 64-bit Windows PE32+ `.exe` files on its own Win32/msvcrt layer,
-with a small window manager (user32: windows, messages, EDIT/BUTTON/STATIC controls, open/save dialog) and a RAM filesystem.
+**A small x86-64 operating system that runs Windows programs: its own kernel, its own Win32 layer, and enough of both to run
+a modern web browser (LibreWolf, a Firefox build) with YouTube, extensions and downloads.**
 
-## Build / boot
-    make img        # willows.img  (dd it to a USB stick, or boot in QEMU)
-    make iso        # willows.iso  (BIOS)
-    make run-img    # boot willows.img in QEMU
+Willows boots with GRUB, loads 64-bit Windows `.exe` and `.dll` files directly, and gives them the Windows APIs they expect:
+windows and messages, GDI, threads and synchronization, files, pipes, Winsock, TLS, COM basics and more. It has its own
+desktop (taskbar, Start menu, file manager, terminal, text editor, settings) and its own small web browser.
 
-## Test your own program
-    make run-c   SRC=examples/primes.c     # plain C file (stdio/stdlib/string/ctype shim, no floats yet)
-    make run-exe EXE=path/to/prog.exe      # an .exe you built yourself (e.g. i686-w64-mingw32-gcc)
-Both put the exe in `user/`; everything in `user/` shows up in the GRUB menu of `willows.img`/`willows.iso`.
-Unimplemented Windows APIs are reported by name when the program calls them (see src/win32.c to add more).
+> [!NOTE]
+> **Willows is 100% AI-generated.** Every line of code, every tool and every document in this repository so far was written by
+> AI (Anthropic's Claude, working through Claude Code), directed, tested and reviewed by StacikM.
+> Contributions written by people are welcome, and are credited as human work; see [CONTRIBUTING.md](CONTRIBUTING.md#human-and-ai-work).
 
-## Files
-Willows has a real hierarchical filesystem rooted at `C:\` (RAM-backed). Everything in `files/` is loaded at boot
-(`files/Documents/...`); `Desktop/` and `Documents/` are the user's folders. Programs can open, read, create, rename,
-delete and list files and folders (`fopen`, `CreateFileA`, `FindFirstFileA`, `CreateDirectoryA`, `MoveFileA`, the
-Open/Save dialogs). Changes are written to a 1 GB data area on the boot disk (ATA/IDE; LBA 122880), including
-folders and deletions, so they survive reboots. `make img` keeps that area when rebuilding (delete `willows.img` for a
-clean slate). ISO/CD boots, AHCI-only SATA, NVMe and USB sticks have no writable disk driver yet, so files stay in RAM there.
+## What works
+| Area | Status |
+|---|---|
+| **LibreWolf / Firefox** | Runs with its usual multi-process setup: HTTPS sites, YouTube pages, extensions (uBlock Origin), downloads with a save dialog, menus and its own title bar. Needs about 6 GB of RAM. Video playback does not work yet. |
+| **Classic Win32 programs** | PuTTY's real configuration dialog and terminal; dialog-based and GDI programs; console programs. |
+| **Desktop** | Taskbar with program icons, Start menu, desktop icons, file manager with search and list/grid views, terminal with pipes and redirection, Notes, Settings (US and French AZERTY keyboards, wallpaper themes). |
+| **Files** | `C:\` file system saved to the boot disk (1 GB), with the Windows behaviour programs rely on. |
+| **Network** | Intel e1000, IPv4 (DHCP, DNS, TCP, UDP, ICMP), Winsock 2, TLS 1.2 with verified certificates, WinINet. |
+| **Not yet** | Video playback in LibreWolf, structured exception handling (`__try`), 32-bit programs beyond simple ones, Wi-Fi and other network cards, USB/NVMe storage, sound, UEFI. |
 
-## Check a program before running it
-    python3 tools/peinfo.py user/prog.exe    # architecture + which imports Willows implements
+How each part works is described in [docs/INTERNALS.md](docs/INTERNALS.md).
 
-## Desktop
-Boot "Willows desktop" in GRUB: taskbar (Start button, one button per open window, clock) and a Start menu listing every
-program (`user/*.exe` and the built-in demos) with Restart and Shut down. Programs run as cooperative processes: they switch
-when they wait (message loop, Sleep, keyboard input). Console programs and kernel messages appear in a "Console" window.
-GRUB entries named "desktop + start X" launch one of your programs at boot (`autostart=X` on the kernel command line).
+## Quick start
+You need a Linux machine with `gcc`, `binutils`, `python3`, the GRUB 2 tools (`grub-mkimage`, `grub-bios-setup`, `grub-mkrescue`),
+`sfdisk`, `xorriso` and `qemu-system-x86_64`.
 
-Every window has minimize / maximize (programs with a message loop) / close buttons; the taskbar button minimizes the
-active window or restores/raises another. Closing a GDI program (`paint`, `gfx`) ends its process.
+    make img                  # build willows.img (kernel, apps and a boot disk with a saved-data area)
+    make run-img              # boot it in QEMU (3 GB of RAM by default)
+    make run-img MEM=6144     # with enough RAM for LibreWolf
 
-The desktop shows the contents of the `Desktop` folder as icons: click to select, double-click to open, right-click for
-New folder / New text document / Open terminal / Rename / Delete (typing renames in place). Folders open in **Files**
-(sidebar, path bar, new folder, rename, delete), text files in **Notes** (Ctrl+S saves), `.html` in the browser and
-`.exe` runs. The Start button is the Willows willow mark; the taskbar is a floating dock.
+Other targets: `make iso` (a BIOS-bootable `willows.iso`), `make run-c SRC=examples/primes.c` (build and run a plain C file),
+`make run-exe EXE=path/to/prog.exe` (boot with your own program; anything in `user/` appears in the Start menu).
+`python3 tools/peinfo.py prog.exe` shows which of a program's imports Willows implements.
 
-## Dialogs, GDI and classic programs
-Willows has a dialog manager (`src/dialog.inc`, `src/dialog2.inc`): resources are read from the program's `.rsrc`, dialog templates become real windows, and the standard
-controls exist (buttons, check/radio, group boxes, labels, single-line edits, list boxes, combo boxes, a tree view) with Tab/Enter/Esc handling and modal dialogs.
-`src/gdi.inc` is a per-DC GDI (memory DCs and bitmaps, pens/brushes/fonts, `ExtTextOut`, `BitBlt`, lines, rectangles) plus timers, clipboard, menus, keyboard translation
-(`ToUnicodeEx`) and `WSAAsyncSelect` sockets. `src/win32x.c` adds ~200 more kernel32/advapi32/COM stubs and wide-string file APIs. With these, PuTTY's real configuration
-dialog and terminal window run (Telnet/Raw to a reachable host; SSH is untested). Optional APIs that Willows lacks return 0 instead of stopping the program.
+`make img` keeps the saved files of an existing `willows.img`; delete the image to start from scratch. Willows can also boot
+from a USB stick or CD, but only ATA/IDE disks are writable so far, so files stay in RAM there.
 
-## Networking
-Willows has an Intel e1000 driver (QEMU's default NIC; many real boards) and its own IPv4 stack: ARP, ICMP, UDP, DHCP, DNS and TCP
-(client and server). Programs use it through Winsock 2 (`ws2_32`: `socket/connect/send/recv/bind/listen/accept/select/
-gethostbyname/getaddrinfo` ...) and the ICMP API (`IcmpSendEcho`). The taskbar shows the IP address.
-Demos: `ping.exe`, `nettest.exe` (HTTP GET from the host and from example.com), `httpd.exe` (web server on port 8080; with
-`make run-img` it is reachable from the host at http://127.0.0.1:18080/). In QEMU the host is 10.0.2.2.
-Not supported yet: HTTPS/TLS, IPv6, other NICs (Wi-Fi, Realtek, virtio), IP fragments, DHCP renewal.
+## Getting LibreWolf
+Open **Start → Get LibreWolf**, or type `getlibrewolf` in the Terminal. Willows downloads the newest official portable build
+from [librewolf.net](https://librewolf.net), checks it against the published SHA-256, unpacks it to `C:\Programs\LibreWolf`
+(about 510 MB) and adds it to the Start menu. Run it again to update. Willows does not include LibreWolf itself; LibreWolf is
+distributed by its own project under its own license.
 
-## HTTPS
-TLS 1.2 client via [BearSSL](https://bearssl.org) (third_party/bearssl, MIT licence), with Mozilla's 118 root certificates built in
-(src/trust_anchors.h; `tools/mkcerts.sh` regenerates it). Certificates are really verified: chain to a trusted root, host name and
-dates (from the CMOS clock) - expired, self-signed and wrong-host sites are refused. Programs get it through WinINet
-(`InternetOpenUrlA/W`, `InternetReadFile`, `HttpQueryInfoA`; http and https, redirects, chunked) and URLMon
-(`URLDownloadToFileA/W` saves into the RAM filesystem, and so onto the boot disk). Programs that bring their own TLS library can
-use `BCryptGenRandom`, `CryptGenRandom` and `RtlGenRandom`, and `GetSystemTimeAsFileTime` now returns the real date.
-Demo: `fetch.exe`. Limits: TLS 1.2 only (no 1.3), no client certificates or revocation checks, root list is frozen at build time,
-random numbers come from RDRAND when the CPU has it (otherwise weaker timer jitter, with a warning).
+## Repository layout
+| Path | What it is |
+|---|---|
+| `src/` | The kernel: boot, memory, scheduler, file system, drivers, network stack, window manager, and the Win32 layer (`win32*.c`, `thread.c`, `ipc.c`, `ucrt.c`, `gdi*.inc`, ...). |
+| `apps/` | Built-in programs (all ordinary Windows programs): file manager, terminal, notes, settings, browser and its engine (`apps/web`), QuickJS (`apps/qjs`), tests. |
+| `files/` | Files copied onto the disk at boot (`C:\Documents`, fonts in `C:\Windows\Fonts`). |
+| `tools/` | Build scripts (disk image, PE writer, C/DLL builders) and `tools/dev/`, the test and debugging tools. |
+| `third_party/` | BearSSL. |
+| `docs/` | Documentation. |
 
-## Look, fonts and the browser
-The desktop runs at 1280x720 (16:9; change the numbers in the Multiboot header in src/boot.S). Windows have flat chrome with shadows,
-hover effects and dot-style window buttons; the taskbar shows tasks, network and a clock with the date.
-
-Text goes through one font API (`ui_text`, `ui_width`; src/font.c). src/fontdata.c (generated: Open Sans + Hack, anti-aliased) is included; without it the system falls back to the
-built-in 8x16 bitmap font. To regenerate the glyph bitmaps (uses stb_truetype, public domain, in tools/host/):
-
-    gcc -O2 -o /tmp/mkfont tools/host/mkfont.c -Itools/host -lm && /tmp/mkfont > src/fontdata.c && make img
-
-`apps/browser.c` is a graphical web browser (a normal Windows program: WM_PAINT, GDI fonts, WinINet). The engine lives in `apps/web/`
-and is plain C with no OS calls, so it can be tested on the host:
-- `dom.h` HTML parser (implied end tags, entities, quirks detection), `css.h` CSS (selectors incl. attribute/nth/not, specificity cascade,
-  `@media`, `var()`, calc of one kind, colours, shorthands), `layout.h` block / inline / float / table / flex layout with margin collapsing,
-  `image.h` PNG (all types, Adam7), JPEG (baseline + progressive) and GIF decoders.
-- http/https, external stylesheets, images loaded progressively, `data:` and `file:` URLs, forms (text, checkbox, radio, select, buttons; GET),
-  history, in-page `#fragment` links, Latin-1 pages. No JavaScript, no SVG, no `<canvas>`/video; CSS grid falls back to normal flow.
-- Windows use small coloured dot buttons (minimize / maximize / close) at the right end of the title bar.
-
-## Terminal and screen resolution
-`apps/terminal.c` is a terminal emulator with a small shell (Start menu, or Ctrl+Shift+T): ANSI colours, scrollback, history,
-Tab completion, pipes (`| grep/head/tail/wc/sort`) and `>` / `>>` redirection. Commands: help ls cat cp mv rm touch echo ping curl wget
-nslookup ipconfig ps kill run date uptime free calc neofetch history clear exit reboot shutdown. It is built only from Windows
-APIs (FindFirstFile, CreateProcess, IcmpSendEcho, WinINet ...), which Willows now also provides to other programs.
-
-The GRUB menu has one entry per resolution (1280x720, 1920x1080, 1600x900, 1024x768): `tools/patchres.py` writes kernel copies with
-a different video request in the Multiboot header. Add resolutions there. Visuals: anti-aliased shapes, vector cursor, rounded
-window corners, cached wallpaper, translucent taskbar and a sliding Start menu.
-
-## Settings
-The **settings** app (Start menu) has three pages: System (OS, GPU, display, memory, uptime), Keyboard (English US / French AZERTY with AltGr and accented letters, plus a test box) and Appearance (six wallpaper themes). Changes apply immediately and are saved to `System\settings.cfg`, which is loaded at boot. Programs can use the kernel32 exports `WillowsSetSetting`/`WillowsGetSetting` (keys: `layout` = `us`|`azerty`, `theme` = 0-5).
-
-## Real DLL loading
-Willows loads PE32+ DLLs from its file system ([src/dll.c](src/dll.c)): `LoadLibrary`/`GetProcAddress`/`FreeLibrary`, static and delay-load imports, export tables (by name, ordinal and forwarders), relocations, nested dependencies and `DllMain` (attach/detach). A DLL is found in the current folder, the root, Downloads, Documents, Desktop, `System`, `System32` or `Windows\System32`. Built-in DLLs (kernel32, user32, ucrt, ...) stay built in; a real file is used for names the built-ins don't provide, e.g. a bundled `msvcp140.dll`. Each process gets its own copy of a DLL. Test: run `dlltest` (uses `wlib.dll` -> `wdep.dll` and `wdyn.dll`, built with `tools/builddll.sh`; export functions as `EXPORT_<name>`).
-
-## JavaScript (QuickJS)
-The browser runs page scripts with **QuickJS-ng** (vendored in `apps/qjs`, with a small libc layer and musl's math functions). `apps/web/js.h` exposes node primitives to JavaScript and `apps/web/prelude.js` builds the browser environment on top: `window`, `document`, elements (attributes, classList, style, dataset, innerHTML, querySelector, ...), events with capture/bubble, timers and `requestAnimationFrame`, `fetch`/`XMLHttpRequest` (any method, headers and body), `URL`, storage, `console` (output goes to the program's console/terminal). Scripts run after the first layout; DOM edits restyle and re-layout the page. Click, input, keydown and submit events are delivered to page handlers (`preventDefault()` works). `jstest "1+2"` runs QuickJS directly in the terminal. Not supported yet: ES modules (`type=module`), multipart/file uploads, Web Workers, canvas, media, `<iframe>`, hit-testing clicks on empty boxes (only text, images and controls).
-
-## Win32 coverage, batch 1
-- **Registry** (`src/registry.c`): a real in-memory hive for the `Reg*` functions (open/create/query/set/get/enum/delete/info, A and W). It starts with the values programs commonly read (Windows version, computer name, CPU name, folders) and is not saved between boots yet.
-- **Locks** (`src/win32y.c`): SRW locks, `InitOnce*`, `WaitOnAddress`, SLists. Willows schedules cooperatively, so these are correct but never block for long.
-- **COM/OLE basics**: `CoInitializeEx`, `CoTaskMem*`, GUID strings, `CoCreateGuid`, BSTRs (`Sys*String*`), `VariantInit/Clear`. `CoCreateInstance` reports "class not registered".
-- **Shell**: `SHGetKnownFolderPath`, `SHGetFolderPathA/W`, `SHGetSpecialFolderPath*`, `ShellExecuteW/ExA/ExW` (with arguments), `CommandLineToArgvW`, shlwapi path helpers.
-- **Processes**: `CreateProcessW`, `GetProcessId`, psapi (`EnumProcesses`, `GetProcessMemoryInfo`, module names), job objects (accepted, not enforced).
-- Run `apitest` (Start menu > Demos & tests; `apitest -v` lists every check) to verify: 43 checks.
-
-## Win32 coverage, batch 2
-- **Pipes** (`src/ipc.c`): anonymous pipes (`CreatePipe`, `PeekNamedPipe`) and duplex named pipes (`\\.\pipe\name` with `CreateNamedPipe`, `ConnectNamedPipe`, `CreateFile` as the client). Reads block until data or end-of-file. `CreateProcess` with `STARTF_USESTDHANDLES` redirects a child's stdin/stdout through pipes (so `subprocess`-style capture works); references are counted so the reader sees end-of-file when the child exits.
-- **File mappings**: `CreateFileMapping`/`OpenFileMapping`/`MapViewOfFile`/`Unmap`/`Flush`. Named mappings are real shared memory between programs (all programs share one address space); file-backed mappings read the file and write changes back on unmap.
-- **File helpers**: `LockFileEx`, `GetDiskFreeSpaceExW`, `GetFinalPathNameByHandle`, `SetFileInformationByHandle`, `DeviceIoControl` (fails), `CancelIo`.
-- **Native registry** (`src/registry.c`): `NtOpenKey`, `NtCreateKey`, `NtQueryValueKey`, `NtEnumerateKey/ValueKey`, `NtQueryKey`, `NtSetValueKey`, `NtDeleteKey`, `NtClose`, `RtlOpenCurrentUser` on the same in-memory hive.
-- **System queries** (`src/nt.c`): `NtQuerySystemInformation` (basic, processor, time of day, per-CPU performance), `NtQueryInformationProcess/Token`, `RtlExpandEnvironmentStrings`, `RtlGetNtVersionNumbers`, `BrandingFormatString`.
-- Run `apitest2` to verify: 33 checks (it starts `echo.exe` as a child with redirected stdin/stdout).
-
-## 32-bit programs (stage 1)
-Willows runs 32-bit (PE32) Windows programs in the CPU's compatibility mode (`src/wow.c`, the `wow_*` code in `src/boot.S`, `pe32_load` in `src/pe.c`). A 32-bit program lives below 4 GB on its own stack with its own 32-bit TEB/PEB (FS). Each import is a small stub that switches into 64-bit mode, widens the stdcall arguments and calls the existing Win64 function, then switches back and pops the arguments.
-- The call needs the number of arguments of every API: see the `SIG` list in `src/wow.c` (about 80 kernel32/user32 functions). An API that is not listed gets a stub that names it and ends the program, so a missing function is visible instead of corrupting the stack.
-- Build a 32-bit test program with `tools/build32.sh prog.c out.exe` (see `apps/hello32.c`; imports are `__imp_<dll>__<name>` stdcall pointers). Run `hello32`.
-- Not done yet: 32-bit structures that contain pointers (windows, messages), callbacks into 32-bit code (window procedures), the 32-bit C runtime (cdecl imports), TLS, 32-bit DLLs, SEH.
-
-## Win32 coverage, batch 3 (GDI)
-- **Clipping and regions** (`src/gdi2.inc`): `IntersectClipRect`, `ExcludeClipRect` (only cuts that remove a whole side), `SelectClipRgn`, `GetClipBox`, `SaveDC`/`RestoreDC`. Regions are rectangles (bounding-box arithmetic for `CombineRgn`); the clip applies to fills, lines, text and blits.
-- **Shapes**: `Ellipse`, `RoundRect`, `Polygon`/`PolyPolygon` (even-odd fill), `Arc`/`Pie`/`Chord`, `PolyBezier(To)`, `PolylineTo`, `FrameRect`, `InvertRect`, `FillRgn`/`FrameRgn`.
-- **Text**: `DrawText(Ex)A/W` (alignment, word-break, single line, `DT_CALCRECT`, `&` prefixes, end ellipsis), `TextOutW`/`GetTextExtentPoint32W` now keep non-ASCII text (UTF-16 to UTF-8), `CreateFontW`/`CreateFontIndirectW`, `EnumFontFamilies(Ex)`, `GetTextFace`.
-- **Bitmaps**: `CreateDIBSection` (32-bit top-down shares the pixel buffer; other formats and bottom-up DIBs are converted when blitted), `GetDIBits`, `SetDIBits`, `SetDIBitsToDevice`, `CreateDIBitmap`, `GetBitmapBits`/`SetBitmapBits`.
-- **Blending**: `AlphaBlend` (constant and per-pixel alpha), `TransparentBlt`, `GradientFill` (horizontal, vertical, triangles).
-- Not done: paths (`BeginPath`...), true complex regions, window/viewport origin translation, `MaskBlt`.
-- Run `apitest3` (`-v` lists each check; 29 checks) or `apitest3 gdi` for a window that shows the shapes.
-
-## Win32 coverage, batch 4 (large programs: LibreWolf/Firefox bring-up)
-- **Threads** (`src/thread.c`): `CreateThread`/`_beginthreadex` start real threads (own stack, TEB, TLS, FLS, last error), scheduled cooperatively with the processes. Events, mutexes, semaphores, waitable timers, I/O completion ports, critical sections, SRW locks, condition variables, `InitOnce` and the `Wait*` functions now block for real; APCs run in alertable waits. DLLs with implicit TLS (`thread_local`) work, and get `DLL_THREAD_ATTACH/DETACH`.
-- **Virtual memory** (`src/vmem.c`): `VirtualAlloc`/`VirtualFree`/`VirtualQuery`/`VirtualProtect` (and `Nt*` versions) with real reserve/commit/decommit/release at any address up to 128 TB, backed by 4 KB pages that are freed again. 32-bit programs keep the old allocator.
-- **C runtime** (`src/ucrt.c`, `src/crtfloat.c`): stdio on Win32 handles, printf/scanf with floating point and wide strings, wide start-up (`__p___wargv`...), environment, locale/ctype, string/conversion/time functions, per-thread `errno`; musl's math library (apps/qjs/math) is built into the kernel.
-- **Security objects** (`src/security.c`): real SIDs, ACLs, security descriptors and token queries (Willows enforces no access checks).
-- **Modules**: DLLs are found in the program's folder first; built-in DLLs (`ntdll`, `kernel32`, ...) have small real PE images with export tables; `GetProcAddress` works on the program itself; `GetModuleHandleEx(FROM_ADDRESS)`; imports by ordinal (Winsock, oleaut32). The Windows App SDK (WinUI 3) needs WinRT and is reported as missing.
-- **Windows**: message queues are per thread (`PeekMessage` honours `PM_NOREMOVE` and filters, `PostThreadMessage`), 64 window classes with long names and atoms, `GetClassInfo`, message-only windows, registered messages, DPI functions, `EnumDisplayDevices`, `SystemParametersInfoW`.
-- Get it with **Start → Get LibreWolf** (or `getlibrewolf` in the Terminal): it downloads the newest official portable build from librewolf.net, checks its published SHA-256, unpacks it to `C:\Programs\LibreWolf` (about 510 MB of saved space) and adds it to the Start menu; run it again to update (`-f` reinstalls). Willows does not ship LibreWolf itself. Installed programs are listed in `C:\System\shortcuts.cfg` (`Name|C:\path\program.exe` per line).
-- Status: LibreWolf 159/160 (portable) runs with its usual set of processes in a 6 GB machine: HTTPS sites, YouTube pages, extensions (uBlock Origin), downloads with a save dialog, menus and its own title bar. Video playback is not working yet (the decoder process fails to start). See `tools/dev/README.md` for the test and debugging tools.
+## Development
+- [docs/INTERNALS.md](docs/INTERNALS.md) explains the kernel and each part of the Win32 layer.
+- [tools/dev/README.md](tools/dev/README.md) describes the headless test setup (a private test disk, scripted QEMU sessions,
+  screenshots) and the debugging tools: crash reports, API traces, thread dumps, gdb scripts.
+- [CONTRIBUTING.md](CONTRIBUTING.md) covers how to contribute and how human and AI work are labelled.
+- [AGENTS.md](AGENTS.md) holds the rules for AI coding agents working on this repository.
 
 ## License
-Willows is free software under the GNU General Public License, version 3 (see `LICENSE`): you may use, study, change and share it, and anything you distribute that is built from it must be released under the same license, with its source.
-Third-party parts keep their own licenses: BearSSL (`third_party/bearssl/LICENSE.txt`, MIT), QuickJS (`apps/qjs/LICENSE`, MIT), and the Open Sans and Hack fonts (`files/Windows/Fonts/LICENSE-*.txt`).
+Willows is free software under the [GNU General Public License, version 3](LICENSE). You may use, study, change and share it;
+anything you distribute that is built from it must be released under the same license, with its source.
+
+Third-party parts keep their own licenses: BearSSL (`third_party/bearssl/LICENSE.txt`, MIT), QuickJS-ng (`apps/qjs/LICENSE`, MIT),
+the Open Sans and Hack fonts (`files/Windows/Fonts/LICENSE-*.txt`), musl's math functions (`apps/qjs/math/COPYRIGHT`, MIT). LibreWolf, Firefox and
+other Windows programs mentioned here belong to their own projects.
