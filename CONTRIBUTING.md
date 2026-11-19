@@ -27,15 +27,12 @@ You need Linux with `gcc`, `binutils`, `python3`, the GRUB 2 tools, `sfdisk`, `x
     make -s all                           # build the kernel and the apps
     make img && make run-img MEM=6144     # build a disk image and boot it in QEMU
 
-Before sending a change, run the API test suites on the private test disk (it never touches your own `willows.img`):
+Before sending a change, run the tests. They boot a private test disk headless in QEMU and never touch your own
+`willows.img`:
 
-    tools/dev/mktest.sh "sleep 8" "apitest > /Documents/t1.txt" "apitest2 > /Documents/t2.txt" \
-        "apitest3 > /Documents/t3.txt" "nettest > /Documents/t4.txt" "cxxtest > /Documents/t5.txt"
-    tools/dev/drive.py --reuse wait60
-    python3 tools/dev/datafs.py build/dev/test.img extract build/dev/out
-    tail -1 build/dev/out/Documents/t*.txt
+    ./TESTS.sh            # about a minute; ./TESTS.sh --all adds the kernel panic paths and a LibreWolf smoke test
 
-All checks must pass. If you change the desktop or an app, include a screenshot; if you fix a program (PuTTY, LibreWolf, ...),
+All checks must pass (the script ends with ALL TESTS PASSED and exit status 0). If you change the desktop or an app, include a screenshot; if you fix a program (PuTTY, LibreWolf, ...),
 describe how you tested it.
 
 ## Pull requests

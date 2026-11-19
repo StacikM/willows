@@ -58,6 +58,7 @@ distributed by its own project under its own license.
 | `docs/` | Documentation. |
 
 ## Development
+- `./TESTS.sh` builds everything and runs the tests headless in QEMU (`--all` for the long set); it never touches `willows.img`.
 - [docs/INTERNALS.md](docs/INTERNALS.md) explains the kernel and each part of the Win32 layer.
 - [tools/dev/README.md](tools/dev/README.md) describes the headless test setup (a private test disk, scripted QEMU sessions,
   screenshots) and the debugging tools: crash reports, API traces, thread dumps, gdb scripts.

@@ -34,19 +34,20 @@ Apps are built as Windows PE files by `tools/buildc.sh` (`-mabi=ms`, a small lib
 with commands that run in a terminal at boot. `tools/dev/drive.py --reuse` boots it headless in QEMU, sends keys and clicks, and
 saves screenshots to `build/dev/*.png`; the serial log goes to `build/dev/serial.txt`.
 
-The API test suites (run them before calling a change done):
+**Run `./TESTS.sh` before calling a change done.** It builds, boots the test disk once and checks the API suites (apitest 43,
+apitest2 33, apitest3 35 and cxxtest 8 checks), the network, the kernel's C++/Rust self-tests (`Languages: C++ ok, Rust ok` in
+the serial log) and that nothing crashed or panicked; exit status 0 means everything passed. `./TESTS.sh --panic` adds the three
+panic paths, `--librewolf` a LibreWolf smoke test, `--all` both (about 4 minutes). Logs and screenshots: `build/dev/tests/`.
 
-    tools/dev/mktest.sh "sleep 8" "apitest > /Documents/t1.txt" "apitest2 > /Documents/t2.txt" \
-        "apitest3 > /Documents/t3.txt" "nettest > /Documents/t4.txt" "cxxtest > /Documents/t5.txt"
+The same by hand, for one scenario:
+
+    tools/dev/mktest.sh "sleep 8" "apitest > /Documents/t1.txt" "nettest > /Documents/t4.txt"   # (sleep 8: DHCP first)
     tools/dev/drive.py --reuse wait60
-    python3 tools/dev/datafs.py build/dev/test.img extract build/dev/out
-    tail -1 build/dev/out/Documents/t*.txt     # 43/43, 33/33, 35/35, 8/8 checks pass; nettest receives a page
+    python3 tools/dev/datafs.py build/dev/test.img extract build/dev/out && tail -1 build/dev/out/Documents/t*.txt
 
-The serial log's boot lines include `Languages: C++ ok, Rust ok` (the kernel's C++ and Rust self-tests). To check a behaviour
+`TESTDATA=dir tools/dev/mktest.sh ...` builds the test disk from another folder than `build/dev/testdata/`. To check a behaviour
 against real Windows semantics, build a small program with `x86_64-w64-mingw32-g++ -static` and run it both under Wine on the
 host and in Willows.
-
-(`sleep 8` gives DHCP time to finish before `nettest`.)
 
 LibreWolf: put a LibreWolf portable folder in `build/dev/testdata/` (or run `getlibrewolf` inside the test system), then
 `tools/dev/mktest.sh "/Programs/LibreWolf/LibreWolf/librewolf.exe https://example.com/"` and

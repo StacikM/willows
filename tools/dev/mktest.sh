@@ -12,10 +12,11 @@
 set -e
 cd "$(dirname "$0")/../.."
 make -s all
-mkdir -p build/dev/testdata/System
-printf 'layout=us\n' > build/dev/testdata/System/settings.cfg
-rm -f build/dev/testdata/System/autorun.cfg; for c in "$@"; do printf '%s\n' "$c" >> build/dev/testdata/System/autorun.cfg; done
-if [ -n "$TRACE" ]; then printf 'on\n' > build/dev/testdata/System/apitrace.cfg; else rm -f build/dev/testdata/System/apitrace.cfg; fi
+D=${TESTDATA:-build/dev/testdata}                     # TESTDATA=dir: another folder for C:\ (TESTS.sh uses an empty one)
+mkdir -p "$D/System"
+printf 'layout=us\n' > "$D/System/settings.cfg"
+rm -f "$D/System/autorun.cfg"; for c in "$@"; do printf '%s\n' "$c" >> "$D/System/autorun.cfg"; done
+if [ -n "$TRACE" ]; then printf 'on\n' > "$D/System/apitrace.cfg"; else rm -f "$D/System/apitrace.cfg"; fi
 rm -f build/dev/test.img
 ./tools/mkdisk.sh build/dev/test.img >/dev/null
-python3 tools/dev/datafs.py build/dev/test.img pack build/dev/testdata
+python3 tools/dev/datafs.py build/dev/test.img pack "$D"
